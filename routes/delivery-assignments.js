@@ -146,7 +146,7 @@ router.post('/', auth, async (req, res) => {
     
     // Generate unique QR code
     const qrCode = crypto.randomBytes(16).toString('hex');
-    const qrUrl = `${process.env.FRONTEND_URL || 'http://localhost:9002'}/qr-payment/${qrCode}`;
+    const qrUrl = `${process.env.FRONTEND_URL || 'https://finance-system-frontend.vercel.app'}/qr-payment/${qrCode}`;
     const qrExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours from now
     
     const assignmentData = {
