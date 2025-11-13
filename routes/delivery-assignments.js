@@ -9,12 +9,12 @@ router.get('/', auth, async (req, res) => {
   try {
     const assignments = await DeliveryAssignment.find()
       .populate('driver_id', 'name phone vehicle_type vehicle_number')
-      .populate('request_id', 'request_id customer receiver')
-      .populate('invoice_id', 'invoice_id total_amount amount')
+      .populate('request_id', 'request_id customer receiver awb_number')
+      .populate('invoice_id', 'invoice_id total_amount amount awb_number receiver_name receiver_phone receiver_address')
       .populate('client_id', 'company_name contact_name')
       .sort({ createdAt: -1 });
     
-    // Convert Decimal128 amounts to numbers for frontend
+    // Convert Decimal128 amounts to numbers and enrich with invoice data
     const formattedAssignments = assignments.map(assignment => {
       const assignmentData = assignment.toObject();
       
@@ -23,6 +23,34 @@ router.get('/', auth, async (req, res) => {
         assignmentData.amount = typeof assignmentData.amount === 'object'
           ? parseFloat(assignmentData.amount.toString())
           : parseFloat(assignmentData.amount);
+      }
+      
+      // If receiver info is missing, try to get it from invoice
+      if (!assignmentData.receiver_name && assignmentData.invoice_id) {
+        assignmentData.receiver_name = assignmentData.invoice_id.receiver_name || 
+                                       assignmentData.invoice_id.request_id?.receiver?.name || 
+                                       'N/A';
+      }
+      
+      if (!assignmentData.receiver_phone && assignmentData.invoice_id) {
+        assignmentData.receiver_phone = assignmentData.invoice_id.receiver_phone || 
+                                        assignmentData.invoice_id.request_id?.receiver?.phone || 
+                                        'N/A';
+      }
+      
+      if (!assignmentData.receiver_address && assignmentData.invoice_id) {
+        assignmentData.receiver_address = assignmentData.invoice_id.receiver_address || 
+                                         assignmentData.invoice_id.request_id?.receiver?.address || 
+                                         assignmentData.delivery_address || 
+                                         'N/A';
+      }
+      
+      // If assignment_id is not AWB number but invoice has AWB, suggest update
+      if (assignmentData.invoice_id?.awb_number && 
+          assignmentData.assignment_id && 
+          !assignmentData.assignment_id.startsWith('DA-') &&
+          assignmentData.assignment_id !== assignmentData.invoice_id.awb_number) {
+        // This is fine - assignment_id might be different
       }
       
       return assignmentData;
@@ -46,8 +74,8 @@ router.get('/by-invoice/:invoiceId', auth, async (req, res) => {
   try {
     const assignment = await DeliveryAssignment.findOne({ invoice_id: req.params.invoiceId })
       .populate('driver_id', 'name phone vehicle_type vehicle_number')
-      .populate('request_id', 'request_id customer receiver')
-      .populate('invoice_id', 'invoice_id total_amount')
+      .populate('request_id', 'request_id customer receiver awb_number')
+      .populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address')
       .populate('client_id', 'company_name contact_name');
     
     if (!assignment) {
@@ -57,9 +85,22 @@ router.get('/by-invoice/:invoiceId', auth, async (req, res) => {
       });
     }
     
+    const assignmentData = assignment.toObject();
+    
+    // Enrich with invoice data if receiver info is missing
+    if (!assignmentData.receiver_name && assignmentData.invoice_id) {
+      assignmentData.receiver_name = assignmentData.invoice_id.receiver_name || 'N/A';
+    }
+    if (!assignmentData.receiver_phone && assignmentData.invoice_id) {
+      assignmentData.receiver_phone = assignmentData.invoice_id.receiver_phone || 'N/A';
+    }
+    if (!assignmentData.receiver_address && assignmentData.invoice_id) {
+      assignmentData.receiver_address = assignmentData.invoice_id.receiver_address || assignmentData.delivery_address || 'N/A';
+    }
+    
     res.json({
       success: true,
-      data: assignment
+      data: assignmentData
     });
   } catch (error) {
     console.error('Error fetching delivery assignment by invoice:', error);
@@ -75,8 +116,8 @@ router.get('/:id', auth, async (req, res) => {
   try {
     const assignment = await DeliveryAssignment.findById(req.params.id)
       .populate('driver_id', 'name phone vehicle_type vehicle_number')
-      .populate('request_id', 'request_id customer receiver')
-      .populate('invoice_id', 'invoice_id total_amount')
+      .populate('request_id', 'request_id customer receiver awb_number')
+      .populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address')
       .populate('client_id', 'company_name contact_name');
     
     if (!assignment) {
@@ -86,9 +127,22 @@ router.get('/:id', auth, async (req, res) => {
       });
     }
     
+    const assignmentData = assignment.toObject();
+    
+    // Enrich with invoice data if receiver info is missing
+    if (!assignmentData.receiver_name && assignmentData.invoice_id) {
+      assignmentData.receiver_name = assignmentData.invoice_id.receiver_name || 'N/A';
+    }
+    if (!assignmentData.receiver_phone && assignmentData.invoice_id) {
+      assignmentData.receiver_phone = assignmentData.invoice_id.receiver_phone || 'N/A';
+    }
+    if (!assignmentData.receiver_address && assignmentData.invoice_id) {
+      assignmentData.receiver_address = assignmentData.invoice_id.receiver_address || assignmentData.delivery_address || 'N/A';
+    }
+    
     res.json({
       success: true,
-      data: assignment
+      data: assignmentData
     });
   } catch (error) {
     console.error('Error fetching delivery assignment:', error);
@@ -226,12 +280,26 @@ router.post('/', auth, async (req, res) => {
     if (assignment.request_id) {
       await assignment.populate('request_id', 'request_id customer receiver');
     }
-    await assignment.populate('invoice_id', 'invoice_id total_amount');
+    await assignment.populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address');
     await assignment.populate('client_id', 'company_name contact_name');
+    
+    // Convert to object and ensure receiver info is included
+    const assignmentResponse = assignment.toObject();
+    
+    // Ensure receiver info is present (should already be set, but double-check)
+    if (!assignmentResponse.receiver_name && assignmentResponse.invoice_id) {
+      assignmentResponse.receiver_name = assignmentResponse.invoice_id.receiver_name || 'N/A';
+    }
+    if (!assignmentResponse.receiver_phone && assignmentResponse.invoice_id) {
+      assignmentResponse.receiver_phone = assignmentResponse.invoice_id.receiver_phone || 'N/A';
+    }
+    if (!assignmentResponse.receiver_address && assignmentResponse.invoice_id) {
+      assignmentResponse.receiver_address = assignmentResponse.invoice_id.receiver_address || assignmentResponse.delivery_address || 'N/A';
+    }
     
     res.status(201).json({
       success: true,
-      data: assignment,
+      data: assignmentResponse,
       message: 'Delivery assignment created successfully'
     });
   } catch (error) {
@@ -305,8 +373,8 @@ router.put('/:id', auth, async (req, res) => {
       updateData,
       { new: true, runValidators: true }
     ).populate('driver_id', 'name phone vehicle_type vehicle_number')
-     .populate('request_id', 'request_id customer receiver')
-     .populate('invoice_id', 'invoice_id total_amount')
+     .populate('request_id', 'request_id customer receiver awb_number')
+     .populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address')
      .populate('client_id', 'company_name contact_name');
     
     if (!assignment) {
@@ -314,6 +382,19 @@ router.put('/:id', auth, async (req, res) => {
         success: false,
         error: 'Delivery assignment not found'
       });
+    }
+    
+    const assignmentData = assignment.toObject();
+    
+    // Enrich with invoice data if receiver info is missing
+    if (!assignmentData.receiver_name && assignmentData.invoice_id) {
+      assignmentData.receiver_name = assignmentData.invoice_id.receiver_name || 'N/A';
+    }
+    if (!assignmentData.receiver_phone && assignmentData.invoice_id) {
+      assignmentData.receiver_phone = assignmentData.invoice_id.receiver_phone || 'N/A';
+    }
+    if (!assignmentData.receiver_address && assignmentData.invoice_id) {
+      assignmentData.receiver_address = assignmentData.invoice_id.receiver_address || assignmentData.delivery_address || 'N/A';
     }
     
     // If status is DELIVERED, update the invoice request delivery_status
@@ -359,7 +440,7 @@ router.put('/:id', auth, async (req, res) => {
     
     res.json({
       success: true,
-      data: assignment,
+      data: assignmentData,
       message: 'Delivery assignment updated successfully'
     });
   } catch (error) {
@@ -380,8 +461,8 @@ router.get('/qr/:qrCode', async (req, res) => {
       qr_used: false
     })
       .populate('driver_id', 'name phone vehicle_type vehicle_number')
-      .populate('request_id', 'request_id customer receiver')
-      .populate('invoice_id', 'invoice_id total_amount amount')
+      .populate('request_id', 'request_id customer receiver awb_number')
+      .populate('invoice_id', 'invoice_id total_amount amount awb_number receiver_name receiver_phone receiver_address')
       .populate('client_id', 'company_name contact_name');
     
     if (!assignment) {
@@ -414,6 +495,17 @@ router.get('/qr/:qrCode', async (req, res) => {
           console.log(`✅ Retrieved amount from invoice: ${assignmentData.amount}`);
         }
       }
+    }
+    
+    // Enrich with invoice data if receiver info is missing
+    if (!assignmentData.receiver_name && assignmentData.invoice_id) {
+      assignmentData.receiver_name = assignmentData.invoice_id.receiver_name || 'N/A';
+    }
+    if (!assignmentData.receiver_phone && assignmentData.invoice_id) {
+      assignmentData.receiver_phone = assignmentData.invoice_id.receiver_phone || 'N/A';
+    }
+    if (!assignmentData.receiver_address && assignmentData.invoice_id) {
+      assignmentData.receiver_address = assignmentData.invoice_id.receiver_address || assignmentData.delivery_address || 'N/A';
     }
     
     res.json({
@@ -492,13 +584,26 @@ router.put('/qr/:qrCode/status', async (req, res) => {
       updateData,
       { new: true, runValidators: true }
     ).populate('driver_id', 'name phone vehicle_type vehicle_number')
-     .populate('request_id', 'request_id customer receiver')
-     .populate('invoice_id', 'invoice_id total_amount')
+     .populate('request_id', 'request_id customer receiver awb_number')
+     .populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address')
      .populate('client_id', 'company_name contact_name');
+    
+    const assignmentData = updatedAssignment.toObject();
+    
+    // Enrich with invoice data if receiver info is missing
+    if (!assignmentData.receiver_name && assignmentData.invoice_id) {
+      assignmentData.receiver_name = assignmentData.invoice_id.receiver_name || 'N/A';
+    }
+    if (!assignmentData.receiver_phone && assignmentData.invoice_id) {
+      assignmentData.receiver_phone = assignmentData.invoice_id.receiver_phone || 'N/A';
+    }
+    if (!assignmentData.receiver_address && assignmentData.invoice_id) {
+      assignmentData.receiver_address = assignmentData.invoice_id.receiver_address || assignmentData.delivery_address || 'N/A';
+    }
     
     res.json({
       success: true,
-      data: updatedAssignment,
+      data: assignmentData,
       message: 'Delivery assignment updated successfully'
     });
   } catch (error) {
@@ -594,8 +699,8 @@ router.post('/qr/:qrCode/payment', async (req, res) => {
 router.get('/driver/:driverId', auth, async (req, res) => {
   try {
     const assignments = await DeliveryAssignment.find({ driver_id: req.params.driverId })
-      .populate('request_id', 'request_id customer receiver')
-      .populate('invoice_id', 'invoice_id total_amount')
+      .populate('request_id', 'request_id customer receiver awb_number')
+      .populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address')
       .populate('client_id', 'company_name contact_name')
       .sort({ createdAt: -1 });
     
