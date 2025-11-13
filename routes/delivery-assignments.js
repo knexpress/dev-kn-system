@@ -11,7 +11,7 @@ router.get('/', auth, async (req, res) => {
       .populate('driver_id', 'name phone vehicle_type vehicle_number')
       .populate('request_id', 'request_id customer receiver awb_number')
       .populate('invoice_id', 'invoice_id total_amount amount awb_number receiver_name receiver_phone receiver_address')
-      .populate('client_id', 'company_name contact_name')
+      .populate('client_id', 'company_name')
       .sort({ createdAt: -1 });
     
     // Convert Decimal128 amounts to numbers and enrich with invoice data
@@ -76,7 +76,7 @@ router.get('/by-invoice/:invoiceId', auth, async (req, res) => {
       .populate('driver_id', 'name phone vehicle_type vehicle_number')
       .populate('request_id', 'request_id customer receiver awb_number')
       .populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address')
-      .populate('client_id', 'company_name contact_name');
+      .populate('client_id', 'company_name');
     
     if (!assignment) {
       return res.status(404).json({
@@ -118,7 +118,7 @@ router.get('/:id', auth, async (req, res) => {
       .populate('driver_id', 'name phone vehicle_type vehicle_number')
       .populate('request_id', 'request_id customer receiver awb_number')
       .populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address')
-      .populate('client_id', 'company_name contact_name');
+      .populate('client_id', 'company_name');
     
     if (!assignment) {
       return res.status(404).json({
@@ -189,14 +189,19 @@ router.post('/', auth, async (req, res) => {
     const receiverPhone = invoice.receiver_phone || invoice.request_id?.receiver?.phone || 'N/A';
     const receiverAddress = invoice.receiver_address || invoice.request_id?.receiver?.address || delivery_address || 'N/A';
     
-    // Get AWB number from invoice (this will be used as tracking ID)
+    // Get AWB number from invoice (this will be used as tracking ID/assignment_id)
     const awbNumber = invoice.awb_number || invoice.request_id?.awb_number || null;
     
-    // Use AWB number as assignment_id (tracking ID) if available, otherwise generate one
-    let assignmentId = null;
-    if (awbNumber) {
-      assignmentId = awbNumber; // Use AWB number as assignment_id/tracking ID
+    // AWB number is REQUIRED - assignment_id MUST be the tracking ID
+    if (!awbNumber) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invoice must have an AWB number (tracking ID) to create a delivery assignment'
+      });
     }
+    
+    // Use AWB number as assignment_id (tracking ID) - this is mandatory
+    const assignmentId = awbNumber;
     
     // Get amount from invoice if not provided
     const invoiceAmount = amount || (invoice.total_amount ? parseFloat(invoice.total_amount.toString()) : 0);
@@ -248,10 +253,8 @@ router.post('/', auth, async (req, res) => {
       created_by: req.user.id
     };
     
-    // Set assignment_id to AWB number if available (before save, so pre-save hook won't override)
-    if (assignmentId) {
-      assignmentData.assignment_id = assignmentId;
-    }
+    // Set assignment_id to AWB number (tracking ID) - this is mandatory
+    assignmentData.assignment_id = assignmentId;
     
     // Only add request_id if it's provided
     if (request_id) {
@@ -281,7 +284,7 @@ router.post('/', auth, async (req, res) => {
       await assignment.populate('request_id', 'request_id customer receiver');
     }
     await assignment.populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address');
-    await assignment.populate('client_id', 'company_name contact_name');
+    await assignment.populate('client_id', 'company_name');
     
     // Convert to object and ensure receiver info is included
     const assignmentResponse = assignment.toObject();
@@ -375,7 +378,7 @@ router.put('/:id', auth, async (req, res) => {
     ).populate('driver_id', 'name phone vehicle_type vehicle_number')
      .populate('request_id', 'request_id customer receiver awb_number')
      .populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address')
-     .populate('client_id', 'company_name contact_name');
+     .populate('client_id', 'company_name');
     
     if (!assignment) {
       return res.status(404).json({
@@ -463,7 +466,7 @@ router.get('/qr/:qrCode', async (req, res) => {
       .populate('driver_id', 'name phone vehicle_type vehicle_number')
       .populate('request_id', 'request_id customer receiver awb_number')
       .populate('invoice_id', 'invoice_id total_amount amount awb_number receiver_name receiver_phone receiver_address')
-      .populate('client_id', 'company_name contact_name');
+      .populate('client_id', 'company_name');
     
     if (!assignment) {
       return res.status(404).json({
@@ -586,7 +589,7 @@ router.put('/qr/:qrCode/status', async (req, res) => {
     ).populate('driver_id', 'name phone vehicle_type vehicle_number')
      .populate('request_id', 'request_id customer receiver awb_number')
      .populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address')
-     .populate('client_id', 'company_name contact_name');
+     .populate('client_id', 'company_name');
     
     const assignmentData = updatedAssignment.toObject();
     
@@ -701,7 +704,7 @@ router.get('/driver/:driverId', auth, async (req, res) => {
     const assignments = await DeliveryAssignment.find({ driver_id: req.params.driverId })
       .populate('request_id', 'request_id customer receiver awb_number')
       .populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address')
-      .populate('client_id', 'company_name contact_name')
+      .populate('client_id', 'company_name')
       .sort({ createdAt: -1 });
     
     res.json({

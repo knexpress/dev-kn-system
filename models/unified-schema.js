@@ -1194,22 +1194,30 @@ cashFlowTransactionSchema.pre('save', async function(next) {
 // Delivery Assignment ID generation
 deliveryAssignmentSchema.pre('save', async function(next) {
   try {
-    // Only generate assignment_id if it's not already set (e.g., when using AWB number as tracking ID)
+    // assignment_id MUST be the tracking ID (AWB number) - no auto-generation
+    // It should be set from invoice.awb_number before saving
     if (!this.assignment_id) {
-      const DeliveryAssignmentModel = this.constructor;
-      const count = await DeliveryAssignmentModel.countDocuments();
-      this.assignment_id = `DA-${String(count + 1).padStart(6, '0')}`;
-      console.log('Generated assignment_id:', this.assignment_id);
+      // Try to get AWB number from invoice if available
+      if (this.invoice_id) {
+        const Invoice = mongoose.models.Invoice || mongoose.model('Invoice');
+        const invoice = await Invoice.findById(this.invoice_id).select('awb_number');
+        if (invoice && invoice.awb_number) {
+          this.assignment_id = invoice.awb_number;
+          console.log('✅ Set assignment_id from invoice AWB number:', this.assignment_id);
+        } else {
+          console.error('❌ ERROR: assignment_id (tracking ID/AWB number) is required but not found in invoice');
+          return next(new Error('Assignment ID (tracking ID/AWB number) is required. Invoice must have an AWB number.'));
+        }
+      } else {
+        console.error('❌ ERROR: assignment_id (tracking ID/AWB number) is required');
+        return next(new Error('Assignment ID (tracking ID/AWB number) is required.'));
+      }
     } else {
-      console.log('Using provided assignment_id (AWB/Tracking ID):', this.assignment_id);
+      console.log('✅ Using provided assignment_id (AWB/Tracking ID):', this.assignment_id);
     }
     next();
   } catch (error) {
-    console.error('Error generating assignment_id:', error);
-    if (!this.assignment_id) {
-      this.assignment_id = `DA-${Date.now().toString().slice(-6)}`;
-      console.log('Fallback assignment_id:', this.assignment_id);
-    }
+    console.error('Error setting assignment_id:', error);
     next(error);
   }
 });
