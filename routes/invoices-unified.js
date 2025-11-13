@@ -1,4 +1,5 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const { Invoice, ShipmentRequest, Client, Employee } = require('../models/unified-schema');
 const { InvoiceRequest } = require('../models');
 const empostAPI = require('../services/empost-api');
@@ -18,10 +19,18 @@ const transformInvoice = (invoice) => {
   return {
     ...invoiceObj,
     amount: convertDecimal128(invoiceObj.amount),
+    delivery_charge: convertDecimal128(invoiceObj.delivery_charge),
+    base_amount: convertDecimal128(invoiceObj.base_amount),
     tax_amount: convertDecimal128(invoiceObj.tax_amount),
     total_amount: convertDecimal128(invoiceObj.total_amount),
     weight_kg: convertDecimal128(invoiceObj.weight_kg),
     volume_cbm: convertDecimal128(invoiceObj.volume_cbm),
+    // Convert line_items Decimal128 fields
+    line_items: invoiceObj.line_items ? invoiceObj.line_items.map((item: any) => ({
+      ...item,
+      unit_price: convertDecimal128(item.unit_price),
+      total: convertDecimal128(item.total),
+    })) : invoiceObj.line_items,
   };
 };
 
@@ -315,7 +324,8 @@ router.post('/', async (req, res) => {
       tax_rate = 0, 
       notes,
       created_by,
-      due_date 
+      due_date,
+      has_delivery = false // Ask if delivery is required
     } = req.body;
     
     console.log('Extracted fields:', {
@@ -342,9 +352,99 @@ router.post('/', async (req, res) => {
       });
     }
 
-    // Calculate tax amount and total
-    const taxAmount = (amount * tax_rate) / 100;
-    const totalAmount = amount + taxAmount;
+    // Get InvoiceRequest to access shipment details for delivery charge calculation
+    let invoiceRequest = null;
+    try {
+      invoiceRequest = await InvoiceRequest.findById(request_id);
+    } catch (error) {
+      console.log('⚠️ Could not fetch InvoiceRequest for delivery calculation:', error.message);
+    }
+    
+    // Get weight and number of boxes from InvoiceRequest
+    let weight = 0;
+    let numberOfBoxes = 1;
+    let serviceCode = null;
+    
+    if (invoiceRequest) {
+      // Get weight from multiple possible sources
+      if (invoiceRequest.shipment?.weight) {
+        weight = parseFloat(invoiceRequest.shipment.weight.toString());
+      } else if (invoiceRequest.weight_kg) {
+        weight = parseFloat(invoiceRequest.weight_kg.toString());
+      } else if (invoiceRequest.verification?.chargeable_weight) {
+        weight = parseFloat(invoiceRequest.verification.chargeable_weight.toString());
+      } else if (invoiceRequest.verification?.weight) {
+        weight = parseFloat(invoiceRequest.verification.weight.toString());
+      }
+      
+      // Get number of boxes (default to 1 if not provided)
+      numberOfBoxes = invoiceRequest.shipment?.number_of_boxes || 1;
+      if (numberOfBoxes < 1) numberOfBoxes = 1;
+      
+      // Get service code
+      serviceCode = invoiceRequest.service_code || invoiceRequest.verification?.service_code || null;
+    }
+    
+    // Calculate delivery charge
+    let deliveryCharge = 0;
+    if (has_delivery) {
+      if (weight > 30) {
+        // Weight > 30 kg: Delivery is FREE
+        deliveryCharge = 0;
+        console.log('✅ Delivery is FREE (weight > 30 kg)');
+      } else {
+        // Weight ≤ 30 kg: 20 AED for first box + 5 AED per additional box
+        if (numberOfBoxes === 1) {
+          deliveryCharge = 20;
+        } else {
+          deliveryCharge = 20 + ((numberOfBoxes - 1) * 5);
+        }
+        console.log(`✅ Delivery charge calculated: ${deliveryCharge} AED (${numberOfBoxes} boxes, weight: ${weight} kg)`);
+      }
+    } else {
+      console.log('ℹ️ No delivery required, delivery charge = 0');
+    }
+    
+    // Calculate base amount (shipping + delivery)
+    const baseAmount = parseFloat(amount) + deliveryCharge;
+    
+    // Calculate tax based on service code
+    let finalTaxRate = 0;
+    let taxOnShipping = 0;
+    let taxOnDelivery = 0;
+    
+    if (serviceCode === 'PH_TO_UAE') {
+      // PH to UAE: 5% tax on delivery fees only, 0% on shipping
+      finalTaxRate = 0; // No tax on shipping
+      taxOnShipping = 0;
+      taxOnDelivery = (deliveryCharge * 5) / 100; // 5% on delivery only
+      console.log('✅ PH_TO_UAE: 5% tax on delivery fees only');
+    } else if (serviceCode === 'UAE_TO_PH') {
+      // UAE to PH: 0% tax on everything
+      finalTaxRate = 0;
+      taxOnShipping = 0;
+      taxOnDelivery = 0;
+      console.log('✅ UAE_TO_PH: 0% tax on everything');
+    } else {
+      // Default: use provided tax_rate (for backward compatibility)
+      finalTaxRate = parseFloat(tax_rate);
+      taxOnShipping = (parseFloat(amount) * finalTaxRate) / 100;
+      taxOnDelivery = (deliveryCharge * finalTaxRate) / 100;
+      console.log(`ℹ️ Using provided tax_rate: ${finalTaxRate}%`);
+    }
+    
+    // Calculate total tax and total amount
+    const totalTaxAmount = taxOnShipping + taxOnDelivery;
+    const totalAmount = baseAmount + totalTaxAmount;
+    
+    console.log('📊 Invoice Calculation Summary:');
+    console.log(`   Shipping Amount: ${amount} AED`);
+    console.log(`   Delivery Charge: ${deliveryCharge} AED`);
+    console.log(`   Base Amount: ${baseAmount} AED`);
+    console.log(`   Tax on Shipping: ${taxOnShipping} AED`);
+    console.log(`   Tax on Delivery: ${taxOnDelivery} AED`);
+    console.log(`   Total Tax: ${totalTaxAmount} AED`);
+    console.log(`   Total Amount: ${totalAmount} AED`);
 
     // Calculate due date if not provided (30 days from now)
     const invoiceDueDate = due_date ? new Date(due_date) : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
@@ -397,29 +497,23 @@ router.post('/', async (req, res) => {
       console.log('📝 Using request_id as fallback invoice_id:', invoiceIdToUse);
     }
 
-    // Try to get InvoiceRequest to populate additional fields
-    let invoiceRequest = null;
-    try {
-      invoiceRequest = await InvoiceRequest.findById(request_id);
-      if (invoiceRequest) {
-        console.log('📋 Found InvoiceRequest, will populate additional fields');
-      }
-    } catch (error) {
-      console.log('⚠️ Could not fetch InvoiceRequest:', error.message);
-    }
+    // invoiceRequest already fetched above for delivery calculation
 
     const invoiceData = {
       request_id,
       client_id,
-      amount: parseFloat(amount), // Ensure amount is a number
+      amount: mongoose.Types.Decimal128.fromString(parseFloat(amount).toFixed(2)), // Base shipping amount
+      delivery_charge: mongoose.Types.Decimal128.fromString(deliveryCharge.toFixed(2)), // Add delivery charge field
+      base_amount: mongoose.Types.Decimal128.fromString(baseAmount.toFixed(2)), // Shipping + Delivery
       due_date: invoiceDueDate,
       status: 'UNPAID',
       line_items: line_items || [],
-      tax_rate: parseFloat(tax_rate),
-      tax_amount: taxAmount,
-      total_amount: totalAmount,
+      tax_rate: finalTaxRate, // Use calculated tax rate
+      tax_amount: mongoose.Types.Decimal128.fromString(totalTaxAmount.toFixed(2)), // Total tax (shipping + delivery)
+      total_amount: mongoose.Types.Decimal128.fromString(totalAmount.toFixed(2)), // Final total
       notes,
       created_by,
+      has_delivery: has_delivery, // Store delivery flag
       // Populate fields from InvoiceRequest if available
       ...(invoiceRequest && {
         service_code: invoiceRequest.service_code || invoiceRequest.verification?.service_code || undefined,

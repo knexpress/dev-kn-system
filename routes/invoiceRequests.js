@@ -335,6 +335,11 @@ router.put('/:id/verification', async (req, res) => {
     const verificationData = req.body;
     const invoiceRequestId = req.params.id;
 
+    console.log('📝 Verification update request:', {
+      id: invoiceRequestId,
+      data: verificationData
+    });
+
     const invoiceRequest = await InvoiceRequest.findById(invoiceRequestId);
     if (!invoiceRequest) {
       return res.status(404).json({ error: 'Invoice request not found' });
@@ -345,37 +350,54 @@ router.put('/:id/verification', async (req, res) => {
       invoiceRequest.verification = {};
     }
 
+    // Helper function to safely convert to Decimal128
+    const toDecimal128 = (value) => {
+      if (value === null || value === undefined || value === '') {
+        return undefined;
+      }
+      try {
+        const numValue = parseFloat(value);
+        if (isNaN(numValue)) {
+          return undefined;
+        }
+        return new mongoose.Types.Decimal128(numValue.toFixed(2));
+      } catch (error) {
+        console.error('Error converting to Decimal128:', value, error);
+        return undefined;
+      }
+    };
+
     // Handle boxes data - convert to Decimal128 for numeric fields
     if (verificationData.boxes && Array.isArray(verificationData.boxes)) {
       invoiceRequest.verification.boxes = verificationData.boxes.map(box => ({
         items: box.items || '',
-        length: box.length ? new mongoose.Types.Decimal128(box.length.toString()) : undefined,
-        width: box.width ? new mongoose.Types.Decimal128(box.width.toString()) : undefined,
-        height: box.height ? new mongoose.Types.Decimal128(box.height.toString()) : undefined,
-        vm: box.vm ? new mongoose.Types.Decimal128(box.vm.toString()) : undefined,
+        length: toDecimal128(box.length),
+        width: toDecimal128(box.width),
+        height: toDecimal128(box.height),
+        vm: toDecimal128(box.vm),
       }));
     }
 
     // Handle total_vm
-    if (verificationData.total_vm !== undefined) {
-      invoiceRequest.verification.total_vm = new mongoose.Types.Decimal128(verificationData.total_vm.toString());
+    if (verificationData.total_vm !== undefined && verificationData.total_vm !== null && verificationData.total_vm !== '') {
+      invoiceRequest.verification.total_vm = toDecimal128(verificationData.total_vm);
     }
 
     // Handle actual_weight, volumetric_weight, chargeable_weight
-    if (verificationData.actual_weight !== undefined) {
-      invoiceRequest.verification.actual_weight = new mongoose.Types.Decimal128(verificationData.actual_weight.toString());
+    if (verificationData.actual_weight !== undefined && verificationData.actual_weight !== null && verificationData.actual_weight !== '') {
+      invoiceRequest.verification.actual_weight = toDecimal128(verificationData.actual_weight);
     }
-    if (verificationData.volumetric_weight !== undefined) {
-      invoiceRequest.verification.volumetric_weight = new mongoose.Types.Decimal128(verificationData.volumetric_weight.toString());
+    if (verificationData.volumetric_weight !== undefined && verificationData.volumetric_weight !== null && verificationData.volumetric_weight !== '') {
+      invoiceRequest.verification.volumetric_weight = toDecimal128(verificationData.volumetric_weight);
     }
-    if (verificationData.chargeable_weight !== undefined) {
-      invoiceRequest.verification.chargeable_weight = new mongoose.Types.Decimal128(verificationData.chargeable_weight.toString());
+    if (verificationData.chargeable_weight !== undefined && verificationData.chargeable_weight !== null && verificationData.chargeable_weight !== '') {
+      invoiceRequest.verification.chargeable_weight = toDecimal128(verificationData.chargeable_weight);
     }
     if (verificationData.rate_bracket !== undefined) {
       invoiceRequest.verification.rate_bracket = verificationData.rate_bracket;
     }
-    if (verificationData.calculated_rate !== undefined) {
-      invoiceRequest.verification.calculated_rate = new mongoose.Types.Decimal128(verificationData.calculated_rate.toString());
+    if (verificationData.calculated_rate !== undefined && verificationData.calculated_rate !== null && verificationData.calculated_rate !== '') {
+      invoiceRequest.verification.calculated_rate = toDecimal128(verificationData.calculated_rate);
     }
 
     // Auto-determine weight_type based on actual_weight and volumetric_weight (always override)
@@ -395,6 +417,7 @@ router.put('/:id/verification', async (req, res) => {
     // Update other verification fields (excluding weight_type, rate_bracket, calculated_rate which are handled separately above)
     Object.keys(verificationData).forEach(key => {
       if (verificationData[key] !== undefined && 
+          verificationData[key] !== null &&
           key !== 'boxes' && 
           key !== 'total_vm' && 
           key !== 'weight' && 
@@ -406,7 +429,7 @@ router.put('/:id/verification', async (req, res) => {
           key !== 'calculated_rate') { // These are handled separately above
         // Handle Decimal128 fields
         if (key === 'amount' || key === 'volume_cbm') {
-          invoiceRequest.verification[key] = new mongoose.Types.Decimal128(verificationData[key].toString());
+          invoiceRequest.verification[key] = toDecimal128(verificationData[key]);
         } else {
           invoiceRequest.verification[key] = verificationData[key];
         }
@@ -414,10 +437,10 @@ router.put('/:id/verification', async (req, res) => {
     });
 
     // Update main weight field with chargeable weight (higher of actual or volumetric)
-    if (verificationData.chargeable_weight !== undefined) {
-      invoiceRequest.weight = new mongoose.Types.Decimal128(verificationData.chargeable_weight.toString());
-    } else if (verificationData.weight !== undefined) {
-      invoiceRequest.weight = new mongoose.Types.Decimal128(verificationData.weight.toString());
+    if (verificationData.chargeable_weight !== undefined && verificationData.chargeable_weight !== null && verificationData.chargeable_weight !== '') {
+      invoiceRequest.weight = toDecimal128(verificationData.chargeable_weight);
+    } else if (verificationData.weight !== undefined && verificationData.weight !== null && verificationData.weight !== '') {
+      invoiceRequest.weight = toDecimal128(verificationData.weight);
     }
 
     // Set verification metadata
@@ -461,8 +484,14 @@ router.put('/:id/verification', async (req, res) => {
       message: 'Verification details updated successfully'
     });
   } catch (error) {
-    console.error('Error updating verification:', error);
-    res.status(500).json({ error: 'Failed to update verification details' });
+    console.error('❌ Error updating verification:', error);
+    console.error('Error stack:', error.stack);
+    console.error('Request body:', req.body);
+    res.status(500).json({ 
+      error: 'Failed to update verification details',
+      details: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
