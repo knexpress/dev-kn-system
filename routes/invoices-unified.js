@@ -26,7 +26,7 @@ const transformInvoice = (invoice) => {
     weight_kg: convertDecimal128(invoiceObj.weight_kg),
     volume_cbm: convertDecimal128(invoiceObj.volume_cbm),
     // Convert line_items Decimal128 fields
-    line_items: invoiceObj.line_items ? invoiceObj.line_items.map((item: any) => ({
+    line_items: invoiceObj.line_items ? invoiceObj.line_items.map((item) => ({
       ...item,
       unit_price: convertDecimal128(item.unit_price),
       total: convertDecimal128(item.total),
