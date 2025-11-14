@@ -5,6 +5,13 @@
 
 const mongoose = require('mongoose');
 
+const counterSchema = new mongoose.Schema({
+  _id: { type: String, required: true },
+  seq: { type: Number, default: 0 }
+});
+
+const Counter = mongoose.models.Counter || mongoose.model('Counter', counterSchema);
+
 /**
  * Generate a random uppercase letter (A-Z)
  */
@@ -20,16 +27,22 @@ function randomDigit() {
 }
 
 /**
- * Generate AWB number following the pattern: PHL2VN3KT28US9H
- * Pattern: [A-Z]{3}[0-9]{1}[A-Z]{2}[0-9]{1}[A-Z]{2}[0-9]{2}[A-Z]{2}[0-9]{1}[A-Z]{1}
- * Format: 3 letters, 1 digit, 2 letters, 1 digit, 2 letters, 2 digits, 2 letters, 1 digit, 1 letter
- * Total: 15 characters
- */
-function generateAWBNumber() {
-  // Pattern: PHL2VN3KT28US9H
-  // [A-Z]{3}[0-9]{1}[A-Z]{2}[0-9]{1}[A-Z]{2}[0-9]{2}[A-Z]{2}[0-9]{1}[A-Z]{1}
+* Generate AWB number following the pattern: PHL2VN3KT28US9H
+* Pattern: [A-Z]{3}[0-9]{1}[A-Z]{2}[0-9]{1}[A-Z]{2}[0-9]{2}[A-Z]{2}[0-9]{1}[A-Z]{1}
+* Format: 3 letters, 1 digit, 2 letters, 1 digit, 2 letters, 2 digits, 2 letters, 1 digit, 1 letter
+* Total: 15 characters
+* @param {object} options
+* @param {string} options.prefix - Optional 3-letter prefix (e.g. "PHL")
+*/
+function generateAWBNumber(options = {}) {
+  const prefix = options.prefix ? options.prefix.toUpperCase().replace(/[^A-Z]/g, '') : '';
+  let firstThree = prefix.slice(0, 3);
+  while (firstThree.length < 3) {
+    firstThree += randomLetter();
+  }
+
   const awb = 
-    randomLetter() + randomLetter() + randomLetter() + // 3 letters
+    firstThree +
     randomDigit() +                                    // 1 digit
     randomLetter() + randomLetter() +                  // 2 letters
     randomDigit() +                                    // 1 digit
@@ -48,13 +61,21 @@ function generateAWBNumber() {
  * @param {number} maxAttempts - Maximum number of attempts to generate unique ID
  * @returns {Promise<string>} Unique AWB number
  */
-async function generateUniqueAWBNumber(Model, maxAttempts = 100) {
+async function generateUniqueAWBNumber(Model, options = {}, maxAttempts = 100) {
+  if (typeof options === 'number') {
+    maxAttempts = options;
+    options = {};
+  }
+  if (typeof options?.maxAttempts === 'number') {
+    maxAttempts = options.maxAttempts;
+  }
+
   let attempts = 0;
   let awbNumber;
   let isUnique = false;
 
   while (!isUnique && attempts < maxAttempts) {
-    awbNumber = generateAWBNumber();
+    awbNumber = generateAWBNumber(options);
     
     // Check if AWB number already exists (check both awb_number and tracking_code fields)
     const existing = await Model.findOne({ 
@@ -84,12 +105,14 @@ async function generateUniqueAWBNumber(Model, maxAttempts = 100) {
  * Generate Invoice ID
  * Format: INV- followed by 6 digits (e.g., INV-000001)
  */
-function generateInvoiceID() {
-  const timestamp = Date.now();
-  const random = Math.floor(Math.random() * 1000000);
-  // Use combination of timestamp and random for uniqueness
-  const id = `INV-${String(random).padStart(6, '0')}`;
-  return id;
+async function generateInvoiceID(sequenceName = 'invoice_number_seq') {
+  const counter = await Counter.findByIdAndUpdate(
+    sequenceName,
+    { $inc: { seq: 1 } },
+    { new: true, upsert: true }
+  );
+  const nextNumber = counter.seq || 1;
+  return `INV-${String(nextNumber).padStart(6, '0')}`;
 }
 
 /**
@@ -104,7 +127,7 @@ async function generateUniqueInvoiceID(Model, maxAttempts = 100) {
   let isUnique = false;
 
   while (!isUnique && attempts < maxAttempts) {
-    invoiceID = generateInvoiceID();
+    invoiceID = await generateInvoiceID();
     
     // Check if Invoice ID already exists (check both invoice_id and invoice_number fields)
     const existing = await Model.findOne({ 
@@ -119,7 +142,6 @@ async function generateUniqueInvoiceID(Model, maxAttempts = 100) {
     } else {
       attempts++;
       if (attempts >= maxAttempts) {
-        // Fallback to timestamp-based ID for guaranteed uniqueness
         invoiceID = `INV-${Date.now().toString().slice(-8)}`;
         isUnique = true;
         console.warn('⚠️  Used fallback Invoice ID generation after maximum attempts');

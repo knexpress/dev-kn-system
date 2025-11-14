@@ -2,6 +2,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const { InvoiceRequest, Employee, Collections } = require('../models');
 const { createNotificationsForAllUsers, createNotificationsForDepartment } = require('./notifications');
+const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/id-generators');
 
 const router = express.Router();
@@ -103,7 +104,9 @@ router.post('/', async (req, res) => {
       console.log('✅ Generated Invoice ID:', invoiceNumber);
       
       // Generate unique AWB number following pattern PHL2VN3KT28US9H
-      awbNumber = await generateUniqueAWBNumber(InvoiceRequest);
+      const normalizedServiceCode = (service_code || '').toString().toUpperCase().replace(/[\s-]+/g, '_');
+      const isPhToUae = normalizedServiceCode === 'PH_TO_UAE' || normalizedServiceCode.startsWith('PH_TO_UAE_') || normalizedServiceCode === 'PHL_ARE_AIR';
+      awbNumber = await generateUniqueAWBNumber(InvoiceRequest, isPhToUae ? { prefix: 'PHL' } : {});
       console.log('✅ Generated AWB Number:', awbNumber);
     } catch (error) {
       console.error('❌ Error generating IDs:', error);
@@ -143,6 +146,11 @@ router.post('/', async (req, res) => {
     });
 
     await invoiceRequest.save();
+
+    await syncInvoiceWithEMPost({
+      requestId: invoiceRequestId,
+      reason: `Invoice request status update (${status || delivery_status || 'no status'})`,
+    });
 
     // Create notifications for relevant departments (Sales, Operations, Finance)
     const relevantDepartments = ['Sales', 'Operations', 'Finance'];
@@ -184,6 +192,11 @@ router.put('/:id', async (req, res) => {
     });
 
     await invoiceRequest.save();
+
+    await syncInvoiceWithEMPost({
+      requestId: invoiceRequestId,
+      reason: `Invoice request delivery status update (${delivery_status})`,
+    });
 
     res.json({
       success: true,
@@ -318,6 +331,11 @@ router.put('/:id/weight', async (req, res) => {
     invoiceRequest.weight = weight;
     await invoiceRequest.save();
 
+    await syncInvoiceWithEMPost({
+      requestId: invoiceRequestId,
+      reason: 'Invoice request weight update',
+    });
+
     res.json({
       success: true,
       invoiceRequest,
@@ -448,6 +466,11 @@ router.put('/:id/verification', async (req, res) => {
     
     await invoiceRequest.save();
 
+    await syncInvoiceWithEMPost({
+      requestId: invoiceRequestId,
+      reason: 'Invoice request verification details update',
+    });
+
     // Convert Decimal128 fields to numbers for JSON response
     const responseData = invoiceRequest.toObject();
     if (responseData.verification?.boxes) {
@@ -515,6 +538,11 @@ router.put('/:id/complete-verification', async (req, res) => {
     invoiceRequest.status = 'VERIFIED';
     
     await invoiceRequest.save();
+
+    await syncInvoiceWithEMPost({
+      requestId: invoiceRequestId,
+      reason: 'Invoice request verification completed',
+    });
 
     res.json({
       success: true,

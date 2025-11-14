@@ -8,7 +8,7 @@ const https = require('https');
 
 class EMpostAPIService {
   constructor() {
-    this.baseURL = process.env.EMPOST_API_BASE_URL || 'https://api-stg.epgl.ae';
+    this.baseURL = process.env.EMPOST_API_BASE_URL || 'https://api.epgl.ae';
     this.clientId = process.env.EMPOST_CLIENT_ID;
     this.clientSecret = process.env.EMPOST_CLIENT_SECRET;
     this.accessToken = null;

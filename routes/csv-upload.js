@@ -211,15 +211,32 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
         }
         
         // Get has_delivery flag from CSV (default to false)
-        const hasDeliveryValue = getColumnValue(row, ['has_delivery', 'hasdelivery', 'delivery', 'delivery_required', 'deliveryrequired', 'requires_delivery']);
-        const hasDelivery = hasDeliveryValue && (hasDeliveryValue.toString().toLowerCase() === 'true' || hasDeliveryValue.toString().toLowerCase() === 'yes' || hasDeliveryValue === '1');
+        // Bulk uploads always include delivery for PH to UAE service
+        const hasDelivery = true;
         
         // Get number of boxes from CSV (default to 1)
-        const numberOfBoxesValue = getColumnValue(row, ['number_of_boxes', 'numberofboxes', 'boxes', 'box_count', 'boxcount', 'qty_boxes', 'qtyboxes']);
-        let numberOfBoxes = numberOfBoxesValue ? parseInt(numberOfBoxesValue) : 1;
-        if (numberOfBoxes < 1) numberOfBoxes = 1;
+        const numberOfBoxesValue = getColumnValue(row, [
+          'number_of_boxes',
+          'numberofboxes',
+          'boxes',
+          'box_no',
+          'boxno',
+          'box_no.',
+          'box no',
+          'box number',
+          'box#',
+          'box count',
+          'box_count',
+          'boxcount',
+          'qty_boxes',
+          'qtyboxes',
+        ]);
+        let numberOfBoxes = numberOfBoxesValue ? parseInt(numberOfBoxesValue.toString().replace(/[^\d]/g, ''), 10) : 1;
+        if (!Number.isFinite(numberOfBoxes) || numberOfBoxes < 1) numberOfBoxes = 1;
+
+        // Get weight from CSV (handles parentheses and variations)
+        const weight = getColumnValue(row, ['weight_kg', 'weight kg', 'weightkg', 'weight(kg)', 'weight (kg)', 'weight', 'kg', 'weight_in_kg', 'weight in kg']);
         
-        // Get weight from CSV (already extracted above)
         const weightValue = weight ? parseFloat(weight) : 0;
         
         // Calculate delivery charge
@@ -245,6 +262,9 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
         // Calculate base amount (shipping + delivery)
         const baseAmount = amount + deliveryCharge;
         
+        // Service Code is fixed for bulk upload
+        const serviceCode = 'PH_TO_UAE';
+
         // Calculate tax based on service code
         let finalTaxRate = 0;
         let taxOnShipping = 0;
@@ -308,14 +328,10 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
         // Get fields from CSV for invoice (matching columns from image)
         // Invoice Number - handles "Invoice Number" column
         const invoiceNumber = getColumnValue(row, ['invoice_number', 'invoice number', 'invoicenumber', 'invoice_id', 'invoice id', 'invoiceid', 'invoice']);
-        // Created At - handles "Created At" column
+        // Created At - handles "Created At" column (used as issue date)
         const createdAt = getColumnValue(row, ['created_at', 'created at', 'createdat', 'date', 'created', 'invoice_date', 'invoice date', 'invoicedate']);
         // Tracking Code - handles "Tracking Code" column
         const trackingCode = getColumnValue(row, ['tracking_code', 'tracking code', 'trackingcode', 'tracking', 'awb_number', 'awb number', 'awbnumber', 'awb']);
-        // Service Code - handles "Service Code" column
-        const serviceCode = getColumnValue(row, ['service_code', 'service code', 'servicecode', 'service']);
-        // Weight (KG) - handles "Weight (KG)" column with parentheses
-        const weight = getColumnValue(row, ['weight_kg', 'weight kg', 'weightkg', 'weight(kg)', 'weight (kg)', 'weight', 'kg', 'weight_in_kg', 'weight in kg']);
         // Volume (CBM) - handles "Volume (CBM)" column with parentheses
         const volume = getColumnValue(row, ['volume_cbm', 'volume cbm', 'volumecbm', 'volume(cbm)', 'volume (cbm)', 'volume', 'cbm', 'volume_in_cbm', 'volume in cbm']);
         
@@ -351,9 +367,10 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
         }
         
         // If tracking code (AWB) not provided, generate one
-        if (!finalTrackingCode) {
+        const phlTrackingRegex = /^PHL[A-Z0-9]{12}$/;
+        if (!finalTrackingCode || (serviceCode === 'PH_TO_UAE' && !phlTrackingRegex.test(finalTrackingCode))) {
           try {
-            finalTrackingCode = await generateUniqueAWBNumber(Invoice);
+            finalTrackingCode = await generateUniqueAWBNumber(Invoice, { prefix: 'PHL' });
             console.log('✅ Auto-generated AWB Number:', finalTrackingCode);
           } catch (error) {
             console.error('❌ Error generating AWB Number:', error);
@@ -371,7 +388,7 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
           if (existingWithTracking) {
             // Tracking code already exists - generate a unique one
             try {
-              finalTrackingCode = await generateUniqueAWBNumber(Invoice);
+              finalTrackingCode = await generateUniqueAWBNumber(Invoice, { prefix: 'PHL' });
               console.log(`⚠️  Tracking code ${trackingCode} already exists. Generated unique AWB: ${finalTrackingCode}`);
             } catch (error) {
               console.error('❌ Error generating unique AWB Number:', error);
@@ -403,6 +420,7 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
           notes: notes || (serviceCode ? `Service Code: ${serviceCode}` : ''),
           created_by: req.user.id,
           has_delivery: hasDelivery, // Store delivery flag
+          batch_number: invoiceNumber ? invoiceNumber.toString().trim() : undefined,
           // Add all fields from CSV columns
           invoice_id: finalInvoiceId, // Use invoice_number from CSV or auto-generated
           awb_number: finalTrackingCode, // Use tracking_code from CSV or auto-generated
@@ -524,7 +542,7 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
             cargo_details: cargoDetails,
             line_items: invoice.line_items,
             tax_rate: invoice.tax_rate,
-            tax_amount: taxAmount?.toString() || '0',
+            tax_amount: totalTaxAmount?.toString() || '0',
             due_date: invoice.due_date,
             current_status: invoice.status
           };

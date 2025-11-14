@@ -577,6 +577,16 @@ const invoiceSchema = new mongoose.Schema({
     ref: 'Client',
     required: true,
   },
+  customer_trn: {
+    type: String,
+    required: false,
+    trim: true,
+  },
+  batch_number: {
+    type: String,
+    required: false,
+    trim: true,
+  },
   amount: {
     type: mongoose.Schema.Types.Decimal128,
     required: true,
@@ -886,8 +896,8 @@ const deliveryAssignmentSchema = new mongoose.Schema({
   status: {
     type: String,
     required: true,
-    enum: ['ASSIGNED', 'PICKED_UP', 'IN_TRANSIT', 'DELIVERED', 'FAILED', 'RETURNED'],
-    default: 'ASSIGNED',
+    enum: ['DELIVERED', 'NOT_DELIVERED'],
+    default: 'NOT_DELIVERED',
   },
   pickup_date: {
     type: Date,

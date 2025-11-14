@@ -4,6 +4,8 @@ const auth = require('../middleware/auth');
 const { DeliveryAssignment, Driver, ShipmentRequest, Invoice, Client } = require('../models/unified-schema');
 const crypto = require('crypto');
 
+const normalizeAssignmentStatus = (status) => status === 'DELIVERED' ? 'DELIVERED' : 'NOT_DELIVERED';
+
 // GET /api/delivery-assignments - Get all delivery assignments
 router.get('/', auth, async (req, res) => {
   try {
@@ -52,6 +54,11 @@ router.get('/', auth, async (req, res) => {
         // Replace old DA- format with AWB number (tracking ID)
         assignmentData.assignment_id = assignmentData.invoice_id.awb_number;
         console.log(`🔄 Updated assignment_id from DA- format to AWB: ${assignmentData.invoice_id.awb_number}`);
+      }
+
+      const normalizedStatus = normalizeAssignmentStatus(assignmentData.status);
+      if (assignmentData.status !== normalizedStatus) {
+        assignmentData.status = normalizedStatus;
       }
       
       return assignmentData;
@@ -105,6 +112,12 @@ router.get('/by-invoice/:invoiceId', auth, async (req, res) => {
         assignmentData.assignment_id.startsWith('DA-')) {
       assignmentData.assignment_id = assignmentData.invoice_id.awb_number;
     }
+
+    assignmentData.status = normalizeAssignmentStatus(assignmentData.status);
+
+    assignmentData.status = normalizeAssignmentStatus(assignmentData.status);
+
+    assignmentData.status = normalizeAssignmentStatus(assignmentData.status);
     
     res.json({
       success: true,
@@ -154,6 +167,8 @@ router.get('/:id', auth, async (req, res) => {
         assignmentData.assignment_id.startsWith('DA-')) {
       assignmentData.assignment_id = assignmentData.invoice_id.awb_number;
     }
+
+    assignmentData.status = normalizeAssignmentStatus(assignmentData.status);
     
     res.json({
       success: true,
@@ -334,8 +349,9 @@ router.post('/', auth, async (req, res) => {
 router.put('/:id', auth, async (req, res) => {
   try {
     const { status, pickup_date, delivery_date, payment_method, payment_reference, payment_notes, driver_name, driver_phone } = req.body;
+    const normalizedStatus = status === 'DELIVERED' ? 'DELIVERED' : 'NOT_DELIVERED';
     
-    const updateData = { status };
+    const updateData = { status: normalizedStatus };
     
     if (pickup_date) updateData.pickup_date = pickup_date;
     if (delivery_date) updateData.delivery_date = delivery_date;
@@ -381,7 +397,7 @@ router.put('/:id', auth, async (req, res) => {
     }
     
     // If status is DELIVERED and payment_method is provided, mark payment as collected
-    if (status === 'DELIVERED' && payment_method) {
+    if (normalizedStatus === 'DELIVERED' && payment_method) {
       updateData.payment_collected = true;
       updateData.payment_collected_at = new Date();
     }
@@ -423,7 +439,7 @@ router.put('/:id', auth, async (req, res) => {
     }
     
     // If status is DELIVERED, update the invoice request delivery_status
-    if (status === 'DELIVERED') {
+    if (normalizedStatus === 'DELIVERED') {
       try {
         const { InvoiceRequest } = require('../models');
         
@@ -440,21 +456,34 @@ router.put('/:id', auth, async (req, res) => {
           const { Invoice } = require('../models/unified-schema');
           const invoice = await Invoice.findById(invoiceId);
           
-          if (invoice && invoice.invoice_id) {
+          if (invoice) {
             console.log('📝 Found invoice with invoice_id:', invoice.invoice_id);
-            
-            // The invoice_id field in the invoice is the same as the invoice request _id
-            const invoiceRequest = await InvoiceRequest.findById(invoice.invoice_id);
-            
+
+            let invoiceRequest = null;
+            if (invoice.request_id) {
+              invoiceRequest = await InvoiceRequest.findById(invoice.request_id);
+            }
+
+            if (!invoiceRequest && invoice.invoice_id) {
+              invoiceRequest = await InvoiceRequest.findOne({ invoice_number: invoice.invoice_id });
+            }
+
+            if (!invoiceRequest && invoice.notes) {
+              const match = invoice.notes.match(/Invoice for request ([a-fA-F0-9]{24})/);
+              if (match && match[1]) {
+                invoiceRequest = await InvoiceRequest.findById(match[1]);
+              }
+            }
+
             if (invoiceRequest) {
               invoiceRequest.delivery_status = 'DELIVERED';
               await invoiceRequest.save();
               console.log('✅ Invoice request delivery_status updated to DELIVERED');
             } else {
-              console.warn('⚠️ Invoice request not found for invoice_id:', invoice.invoice_id);
+              console.warn('⚠️ Invoice request not found for invoice:', invoice.invoice_id || invoice._id);
             }
           } else {
-            console.warn('⚠️ Invoice not found or has no invoice_id');
+            console.warn('⚠️ Invoice not found or has no link to request');
           }
         }
       } catch (syncError) {
@@ -556,7 +585,8 @@ router.get('/qr/:qrCode', async (req, res) => {
 // PUT /api/delivery-assignments/qr/:qrCode/status - Update assignment status via QR code (no auth required)
 router.put('/qr/:qrCode/status', async (req, res) => {
   try {
-    const { status, pickup_date, delivery_date, driver_name, driver_phone } = req.body;
+    const { status, delivery_date, driver_name, driver_phone } = req.body;
+    const normalizedStatus = status === 'DELIVERED' ? 'DELIVERED' : 'NOT_DELIVERED';
     
     // Find assignment by QR code
     const assignment = await DeliveryAssignment.findOne({ 
@@ -571,10 +601,13 @@ router.put('/qr/:qrCode/status', async (req, res) => {
       });
     }
     
-    const updateData = { status };
+    const updateData = { status: normalizedStatus };
     
-    if (pickup_date) updateData.pickup_date = pickup_date;
-    if (delivery_date) updateData.delivery_date = delivery_date;
+    if (normalizedStatus === 'DELIVERED') {
+      updateData.delivery_date = delivery_date || new Date();
+    } else {
+      updateData.delivery_date = null;
+    }
     
     // Handle driver information - create or update Driver record
     if (driver_name && driver_phone) {

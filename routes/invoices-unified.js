@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const { Invoice, ShipmentRequest, Client, Employee } = require('../models/unified-schema');
 const { InvoiceRequest } = require('../models');
 const empostAPI = require('../services/empost-api');
+const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 // const { createNotificationsForAllUsers } = require('./notifications');
 
 const router = express.Router();
@@ -402,7 +403,9 @@ router.post('/', async (req, res) => {
       notes,
       created_by,
       due_date,
-      has_delivery = false // Ask if delivery is required
+      has_delivery = false,
+      customer_trn,
+      batch_number
     } = req.body;
     
     console.log('Extracted fields:', {
@@ -426,6 +429,12 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ 
         success: false,
         error: 'Request ID, client ID, amount, and created by are required' 
+      });
+    }
+    if (!batch_number || !batch_number.toString().trim()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Batch number is required when generating an invoice'
       });
     }
 
@@ -583,6 +592,8 @@ router.post('/', async (req, res) => {
       notes,
       created_by,
       has_delivery: has_delivery, // Store delivery flag
+      ...(customer_trn ? { customer_trn } : {}),
+      batch_number: batch_number.toString().trim(),
       // Populate fields from InvoiceRequest if available
       ...(invoiceRequest && {
         service_code: invoiceRequest.service_code || invoiceRequest.verification?.service_code || undefined,
@@ -623,6 +634,11 @@ router.post('/', async (req, res) => {
     });
     
     await invoice.save();
+
+    await syncInvoiceWithEMPost({
+      invoiceId: invoice._id,
+      reason: `Invoice status update (${status})`,
+    });
     
     console.log('✅ Invoice saved successfully:', {
       _id: invoice._id,
@@ -848,6 +864,11 @@ router.put('/:id/status', async (req, res) => {
 
     await invoice.save();
 
+    await syncInvoiceWithEMPost({
+      invoiceId: invoice._id,
+      reason: 'Invoice remitted status update',
+    });
+
     // Sync invoice status to shipment request if they share the same ID
     try {
       if (invoice.request_id) {
@@ -1045,6 +1066,11 @@ router.put('/:id', async (req, res) => {
 
     Object.assign(invoice, updateData);
     await invoice.save();
+
+    await syncInvoiceWithEMPost({
+      invoiceId: invoice._id,
+      reason: 'Invoice update',
+    });
 
     // Populate the updated invoice for response
     const populatedInvoice = await Invoice.findById(invoice._id)
