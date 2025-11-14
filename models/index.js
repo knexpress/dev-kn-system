@@ -16,7 +16,7 @@ const departmentSchema = new mongoose.Schema({
   timestamps: true,
 });
 
-departmentSchema.index({ name: 1 }, { unique: true });
+// name index is automatically created by unique: true
 
 // Employee Schema
 const employeeSchema = new mongoose.Schema({
@@ -38,7 +38,7 @@ const employeeSchema = new mongoose.Schema({
   timestamps: true,
 });
 
-employeeSchema.index({ email: 1 }, { unique: true });
+// email index is automatically created by unique: true
 employeeSchema.index({ department_id: 1 });
 
 // User Schema
@@ -101,7 +101,7 @@ userSchema.methods.comparePassword = async function(candidatePassword) {
   return bcrypt.compare(candidatePassword, this.password);
 };
 
-userSchema.index({ email: 1 }, { unique: true });
+// email index is automatically created by unique: true
 userSchema.index({ department_id: 1 });
 userSchema.index({ role: 1 });
 
@@ -200,7 +200,7 @@ const requestSchema = new mongoose.Schema({
 
 requestSchema.index({ client_id: 1 });
 requestSchema.index({ status: 1 });
-requestSchema.index({ awb_number: 1 }, { unique: true });
+// awb_number index is automatically created by unique: true
 requestSchema.index({ assigned_to_employee_id: 1 });
 
 // Ticket Schema
@@ -365,9 +365,7 @@ chatRoomSchema.index({ participants: 1 });
 chatRoomSchema.index({ user_ids: 1 });
 chatRoomSchema.index({ room_type: 1 });
 chatRoomSchema.index({ is_active: 1 });
-// Compound index for finding direct chat rooms between two users
-chatRoomSchema.index({ room_type: 1, user_ids: 1 });
-// Ensure unique direct chat rooms between two users
+// Ensure unique direct chat rooms between two users (compound index with uniqueness)
 chatRoomSchema.index({ room_type: 1, user_ids: 1 }, { 
   unique: true, 
   sparse: true,
@@ -742,7 +740,7 @@ const collectionsSchema = new mongoose.Schema({
   timestamps: true,
 });
 
-collectionsSchema.index({ invoice_id: 1 }, { unique: true });
+// invoice_id index is automatically created by unique: true
 collectionsSchema.index({ status: 1 });
 collectionsSchema.index({ due_date: 1 });
 collectionsSchema.index({ client_name: 1 });

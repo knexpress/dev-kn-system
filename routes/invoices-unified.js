@@ -7,6 +7,16 @@ const empostAPI = require('../services/empost-api');
 
 const router = express.Router();
 
+const REQUEST_POPULATE_FIELDS = 'request_id awb_number customer route status shipment verification number_of_boxes origin_place destination_place receiver_name receiver_address receiver_phone';
+
+const normalizeServiceCode = (code = '') =>
+  code.toString().toUpperCase().replace(/[\s-]+/g, '_');
+
+const isPhToUaeService = (code = '') => {
+  const normalized = normalizeServiceCode(code || '');
+  return normalized === 'PH_TO_UAE' || normalized.startsWith('PH_TO_UAE_');
+};
+
 // Helper function to convert Decimal128 to number
 const convertDecimal128 = (value) => {
   if (!value) return null;
@@ -39,7 +49,7 @@ router.get('/', async (req, res) => {
   try {
     console.log('🔄 Fetching invoices from database...');
     const invoices = await Invoice.find()
-      .populate('request_id', 'request_id awb_number customer route status')
+      .populate('request_id', REQUEST_POPULATE_FIELDS)
       .populate('client_id', 'company_name contact_name email phone')
       .populate('created_by', 'full_name email department_id')
       .sort({ createdAt: -1 });
@@ -140,6 +150,39 @@ router.get('/', async (req, res) => {
               console.log(`  ✅ Populated receiver_phone: ${transformed.receiver_phone}`);
             }
             
+            // Populate number_of_boxes
+            const detectedBoxes = invoiceRequest.verification?.number_of_boxes ||
+                                  invoiceRequest.number_of_boxes ||
+                                  invoiceRequest.shipment?.number_of_boxes ||
+                                  invoiceRequest.shipment?.boxes_count;
+            if (!transformed.number_of_boxes || transformed.number_of_boxes === 0) {
+              transformed.number_of_boxes = detectedBoxes || 1;
+              console.log(`  ✅ Populated number_of_boxes: ${transformed.number_of_boxes}`);
+            }
+            // Ensure request_id field in response contains full invoice request when missing
+            const invoiceRequestObj = invoiceRequest.toObject ? invoiceRequest.toObject() : invoiceRequest;
+            const existingRequestData =
+              transformed.request_id && typeof transformed.request_id === 'object'
+                ? transformed.request_id
+                : {};
+            const mergedVerification = {
+              ...(invoiceRequestObj.verification || {}),
+              ...(existingRequestData.verification || {})
+            };
+            if (!mergedVerification.number_of_boxes) {
+              mergedVerification.number_of_boxes = transformed.number_of_boxes;
+            }
+            transformed.request_id = {
+              ...invoiceRequestObj,
+              ...existingRequestData,
+              verification: mergedVerification,
+              number_of_boxes:
+                existingRequestData.number_of_boxes ||
+                invoiceRequestObj.number_of_boxes ||
+                invoiceRequestObj.shipment?.number_of_boxes ||
+                transformed.number_of_boxes
+            };
+            
             // Also update the invoice's request_id in the database if it was null
             if (!invoiceObj.request_id && invoiceRequest._id) {
               try {
@@ -180,7 +223,7 @@ router.get('/', async (req, res) => {
 router.get('/:id', async (req, res) => {
   try {
     const invoice = await Invoice.findById(req.params.id)
-      .populate('request_id', 'request_id awb_number customer route status')
+      .populate('request_id', REQUEST_POPULATE_FIELDS)
       .populate('client_id', 'company_name contact_name email phone')
       .populate('created_by', 'full_name email department_id');
     
@@ -276,6 +319,40 @@ router.get('/:id', async (req, res) => {
             transformed.receiver_phone = invoiceRequest.receiver_phone || invoiceRequest.verification?.receiver_phone;
             console.log(`  ✅ Populated receiver_phone: ${transformed.receiver_phone}`);
           }
+
+          // Populate number_of_boxes
+          const detectedBoxes = invoiceRequest.verification?.number_of_boxes ||
+                                invoiceRequest.number_of_boxes ||
+                                invoiceRequest.shipment?.number_of_boxes ||
+                                invoiceRequest.shipment?.boxes_count;
+          if (!transformed.number_of_boxes || transformed.number_of_boxes === 0) {
+            transformed.number_of_boxes = detectedBoxes || 1;
+            console.log(`  ✅ Populated number_of_boxes: ${transformed.number_of_boxes}`);
+          }
+
+          // Ensure request_id field includes invoice request details
+          const invoiceRequestObj = invoiceRequest.toObject ? invoiceRequest.toObject() : invoiceRequest;
+          const existingRequestData =
+            transformed.request_id && typeof transformed.request_id === 'object'
+              ? transformed.request_id
+              : {};
+          const mergedVerification = {
+            ...(invoiceRequestObj.verification || {}),
+            ...(existingRequestData.verification || {})
+          };
+          if (!mergedVerification.number_of_boxes) {
+            mergedVerification.number_of_boxes = transformed.number_of_boxes;
+          }
+          transformed.request_id = {
+            ...invoiceRequestObj,
+            ...existingRequestData,
+            verification: mergedVerification,
+            number_of_boxes:
+              existingRequestData.number_of_boxes ||
+              invoiceRequestObj.number_of_boxes ||
+              invoiceRequestObj.shipment?.number_of_boxes ||
+              transformed.number_of_boxes
+          };
           
           // Also update the invoice's request_id in the database if it was null
           if (!invoiceObj.request_id && invoiceRequest._id) {
@@ -378,8 +455,12 @@ router.post('/', async (req, res) => {
       }
       
       // Get number of boxes (default to 1 if not provided)
-      numberOfBoxes = invoiceRequest.shipment?.number_of_boxes || 1;
-      if (numberOfBoxes < 1) numberOfBoxes = 1;
+      const detectedBoxes = invoiceRequest.shipment?.number_of_boxes ||
+                            invoiceRequest.verification?.number_of_boxes ||
+                            invoiceRequest.number_of_boxes ||
+                            invoiceRequest.shipment?.boxes_count;
+      numberOfBoxes = parseInt(detectedBoxes, 10);
+      if (!Number.isFinite(numberOfBoxes) || numberOfBoxes < 1) numberOfBoxes = 1;
       
       // Get service code
       serviceCode = invoiceRequest.service_code || invoiceRequest.verification?.service_code || null;
@@ -408,29 +489,17 @@ router.post('/', async (req, res) => {
     // Calculate base amount (shipping + delivery)
     const baseAmount = parseFloat(amount) + deliveryCharge;
     
-    // Calculate tax based on service code
+    // Calculate tax: 5% on delivery only when delivery charge exists
     let finalTaxRate = 0;
     let taxOnShipping = 0;
     let taxOnDelivery = 0;
     
-    if (serviceCode === 'PH_TO_UAE') {
-      // PH to UAE: 5% tax on delivery fees only, 0% on shipping
-      finalTaxRate = 0; // No tax on shipping
-      taxOnShipping = 0;
-      taxOnDelivery = (deliveryCharge * 5) / 100; // 5% on delivery only
-      console.log('✅ PH_TO_UAE: 5% tax on delivery fees only');
-    } else if (serviceCode === 'UAE_TO_PH') {
-      // UAE to PH: 0% tax on everything
-      finalTaxRate = 0;
-      taxOnShipping = 0;
-      taxOnDelivery = 0;
-      console.log('✅ UAE_TO_PH: 0% tax on everything');
+    if (deliveryCharge > 0 && isPhToUaeService(serviceCode)) {
+      finalTaxRate = 5;
+      taxOnDelivery = (deliveryCharge * 5) / 100;
+      console.log('✅ Applying 5% tax on delivery charge only (PH to UAE)');
     } else {
-      // Default: use provided tax_rate (for backward compatibility)
-      finalTaxRate = parseFloat(tax_rate);
-      taxOnShipping = (parseFloat(amount) * finalTaxRate) / 100;
-      taxOnDelivery = (deliveryCharge * finalTaxRate) / 100;
-      console.log(`ℹ️ Using provided tax_rate: ${finalTaxRate}%`);
+      console.log('ℹ️ No applicable delivery tax (either no delivery charge or non PH to UAE service)');
     }
     
     // Calculate total tax and total amount
@@ -563,7 +632,7 @@ router.post('/', async (req, res) => {
 
     // Populate the created invoice for response
     const populatedInvoice = await Invoice.findById(invoice._id)
-      .populate('request_id', 'request_id awb_number customer route status')
+      .populate('request_id', REQUEST_POPULATE_FIELDS)
       .populate('client_id', 'company_name contact_name email phone address city country')
       .populate('created_by', 'full_name email department_id');
 
@@ -808,7 +877,7 @@ router.put('/:id/status', async (req, res) => {
 
     // Populate the updated invoice for response
     const populatedInvoice = await Invoice.findById(invoice._id)
-      .populate('request_id', 'request_id awb_number customer route status')
+      .populate('request_id', REQUEST_POPULATE_FIELDS)
       .populate('client_id', 'company_name contact_name email phone')
       .populate('created_by', 'full_name email department_id');
 
@@ -870,7 +939,7 @@ router.patch('/:id/remit', async (req, res) => {
       // Get client details for the description
       const populatedInvoice = await Invoice.findById(invoice._id)
         .populate('client_id', 'company_name contact_name')
-        .populate('request_id', 'request_id awb_number');
+        .populate('request_id', REQUEST_POPULATE_FIELDS);
       
       const clientName = populatedInvoice.client_id?.company_name || 'Unknown Client';
       const requestId = populatedInvoice.request_id?.request_id || 'N/A';
@@ -931,7 +1000,7 @@ router.patch('/:id/remit', async (req, res) => {
 
     // Populate the updated invoice for response
     const populatedInvoice = await Invoice.findById(invoice._id)
-      .populate('request_id', 'request_id awb_number customer route status')
+      .populate('request_id', REQUEST_POPULATE_FIELDS)
       .populate('client_id', 'company_name contact_name email phone')
       .populate('created_by', 'full_name email department_id');
 
@@ -979,7 +1048,7 @@ router.put('/:id', async (req, res) => {
 
     // Populate the updated invoice for response
     const populatedInvoice = await Invoice.findById(invoice._id)
-      .populate('request_id', 'request_id awb_number customer route status')
+      .populate('request_id', REQUEST_POPULATE_FIELDS)
       .populate('client_id', 'company_name contact_name email phone')
       .populate('created_by', 'full_name email department_id');
 
@@ -1031,7 +1100,7 @@ router.get('/client/:clientId', async (req, res) => {
     const { clientId } = req.params;
     
     const invoices = await Invoice.find({ client_id: clientId })
-      .populate('request_id', 'request_id awb_number customer route status')
+      .populate('request_id', REQUEST_POPULATE_FIELDS)
       .populate('client_id', 'company_name contact_name email phone')
       .populate('created_by', 'full_name email department_id')
       .sort({ createdAt: -1 });
@@ -1055,7 +1124,7 @@ router.get('/status/:status', async (req, res) => {
     const { status } = req.params;
     
     const invoices = await Invoice.find({ status: status.toUpperCase() })
-      .populate('request_id', 'request_id awb_number customer route status')
+      .populate('request_id', REQUEST_POPULATE_FIELDS)
       .populate('client_id', 'company_name contact_name email phone')
       .populate('created_by', 'full_name email department_id')
       .sort({ createdAt: -1 });

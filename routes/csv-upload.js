@@ -1,4 +1,5 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const multer = require('multer');
 const csv = require('csv-parser');
 const { Readable } = require('stream');
@@ -209,36 +210,79 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
           amount = parseFloat(altAmount || 0);
         }
         
-        // Get tax rate (default to 5% if not provided, or 0 if tax not applicable)
-        const taxRateValue = getColumnValue(row, ['tax_rate', 'taxrate', 'tax', 'tax_percent', 'vat_rate', 'vat']);
-        let taxRate = parseFloat(taxRateValue || 5); // Default 5% VAT in UAE
+        // Get has_delivery flag from CSV (default to false)
+        const hasDeliveryValue = getColumnValue(row, ['has_delivery', 'hasdelivery', 'delivery', 'delivery_required', 'deliveryrequired', 'requires_delivery']);
+        const hasDelivery = hasDeliveryValue && (hasDeliveryValue.toString().toLowerCase() === 'true' || hasDeliveryValue.toString().toLowerCase() === 'yes' || hasDeliveryValue === '1');
         
-        // Check if amount includes tax (if total_amount is provided and different from amount)
-        const totalAmountValue = getColumnValue(row, ['total_amount', 'totalamount', 'total', 'grand_total', 'amount_with_tax']);
-        const totalAmountProvided = totalAmountValue ? parseFloat(totalAmountValue) : null;
+        // Get number of boxes from CSV (default to 1)
+        const numberOfBoxesValue = getColumnValue(row, ['number_of_boxes', 'numberofboxes', 'boxes', 'box_count', 'boxcount', 'qty_boxes', 'qtyboxes']);
+        let numberOfBoxes = numberOfBoxesValue ? parseInt(numberOfBoxesValue) : 1;
+        if (numberOfBoxes < 1) numberOfBoxes = 1;
         
-        // Calculate tax and total amounts
-        let taxAmount = 0;
-        let totalAmount = amount;
+        // Get weight from CSV (already extracted above)
+        const weightValue = weight ? parseFloat(weight) : 0;
         
-        if (totalAmountProvided && totalAmountProvided > amount && amount > 0) {
-          // Total amount is provided and is greater than base amount - calculate tax
-          totalAmount = totalAmountProvided;
-          taxAmount = totalAmount - amount;
-          // Recalculate tax rate based on actual values
-          if (amount > 0) {
-            taxRate = (taxAmount / amount) * 100;
+        // Calculate delivery charge
+        let deliveryCharge = 0;
+        if (hasDelivery) {
+          if (weightValue > 30) {
+            // Weight > 30 kg: Delivery is FREE
+            deliveryCharge = 0;
+            console.log(`✅ Delivery is FREE (weight ${weightValue} kg > 30 kg)`);
+          } else {
+            // Weight ≤ 30 kg: 20 AED for first box + 5 AED per additional box
+            if (numberOfBoxes === 1) {
+              deliveryCharge = 20;
+            } else {
+              deliveryCharge = 20 + ((numberOfBoxes - 1) * 5);
+            }
+            console.log(`✅ Delivery charge calculated: ${deliveryCharge} AED (${numberOfBoxes} boxes, weight: ${weightValue} kg)`);
           }
-        } else if (taxRate > 0 && amount > 0) {
-          // Calculate tax from tax rate
-          taxAmount = (amount * taxRate) / 100;
-          totalAmount = amount + taxAmount;
         } else {
-          // No tax
-          taxRate = 0;
-          taxAmount = 0;
-          totalAmount = amount;
+          console.log('ℹ️ No delivery required, delivery charge = 0');
         }
+        
+        // Calculate base amount (shipping + delivery)
+        const baseAmount = amount + deliveryCharge;
+        
+        // Calculate tax based on service code
+        let finalTaxRate = 0;
+        let taxOnShipping = 0;
+        let taxOnDelivery = 0;
+        
+        if (serviceCode === 'PH_TO_UAE') {
+          // PH to UAE: 5% tax on delivery fees only, 0% on shipping
+          finalTaxRate = 0; // No tax on shipping
+          taxOnShipping = 0;
+          taxOnDelivery = (deliveryCharge * 5) / 100; // 5% on delivery only
+          console.log('✅ PH_TO_UAE: 5% tax on delivery fees only');
+        } else if (serviceCode === 'UAE_TO_PH') {
+          // UAE to PH: 0% tax on everything
+          finalTaxRate = 0;
+          taxOnShipping = 0;
+          taxOnDelivery = 0;
+          console.log('✅ UAE_TO_PH: 0% tax on everything');
+        } else {
+          // Default: use provided tax_rate from CSV or 0
+          const taxRateValue = getColumnValue(row, ['tax_rate', 'taxrate', 'tax', 'tax_percent', 'vat_rate', 'vat']);
+          finalTaxRate = taxRateValue ? parseFloat(taxRateValue) : 0;
+          taxOnShipping = (amount * finalTaxRate) / 100;
+          taxOnDelivery = (deliveryCharge * finalTaxRate) / 100;
+          console.log(`ℹ️ Using provided tax_rate: ${finalTaxRate}%`);
+        }
+        
+        // Calculate total tax and total amount
+        const totalTaxAmount = taxOnShipping + taxOnDelivery;
+        const totalAmount = baseAmount + totalTaxAmount;
+        
+        console.log('📊 CSV Invoice Calculation Summary:');
+        console.log(`   Shipping Amount: ${amount} AED`);
+        console.log(`   Delivery Charge: ${deliveryCharge} AED`);
+        console.log(`   Base Amount: ${baseAmount} AED`);
+        console.log(`   Tax on Shipping: ${taxOnShipping} AED`);
+        console.log(`   Tax on Delivery: ${taxOnDelivery} AED`);
+        console.log(`   Total Tax: ${totalTaxAmount} AED`);
+        console.log(`   Total Amount: ${totalAmount} AED`);
 
         if (amount <= 0) {
           errors.push({
@@ -338,24 +382,27 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
         }
         
         // Create invoice with all data from CSV
-        // Ensure amount is base amount (without tax) for invoice.amount
+        // Ensure amount is base shipping amount (without delivery and tax)
         const invoiceData = {
           client_id: client._id,
-          amount: amount, // Base amount without tax - this is critical for EMpost integration
+          amount: mongoose.Types.Decimal128.fromString(amount.toFixed(2)), // Base shipping amount
+          delivery_charge: mongoose.Types.Decimal128.fromString(deliveryCharge.toFixed(2)), // Delivery charge
+          base_amount: mongoose.Types.Decimal128.fromString(baseAmount.toFixed(2)), // Shipping + Delivery
           issue_date: createdAt ? new Date(createdAt) : new Date(), // Use created_at from CSV
           due_date: dueDate ? new Date(dueDate) : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // Default 30 days
           status: 'UNPAID',
           line_items: [{
             description: description || serviceCode || 'Shipping Service',
             quantity: parseFloat(quantity || 1),
-            unit_price: amount, // Base unit price without tax
-            total: amount // Base total without tax
+            unit_price: mongoose.Types.Decimal128.fromString(amount.toFixed(2)), // Base unit price without tax
+            total: mongoose.Types.Decimal128.fromString(amount.toFixed(2)) // Base total without tax
           }],
-          tax_rate: taxRate,
-          tax_amount: taxAmount, // Tax amount calculated
-          total_amount: totalAmount, // Total amount (base + tax)
+          tax_rate: finalTaxRate, // Use calculated tax rate
+          tax_amount: mongoose.Types.Decimal128.fromString(totalTaxAmount.toFixed(2)), // Total tax (shipping + delivery)
+          total_amount: mongoose.Types.Decimal128.fromString(totalAmount.toFixed(2)), // Total amount (base + tax)
           notes: notes || (serviceCode ? `Service Code: ${serviceCode}` : ''),
           created_by: req.user.id,
+          has_delivery: hasDelivery, // Store delivery flag
           // Add all fields from CSV columns
           invoice_id: finalInvoiceId, // Use invoice_number from CSV or auto-generated
           awb_number: finalTrackingCode, // Use tracking_code from CSV or auto-generated
@@ -369,9 +416,11 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
         
         // Log invoice data for debugging
         console.log('💰 Invoice amounts:', {
-          base_amount: amount,
-          tax_rate: taxRate,
-          tax_amount: taxAmount,
+          shipping_amount: amount,
+          delivery_charge: deliveryCharge,
+          base_amount: baseAmount,
+          tax_rate: finalTaxRate,
+          tax_amount: totalTaxAmount,
           total_amount: totalAmount
         });
 

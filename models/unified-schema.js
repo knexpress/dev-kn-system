@@ -581,6 +581,20 @@ const invoiceSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.Decimal128,
     required: true,
   },
+  delivery_charge: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: false,
+    default: 0,
+  },
+  base_amount: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: false,
+  },
+  has_delivery: {
+    type: Boolean,
+    required: false,
+    default: false,
+  },
   issue_date: {
     type: Date,
     required: true,
