@@ -637,7 +637,7 @@ router.post('/', async (req, res) => {
 
     await syncInvoiceWithEMPost({
       invoiceId: invoice._id,
-      reason: `Invoice status update (${status})`,
+      reason: `Invoice created with status: ${invoice.status}`,
     });
     
     console.log('✅ Invoice saved successfully:', {

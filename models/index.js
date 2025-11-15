@@ -882,7 +882,7 @@ const bookingSchema = new mongoose.Schema({
   // Review status field - will be added to existing documents
   review_status: {
     type: String,
-    enum: ['not reviewed', 'reviewed'],
+    enum: ['not reviewed', 'reviewed', 'rejected'],
     default: 'not reviewed',
   },
   
@@ -894,6 +894,12 @@ const bookingSchema = new mongoose.Schema({
   },
   reviewed_at: {
     type: Date,
+    required: false,
+  },
+  
+  // Rejection reason (required when review_status is 'rejected')
+  reason: {
+    type: String,
     required: false,
   },
   
