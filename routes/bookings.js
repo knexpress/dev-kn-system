@@ -73,20 +73,40 @@ router.post('/:id/review', async (req, res) => {
     await booking.save();
 
     // Convert booking to invoice request
+    // Get customer first and last name from sender object
+    const sender = booking.sender || {};
+    const receiver = booking.receiver || {};
+    const customerFirstName = sender.firstName || booking.customer_first_name || '';
+    const customerLastName = sender.lastName || booking.customer_last_name || '';
+    const customerName = customerFirstName && customerLastName 
+      ? `${customerFirstName} ${customerLastName}`.trim()
+      : booking.customer_name || booking.name || sender.fullName || '';
+    
+    const receiverFirstName = receiver.firstName || booking.receiver_first_name || '';
+    const receiverLastName = receiver.lastName || booking.receiver_last_name || '';
+    const receiverName = receiverFirstName && receiverLastName
+      ? `${receiverFirstName} ${receiverLastName}`.trim()
+      : booking.receiver_name || booking.receiverName || receiver.fullName || '';
+    
+    // Get items commodity from items array
+    const items = Array.isArray(booking.items) ? booking.items : [];
+    const itemsDescription = items
+      .map(item => item.commodity || item.name || item.description || '')
+      .filter(Boolean)
+      .join(', ') || '';
+
     const invoiceRequestData = {
-      customer_name: booking.customer_name || booking.name || '',
-      customer_company: booking.customer_company || booking.company || '',
-      receiver_name: booking.receiver_name || booking.receiverName || '',
-      receiver_address: booking.receiver_address || booking.receiverAddress || '',
-      receiver_phone: booking.receiver_phone || booking.receiverPhone || '',
-      receiver_company: booking.receiver_company || booking.receiverCompany || '',
-      origin_place: booking.origin_place || booking.origin || '',
-      destination_place: booking.destination_place || booking.destination || '',
-      shipment_type: booking.shipment_type || booking.shipmentType || 'NON_DOCUMENT',
-      weight_kg: booking.weight_kg || booking.weightKg || null,
-      volume_cbm: booking.volume_cbm || booking.volumeCbm || null,
-      amount: booking.amount || null,
-      notes: booking.notes || '',
+      customer_name: customerName,
+      customer_first_name: customerFirstName,
+      customer_last_name: customerLastName,
+      receiver_name: receiverName,
+      receiver_first_name: receiverFirstName,
+      receiver_last_name: receiverLastName,
+      receiver_address: booking.receiver_address || booking.receiverAddress || receiver.completeAddress || receiver.address || '',
+      receiver_phone: booking.receiver_phone || booking.receiverPhone || receiver.contactNo || receiver.phone || '',
+      origin_place: booking.origin_place || booking.origin || sender.completeAddress || sender.address || '',
+      destination_place: booking.destination_place || booking.destination || receiver.completeAddress || receiver.address || '',
+      items_description: itemsDescription,
       created_by_employee_id: reviewed_by_employee_id,
       status: 'SUBMITTED', // Ready for Sales/Operations to process
       delivery_status: 'PENDING',
