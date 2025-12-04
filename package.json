@@ -5,6 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "build": "echo 'No build step required for Node.js backend'",
     "dev": "nodemon server.js",
     "seed": "node scripts/seed.js",
     "setup": "node setup-env.js",
@@ -22,10 +23,7 @@
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.0.3",
-    "multer": "^2.0.2",
-    "next": "^16.0.7",
-    "react": "^19.2.1",
-    "react-dom": "^19.2.1"
+    "multer": "^2.0.2"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
