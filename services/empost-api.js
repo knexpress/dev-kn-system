@@ -182,6 +182,97 @@ class EMpostAPIService {
   }
 
   /**
+   * Create shipment in EMpost from InvoiceRequest (without invoice generation)
+   * @param {Object} invoiceRequest - InvoiceRequest object
+   * @returns {Promise<Object>} EMpost shipment response
+   */
+  async createShipmentFromInvoiceRequest(invoiceRequest) {
+    try {
+      console.log('📦 Creating shipment in EMpost from InvoiceRequest:', invoiceRequest.tracking_code || invoiceRequest.invoice_number);
+      
+      const headers = await this.getAuthHeaders();
+      
+      // Map InvoiceRequest data to EMpost shipment format
+      const shipmentData = this.mapInvoiceRequestToShipment(invoiceRequest);
+      
+      const createShipment = async () => {
+        const response = await this.apiClient.post(
+          '/api/v1/shipment/create',
+          shipmentData,
+          { headers }
+        );
+        return response.data;
+      };
+      
+      const result = await this.retryWithBackoff(createShipment, 3, 1000);
+      
+      console.log('✅ Shipment created in EMpost from InvoiceRequest:', result.data?.uhawb);
+      return result;
+    } catch (error) {
+      console.error('❌ Failed to create shipment in EMpost from InvoiceRequest:', error.response?.data || error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Update shipment status in EMpost
+   * @param {string} trackingNumber - Tracking number (AWB) or UHAWB
+   * @param {string} status - New delivery status
+   * @param {Object} additionalData - Additional data like delivery date, notes, etc.
+   * @returns {Promise<Object>} EMpost update response
+   */
+  async updateShipmentStatus(trackingNumber, status, additionalData = {}) {
+    try {
+      console.log(`🔄 Updating EMPOST shipment status: ${trackingNumber} -> ${status}`);
+      
+      const headers = await this.getAuthHeaders();
+      
+      // Map status to EMPOST delivery status format
+      const empostStatus = this.mapDeliveryStatus(status);
+      
+      // Build update payload
+      const updateData = {
+        trackingNumber: trackingNumber,
+        deliveryStatus: empostStatus,
+        ...(additionalData.deliveryDate && { deliveryDate: new Date(additionalData.deliveryDate).toISOString() }),
+        ...(additionalData.deliveryAttempts !== undefined && { deliveryAttempts: additionalData.deliveryAttempts }),
+        ...(additionalData.notes && { notes: additionalData.notes })
+      };
+      
+      const updateShipment = async () => {
+        // Try PUT endpoint first (update existing shipment)
+        try {
+          const response = await this.apiClient.put(
+            `/api/v1/shipment/update`,
+            updateData,
+            { headers }
+          );
+          return response.data;
+        } catch (putError) {
+          // If PUT doesn't work, try PATCH
+          if (putError.response?.status === 404 || putError.response?.status === 405) {
+            const patchResponse = await this.apiClient.patch(
+              `/api/v1/shipment/${trackingNumber}`,
+              updateData,
+              { headers }
+            );
+            return patchResponse.data;
+          }
+          throw putError;
+        }
+      };
+      
+      const result = await this.retryWithBackoff(updateShipment, 3, 1000);
+      
+      console.log('✅ Shipment status updated in EMPOST');
+      return result;
+    } catch (error) {
+      console.error('❌ Failed to update shipment status in EMPOST:', error.response?.data || error.message);
+      throw error;
+    }
+  }
+
+  /**
    * Issue an invoice in EMpost
    * @param {Object} invoice - Invoice object
    * @returns {Promise<Object>} EMpost invoice response
@@ -445,22 +536,239 @@ class EMpostAPIService {
   }
 
   /**
-   * Map invoice status to EMpost delivery status
-   * @param {string} status - Invoice status
-   * @returns {string} EMpost delivery status
+   * Map InvoiceRequest data to EMpost shipment format
+   * @param {Object} invoiceRequest - InvoiceRequest object
+   * @returns {Object} EMpost shipment payload
+   */
+  mapInvoiceRequestToShipment(invoiceRequest) {
+    // Parse origin and destination addresses
+    const originAddress = this.parseAddress(invoiceRequest.origin_place || '');
+    const destinationAddress = this.parseAddress(invoiceRequest.receiver_address || invoiceRequest.destination_place || '');
+    
+    // Get weight from verification or main weight field
+    const chargeableWeight = invoiceRequest.verification?.chargeable_weight 
+      ? parseFloat(invoiceRequest.verification.chargeable_weight.toString())
+      : (invoiceRequest.weight ? parseFloat(invoiceRequest.weight.toString()) : 
+         (invoiceRequest.verification?.weight ? parseFloat(invoiceRequest.verification.weight.toString()) : 0.1));
+    
+    const actualWeight = invoiceRequest.verification?.actual_weight 
+      ? parseFloat(invoiceRequest.verification.actual_weight.toString())
+      : chargeableWeight;
+    
+    // Use chargeable weight (higher of actual or volumetric)
+    const weightToUse = Math.max(chargeableWeight, 0.1);
+    
+    // Calculate dimensions from boxes or volume
+    let dimensionValue = 10; // Default 10cm
+    if (invoiceRequest.verification?.boxes && invoiceRequest.verification.boxes.length > 0) {
+      // Calculate average dimension from boxes
+      const totalVm = invoiceRequest.verification.total_vm 
+        ? parseFloat(invoiceRequest.verification.total_vm.toString())
+        : 0;
+      if (totalVm > 0) {
+        dimensionValue = Math.cbrt(totalVm * 1000000); // Convert CBM to cubic cm, then get cube root
+      } else {
+        // Calculate from first box
+        const firstBox = invoiceRequest.verification.boxes[0];
+        if (firstBox.length && firstBox.width && firstBox.height) {
+          const length = parseFloat(firstBox.length.toString());
+          const width = parseFloat(firstBox.width.toString());
+          const height = parseFloat(firstBox.height.toString());
+          dimensionValue = Math.max(length, width, height, 1);
+        }
+      }
+    } else if (invoiceRequest.volume_cbm) {
+      const volumeCbm = parseFloat(invoiceRequest.volume_cbm.toString());
+      dimensionValue = Math.cbrt(volumeCbm * 1000000);
+    }
+    
+    // Ensure minimum dimension
+    dimensionValue = Math.max(dimensionValue, 1);
+    
+    // Determine shipping type (DOM or INT) based on origin and destination
+    const originCountry = this.extractCountryFromAddress(invoiceRequest.origin_place || '');
+    const destinationCountry = this.extractCountryFromAddress(invoiceRequest.destination_place || invoiceRequest.receiver_address || '');
+    const shippingType = (originCountry && destinationCountry && 
+      originCountry.toLowerCase() === destinationCountry.toLowerCase()) ? 'DOM' : 'INT';
+    
+    // Get product category from shipment type
+    const productCategory = invoiceRequest.verification?.listed_commodities 
+      ? invoiceRequest.verification.listed_commodities.split(',')[0].trim() || 'Electronics'
+      : 'Electronics';
+    
+    // Get number of boxes
+    const numberOfBoxes = invoiceRequest.verification?.number_of_boxes || 1;
+    
+    // Build items array from boxes or default
+    const items = [];
+    if (invoiceRequest.verification?.boxes && invoiceRequest.verification.boxes.length > 0) {
+      invoiceRequest.verification.boxes.forEach((box, index) => {
+        const boxWeight = weightToUse / numberOfBoxes;
+        const boxDimension = dimensionValue;
+        items.push({
+          description: box.items || invoiceRequest.verification.listed_commodities || `Item ${index + 1}`,
+          countryOfOrigin: 'AE',
+          quantity: 1,
+          hsCode: '8504.40',
+          weight: {
+            unit: 'KG',
+            value: Math.max(boxWeight, 0.1)
+          },
+          dimensions: {
+            length: Math.max(boxDimension, 1),
+            width: Math.max(boxDimension, 1),
+            height: Math.max(boxDimension, 1),
+            unit: 'CM'
+          }
+        });
+      });
+    } else {
+      // Default item
+      items.push({
+        description: invoiceRequest.verification?.listed_commodities || 'General Goods',
+        countryOfOrigin: 'AE',
+        quantity: 1,
+        hsCode: '8504.40',
+        weight: {
+          unit: 'KG',
+          value: weightToUse
+        },
+        dimensions: {
+          length: dimensionValue,
+          width: dimensionValue,
+          height: dimensionValue,
+          unit: 'CM'
+        }
+      });
+    }
+    
+    // Get delivery charges from verification calculated_rate or amount
+    const deliveryCharges = invoiceRequest.verification?.calculated_rate
+      ? parseFloat(invoiceRequest.verification.calculated_rate.toString())
+      : (invoiceRequest.amount ? parseFloat(invoiceRequest.amount.toString()) : 0);
+    
+    // Build shipment data
+    const shipmentData = {
+      trackingNumber: invoiceRequest.tracking_code || invoiceRequest.invoice_number || '',
+      uhawb: invoiceRequest.empost_uhawb && invoiceRequest.empost_uhawb !== 'N/A' ? invoiceRequest.empost_uhawb : '',
+      sender: {
+        name: invoiceRequest.customer_name || 'N/A',
+        email: invoiceRequest.customer_phone ? `customer${invoiceRequest._id}@noreply.com` : 'noreply@company.com',
+        phone: invoiceRequest.customer_phone || '+971500000000',
+        secondPhone: '',
+        countryCode: originAddress.countryCode || 'AE',
+        state: originAddress.state || '',
+        postCode: originAddress.postCode || '',
+        city: originAddress.city || 'Dubai',
+        line1: originAddress.line1 || invoiceRequest.origin_place || 'N/A',
+        line2: originAddress.line2 || '',
+        line3: originAddress.line3 || '',
+      },
+      receiver: {
+        name: invoiceRequest.receiver_name || 'N/A',
+        email: '',
+        phone: invoiceRequest.receiver_phone || invoiceRequest.verification?.receiver_phone || '+971500000000',
+        secondPhone: '',
+        countryCode: destinationAddress.countryCode || 'AE',
+        state: destinationAddress.state || '',
+        postCode: destinationAddress.postCode || '',
+        city: destinationAddress.city || 'Dubai',
+        line1: destinationAddress.line1 || invoiceRequest.receiver_address || invoiceRequest.destination_place || 'N/A',
+        line2: destinationAddress.line2 || '',
+        line3: destinationAddress.line3 || '',
+      },
+      details: {
+        weight: {
+          unit: 'KG',
+          value: weightToUse
+        },
+        declaredWeight: {
+          unit: 'KG',
+          value: actualWeight || weightToUse
+        },
+        deliveryCharges: {
+          currencyCode: 'AED',
+          amount: deliveryCharges
+        },
+        numberOfPieces: numberOfBoxes,
+        pickupDate: new Date().toISOString(),
+        deliveryStatus: 'In Transit',
+        deliveryAttempts: 0,
+        shippingType: shippingType,
+        productCategory: productCategory,
+        productType: 'Parcel',
+        descriptionOfGoods: invoiceRequest.verification?.listed_commodities || 'General Goods',
+        dimensions: {
+          length: dimensionValue,
+          width: dimensionValue,
+          height: dimensionValue,
+          unit: 'CM'
+        }
+      },
+      items: items
+    };
+    
+    return shipmentData;
+  }
+
+  /**
+   * Extract country from address string
+   * @param {string} address - Address string
+   * @returns {string} Country code or name
+   */
+  extractCountryFromAddress(address) {
+    if (!address) return 'AE';
+    
+    // Try to extract country from address
+    const addressLower = address.toLowerCase();
+    if (addressLower.includes('uae') || addressLower.includes('united arab emirates') || addressLower.includes('dubai') || addressLower.includes('abu dhabi')) {
+      return 'AE';
+    }
+    if (addressLower.includes('philippines') || addressLower.includes('ph') || addressLower.includes('manila')) {
+      return 'PH';
+    }
+    
+    return 'AE'; // Default
+  }
+
+  /**
+   * Map invoice/request status to EMpost delivery status
+   * Only three statuses: Pending, Delivered, Cancelled
+   * @param {string} status - Invoice/Request status or delivery_status
+   * @returns {string} EMpost delivery status (Pending, Delivered, or Cancelled)
    */
   mapDeliveryStatus(status) {
+    if (!status) return 'Pending';
+    
+    const statusUpper = status.toUpperCase();
+    
+    // Only three statuses: Pending, Delivered, Cancelled
     const statusMap = {
-      'UNPAID': 'In Transit',
-      'PAID': 'Delivered',
-      'COLLECTED_BY_DRIVER': 'In Transit',
+      // Delivery statuses - direct mapping
+      'PENDING': 'Pending',
+      'PICKED_UP': 'Pending',
+      'IN_TRANSIT': 'Pending',
       'DELIVERED': 'Delivered',
-      'OVERDUE': 'In Transit',
+      'FAILED': 'Pending', // Failed deliveries stay as Pending
+      'CANCELLED': 'Cancelled',
+      // Request statuses
+      'DRAFT': 'Pending',
+      'SUBMITTED': 'Pending',
+      'IN_PROGRESS': 'Pending',
+      'VERIFIED': 'Pending',
+      'COMPLETED': 'Delivered',
+      'CANCELLED': 'Cancelled',
+      // Invoice statuses (for shipment updates, not invoice status changes)
+      'UNPAID': 'Pending',
+      'PAID': 'Delivered',
+      'COLLECTED_BY_DRIVER': 'Pending', // Still in transit until delivered
+      'DELIVERED': 'Delivered',
+      'OVERDUE': 'Pending',
       'CANCELLED': 'Cancelled',
       'REMITTED': 'Delivered',
     };
     
-    return statusMap[status] || 'In Transit';
+    return statusMap[statusUpper] || 'Pending';
   }
 }
 

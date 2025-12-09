@@ -2,10 +2,77 @@ const express = require('express');
 const mongoose = require('mongoose');
 const { InvoiceRequest, Employee, Collections } = require('../models');
 const { createNotificationsForAllUsers, createNotificationsForDepartment } = require('./notifications');
-const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
+// EMPOST API DISABLED
+// const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/id-generators');
 
 const router = express.Router();
+
+// Force PH_TO_UAE classification to GENERAL (ignore incoming box classifications)
+const normalizePhToUaeClassification = (invoiceRequest) => {
+  if (!invoiceRequest) return;
+  const code = (invoiceRequest.service_code || invoiceRequest.verification?.service_code || '').toUpperCase();
+  if (!code.includes('PH_TO_UAE')) return;
+
+  if (!invoiceRequest.verification) {
+    invoiceRequest.verification = {};
+  }
+  invoiceRequest.verification.shipment_classification = 'GENERAL';
+
+  if (Array.isArray(invoiceRequest.verification.boxes)) {
+    invoiceRequest.verification.boxes = invoiceRequest.verification.boxes.map((box) => ({
+      ...box,
+      classification: 'GENERAL',
+      shipment_classification: 'GENERAL',
+    }));
+  }
+};
+
+// Helper to normalize Decimal128 fields for frontend-friendly JSON
+const normalizeInvoiceRequest = (request) => {
+  if (!request) return request;
+  const obj = request.toObject ? request.toObject() : request;
+
+  const normalizeDecimal = (value) => {
+    if (value === null || value === undefined) return value;
+    try {
+      return parseFloat(value.toString());
+    } catch (e) {
+      return value;
+    }
+  };
+
+  // Top-level Decimal128 fields we care about
+  obj.weight = normalizeDecimal(obj.weight);
+  obj.weight_kg = normalizeDecimal(obj.weight_kg);
+  obj.invoice_amount = normalizeDecimal(obj.invoice_amount);
+  obj.amount = normalizeDecimal(obj.amount);
+  obj.declaredAmount = normalizeDecimal(obj.declaredAmount);
+
+  // Nested verification decimals
+  if (obj.verification) {
+    obj.verification.amount = normalizeDecimal(obj.verification.amount);
+    obj.verification.volume_cbm = normalizeDecimal(obj.verification.volume_cbm);
+    obj.verification.declared_value = normalizeDecimal(obj.verification.declared_value);
+    obj.verification.total_vm = normalizeDecimal(obj.verification.total_vm);
+    obj.verification.actual_weight = normalizeDecimal(obj.verification.actual_weight);
+    obj.verification.volumetric_weight = normalizeDecimal(obj.verification.volumetric_weight);
+    obj.verification.chargeable_weight = normalizeDecimal(obj.verification.chargeable_weight);
+    obj.verification.calculated_rate = normalizeDecimal(obj.verification.calculated_rate);
+
+    if (Array.isArray(obj.verification.boxes)) {
+      obj.verification.boxes = obj.verification.boxes.map((box) => ({
+        ...box,
+        length: normalizeDecimal(box.length),
+        width: normalizeDecimal(box.width),
+        height: normalizeDecimal(box.height),
+        vm: normalizeDecimal(box.vm),
+      }));
+    }
+  }
+
+  return obj;
+};
 
 // Get all invoice requests
 router.get('/', async (req, res) => {
@@ -14,7 +81,7 @@ router.get('/', async (req, res) => {
       .populate('created_by_employee_id')
       .populate('assigned_to_employee_id')
       .sort({ createdAt: -1 });
-    res.json(invoiceRequests);
+    res.json(invoiceRequests.map(normalizeInvoiceRequest));
   } catch (error) {
     console.error('Error fetching invoice requests:', error);
     res.status(500).json({ error: 'Failed to fetch invoice requests' });
@@ -31,17 +98,8 @@ router.get('/status/:status', async (req, res) => {
       .sort({ createdAt: -1 });
     
     // Convert Decimal128 fields to numbers for proper JSON serialization
-    const processedRequests = invoiceRequests.map(request => {
-      const requestObj = request.toObject();
-      if (requestObj.weight) {
-        requestObj.weight = parseFloat(requestObj.weight.toString());
-      }
-      if (requestObj.invoice_amount) {
-        requestObj.invoice_amount = parseFloat(requestObj.invoice_amount.toString());
-      }
-      return requestObj;
-    });
-    
+    const processedRequests = invoiceRequests.map(normalizeInvoiceRequest);
+
     res.json(processedRequests);
   } catch (error) {
     console.error('Error fetching invoice requests by status:', error);
@@ -57,7 +115,7 @@ router.get('/delivery-status/:deliveryStatus', async (req, res) => {
       .populate('created_by_employee_id')
       .populate('assigned_to_employee_id')
       .sort({ createdAt: -1 });
-    res.json(invoiceRequests);
+    res.json(invoiceRequests.map(normalizeInvoiceRequest));
   } catch (error) {
     console.error('Error fetching invoice requests by delivery status:', error);
     res.status(500).json({ error: 'Failed to fetch invoice requests' });
@@ -147,10 +205,11 @@ router.post('/', async (req, res) => {
 
     await invoiceRequest.save();
 
-    await syncInvoiceWithEMPost({
-      requestId: invoiceRequest._id,
-      reason: `Invoice request status update (${status || 'no status'})`,
-    });
+    // EMPOST API DISABLED
+    // await syncInvoiceWithEMPost({
+    //   requestId: invoiceRequest._id,
+    //   reason: `Invoice request status update (${status || 'no status'})`,
+    // });
 
     // Create notifications for relevant departments (Sales, Operations, Finance)
     const relevantDepartments = ['Sales', 'Operations', 'Finance'];
@@ -164,7 +223,7 @@ router.post('/', async (req, res) => {
 
     res.status(201).json({
       success: true,
-      invoiceRequest,
+      invoiceRequest: normalizeInvoiceRequest(invoiceRequest),
       message: 'Invoice request created successfully'
     });
   } catch (error) {
@@ -184,6 +243,10 @@ router.put('/:id', async (req, res) => {
       return res.status(404).json({ error: 'Invoice request not found' });
     }
 
+    // Store old values for comparison
+    const oldStatus = invoiceRequest.status;
+    const oldDeliveryStatus = invoiceRequest.delivery_status;
+    
     // Update fields
     Object.keys(updateData).forEach(key => {
       if (updateData[key] !== undefined) {
@@ -193,14 +256,35 @@ router.put('/:id', async (req, res) => {
 
     await invoiceRequest.save();
 
-    await syncInvoiceWithEMPost({
-      requestId: invoiceRequestId,
-      reason: `Invoice request delivery status update (${delivery_status})`,
-    });
+    // EMPOST API DISABLED
+    // Update EMPOST shipment status if status or delivery_status changed
+    // const statusChanged = updateData.status && updateData.status !== oldStatus;
+    // const deliveryStatusChanged = updateData.delivery_status && updateData.delivery_status !== oldDeliveryStatus;
+    
+    // if (statusChanged || deliveryStatusChanged) {
+    //   try {
+    //     const empostAPI = require('../services/empost-api');
+    //     const trackingNumber = invoiceRequest.tracking_code || invoiceRequest.invoice_number || invoiceRequest.empost_uhawb;
+    //     
+    //     if (trackingNumber && trackingNumber !== 'N/A') {
+    //       const statusToUpdate = updateData.delivery_status || updateData.status;
+    //       console.log(`🔄 Updating EMPOST shipment status via general update: ${trackingNumber} -> ${statusToUpdate}`);
+    //       
+    //       await empostAPI.updateShipmentStatus(trackingNumber, statusToUpdate, {
+    //         deliveryDate: statusToUpdate === 'DELIVERED' ? new Date() : undefined
+    //       });
+    //       
+    //       console.log('✅ EMPOST shipment status updated successfully');
+    //     }
+    //   } catch (empostError) {
+    //     console.error('❌ Failed to update EMPOST shipment status (non-critical):', empostError.message);
+    //     // Don't fail the update if EMPOST fails
+    //   }
+    // }
 
     res.json({
       success: true,
-      invoiceRequest,
+      invoiceRequest: normalizeInvoiceRequest(invoiceRequest),
       message: 'Invoice request updated successfully'
     });
   } catch (error) {
@@ -220,6 +304,10 @@ router.put('/:id/status', async (req, res) => {
       return res.status(404).json({ error: 'Invoice request not found' });
     }
 
+    // Store old status for comparison
+    const oldStatus = invoiceRequest.status;
+    const oldDeliveryStatus = invoiceRequest.delivery_status;
+    
     // Update status if provided
     if (status) {
       invoiceRequest.status = status;
@@ -262,9 +350,32 @@ router.put('/:id/status', async (req, res) => {
 
     await invoiceRequest.save();
 
+    // EMPOST API DISABLED
+    // Update EMPOST shipment status if status or delivery_status changed
+    // if ((status && status !== oldStatus) || (delivery_status && delivery_status !== oldDeliveryStatus)) {
+    //   try {
+    //     const empostAPI = require('../services/empost-api');
+    //     const trackingNumber = invoiceRequest.tracking_code || invoiceRequest.invoice_number || invoiceRequest.empost_uhawb;
+    //     
+    //     if (trackingNumber && trackingNumber !== 'N/A') {
+    //       const statusToUpdate = delivery_status || status;
+    //       console.log(`🔄 Updating EMPOST shipment status: ${trackingNumber} -> ${statusToUpdate}`);
+    //       
+    //       await empostAPI.updateShipmentStatus(trackingNumber, statusToUpdate, {
+    //         deliveryDate: statusToUpdate === 'DELIVERED' ? new Date() : undefined
+    //       });
+    //       
+    //       console.log('✅ EMPOST shipment status updated successfully');
+    //     }
+    //   } catch (empostError) {
+    //     console.error('❌ Failed to update EMPOST shipment status (non-critical):', empostError.message);
+    //     // Don't fail the status update if EMPOST fails
+    //   }
+    // }
+
     res.json({
       success: true,
-      invoiceRequest,
+      invoiceRequest: normalizeInvoiceRequest(invoiceRequest),
       message: 'Invoice request status updated successfully'
     });
   } catch (error) {
@@ -284,6 +395,9 @@ router.put('/:id/delivery-status', async (req, res) => {
       return res.status(404).json({ error: 'Invoice request not found' });
     }
 
+    // Store old delivery status for comparison
+    const oldDeliveryStatus = invoiceRequest.delivery_status;
+    
     // Update delivery status
     invoiceRequest.delivery_status = delivery_status;
     
@@ -297,18 +411,32 @@ router.put('/:id/delivery-status', async (req, res) => {
     
     await invoiceRequest.save();
 
-    // Convert Decimal128 fields to numbers for proper JSON serialization
-    const responseData = invoiceRequest.toObject();
-    if (responseData.weight) {
-      responseData.weight = parseFloat(responseData.weight.toString());
-    }
-    if (responseData.invoice_amount) {
-      responseData.invoice_amount = parseFloat(responseData.invoice_amount.toString());
-    }
+    // EMPOST API DISABLED
+    // Update EMPOST shipment status if delivery_status changed
+    // if (delivery_status && delivery_status !== oldDeliveryStatus) {
+    //   try {
+    //     const empostAPI = require('../services/empost-api');
+    //     const trackingNumber = invoiceRequest.tracking_code || invoiceRequest.invoice_number || invoiceRequest.empost_uhawb;
+    //     
+    //     if (trackingNumber && trackingNumber !== 'N/A') {
+    //       console.log(`🔄 Updating EMPOST shipment delivery status: ${trackingNumber} -> ${delivery_status}`);
+    //       
+    //       await empostAPI.updateShipmentStatus(trackingNumber, delivery_status, {
+    //         deliveryDate: delivery_status === 'DELIVERED' ? new Date() : undefined,
+    //         notes: notes
+    //       });
+    //       
+    //       console.log('✅ EMPOST shipment delivery status updated successfully');
+    //     }
+    //   } catch (empostError) {
+    //     console.error('❌ Failed to update EMPOST shipment delivery status (non-critical):', empostError.message);
+    //     // Don't fail the status update if EMPOST fails
+    //   }
+    // }
 
     res.json({
       success: true,
-      invoiceRequest: responseData,
+      invoiceRequest: normalizeInvoiceRequest(invoiceRequest),
       message: 'Delivery status updated successfully'
     });
   } catch (error) {
@@ -331,14 +459,15 @@ router.put('/:id/weight', async (req, res) => {
     invoiceRequest.weight = weight;
     await invoiceRequest.save();
 
-    await syncInvoiceWithEMPost({
-      requestId: invoiceRequestId,
-      reason: 'Invoice request weight update',
-    });
+    // EMPOST API DISABLED
+    // await syncInvoiceWithEMPost({
+    //   requestId: invoiceRequestId,
+    //   reason: 'Invoice request weight update',
+    // });
 
     res.json({
       success: true,
-      invoiceRequest,
+      invoiceRequest: normalizeInvoiceRequest(invoiceRequest),
       message: 'Weight updated successfully'
     });
   } catch (error) {
@@ -363,6 +492,10 @@ router.put('/:id/verification', async (req, res) => {
       return res.status(404).json({ error: 'Invoice request not found' });
     }
 
+    // If PH_TO_UAE, force classification to GENERAL regardless of incoming data
+    const serviceCode = (invoiceRequest.service_code || invoiceRequest.verification?.service_code || '').toUpperCase();
+    const isPhToUae = serviceCode.includes('PH_TO_UAE');
+
     // Initialize verification object if it doesn't exist
     if (!invoiceRequest.verification) {
       invoiceRequest.verification = {};
@@ -385,15 +518,38 @@ router.put('/:id/verification', async (req, res) => {
       }
     };
 
+    // Normalize classification helper
+    const normalizeClass = (value) => {
+      if (!value) return undefined;
+      return value.toString().trim().toUpperCase();
+    };
+
     // Handle boxes data - convert to Decimal128 for numeric fields
     if (verificationData.boxes && Array.isArray(verificationData.boxes)) {
-      invoiceRequest.verification.boxes = verificationData.boxes.map(box => ({
-        items: box.items || '',
-        length: toDecimal128(box.length),
-        width: toDecimal128(box.width),
-        height: toDecimal128(box.height),
-        vm: toDecimal128(box.vm),
-      }));
+      invoiceRequest.verification.boxes = verificationData.boxes.map(box => {
+        // Force GENERAL for PH_TO_UAE, otherwise normalize provided classification
+        const normalizedClassification = isPhToUae ? 'GENERAL' : normalizeClass(box.classification);
+        
+        return {
+          items: box.items || '',
+          quantity: box.quantity,
+          length: toDecimal128(box.length),
+          width: toDecimal128(box.width),
+          height: toDecimal128(box.height),
+          vm: toDecimal128(box.vm),
+          classification: normalizedClassification, // Stored uppercase
+          shipment_classification: isPhToUae ? 'GENERAL' : normalizedClassification
+        };
+      });
+    }
+
+    // Shipment classification (top-level marker)
+    if (verificationData.shipment_classification !== undefined) {
+      invoiceRequest.verification.shipment_classification = isPhToUae
+        ? 'GENERAL'
+        : normalizeClass(verificationData.shipment_classification);
+    } else if (isPhToUae) {
+      invoiceRequest.verification.shipment_classification = 'GENERAL';
     }
 
     // Handle total_vm
@@ -461,49 +617,42 @@ router.put('/:id/verification', async (req, res) => {
       invoiceRequest.weight = toDecimal128(verificationData.weight);
     }
 
+    // If PH_TO_UAE, force classification to GENERAL on the request object too
+    if (isPhToUae) {
+      normalizePhToUaeClassification(invoiceRequest);
+    }
+
     // Set verification metadata
     invoiceRequest.verification.verified_at = new Date();
     
     await invoiceRequest.save();
 
-    await syncInvoiceWithEMPost({
-      requestId: invoiceRequestId,
-      reason: 'Invoice request verification details update',
-    });
-
-    // Convert Decimal128 fields to numbers for JSON response
-    const responseData = invoiceRequest.toObject();
-    if (responseData.verification?.boxes) {
-      responseData.verification.boxes = responseData.verification.boxes.map((box) => ({
-        ...box,
-        length: box.length ? parseFloat(box.length.toString()) : undefined,
-        width: box.width ? parseFloat(box.width.toString()) : undefined,
-        height: box.height ? parseFloat(box.height.toString()) : undefined,
-        vm: box.vm ? parseFloat(box.vm.toString()) : undefined,
-      }));
-    }
-    if (responseData.verification?.total_vm) {
-      responseData.verification.total_vm = parseFloat(responseData.verification.total_vm.toString());
-    }
-    if (responseData.verification?.actual_weight) {
-      responseData.verification.actual_weight = parseFloat(responseData.verification.actual_weight.toString());
-    }
-    if (responseData.verification?.volumetric_weight) {
-      responseData.verification.volumetric_weight = parseFloat(responseData.verification.volumetric_weight.toString());
-    }
-    if (responseData.verification?.chargeable_weight) {
-      responseData.verification.chargeable_weight = parseFloat(responseData.verification.chargeable_weight.toString());
-    }
-    if (responseData.verification?.calculated_rate) {
-      responseData.verification.calculated_rate = parseFloat(responseData.verification.calculated_rate.toString());
-    }
-    if (responseData.weight) {
-      responseData.weight = parseFloat(responseData.weight.toString());
+    // Create EMPOST shipment when verification is updated (only shipment, NOT invoice)
+    // Only create if UHAWB doesn't already exist (avoid duplicates)
+    if (!invoiceRequest.empost_uhawb || invoiceRequest.empost_uhawb === 'N/A') {
+      try {
+        const empostAPI = require('../services/empost-api');
+        console.log('📦 Creating EMPOST shipment from verified InvoiceRequest...');
+        
+        const shipmentResult = await empostAPI.createShipmentFromInvoiceRequest(invoiceRequest);
+        
+        if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
+          // Store UHAWB in invoiceRequest for future reference
+          invoiceRequest.empost_uhawb = shipmentResult.data.uhawb;
+          await invoiceRequest.save();
+          console.log('✅ EMPOST shipment created with UHAWB:', shipmentResult.data.uhawb);
+        }
+      } catch (empostError) {
+        console.error('❌ Failed to create EMPOST shipment (non-critical, will retry later):', empostError.message);
+        // Don't fail the verification update if EMPOST fails
+      }
+    } else {
+      console.log('ℹ️ EMPOST shipment already exists with UHAWB:', invoiceRequest.empost_uhawb);
     }
 
     res.json({
       success: true,
-      invoiceRequest: responseData,
+      invoiceRequest: normalizeInvoiceRequest(invoiceRequest),
       message: 'Verification details updated successfully'
     });
   } catch (error) {
@@ -539,14 +688,34 @@ router.put('/:id/complete-verification', async (req, res) => {
     
     await invoiceRequest.save();
 
-    await syncInvoiceWithEMPost({
-      requestId: invoiceRequestId,
-      reason: 'Invoice request verification completed',
-    });
+    // EMPOST API DISABLED
+    // Create EMPOST shipment automatically when verification is completed
+    // This creates ONLY the shipment, NOT the invoice (invoice will be generated later by Finance)
+    // Only create if UHAWB doesn't already exist (avoid duplicates)
+    // if (!invoiceRequest.empost_uhawb || invoiceRequest.empost_uhawb === 'N/A') {
+    //   try {
+    //     const empostAPI = require('../services/empost-api');
+    //     console.log('📦 Automatically creating EMPOST shipment from verified InvoiceRequest...');
+    //     
+    //     const shipmentResult = await empostAPI.createShipmentFromInvoiceRequest(invoiceRequest);
+    //     
+    //     if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
+    //       // Store UHAWB in invoiceRequest for future reference
+    //       invoiceRequest.empost_uhawb = shipmentResult.data.uhawb;
+    //       await invoiceRequest.save();
+    //       console.log('✅ EMPOST shipment created automatically with UHAWB:', shipmentResult.data.uhawb);
+    //     }
+    //   } catch (empostError) {
+    //     console.error('❌ Failed to create EMPOST shipment automatically (non-critical):', empostError.message);
+    //     // Don't fail verification completion if EMPOST fails - can be retried later
+    //   }
+    // } else {
+    //   console.log('ℹ️ EMPOST shipment already exists with UHAWB:', invoiceRequest.empost_uhawb);
+    // }
 
     res.json({
       success: true,
-      invoiceRequest,
+      invoiceRequest: normalizeInvoiceRequest(invoiceRequest),
       message: 'Verification completed successfully'
     });
   } catch (error) {

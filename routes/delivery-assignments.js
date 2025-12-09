@@ -476,9 +476,31 @@ router.put('/:id', auth, async (req, res) => {
             }
 
             if (invoiceRequest) {
+              const oldDeliveryStatus = invoiceRequest.delivery_status;
               invoiceRequest.delivery_status = 'DELIVERED';
               await invoiceRequest.save();
               console.log('✅ Invoice request delivery_status updated to DELIVERED');
+              
+              // EMPOST API DISABLED
+              // Update EMPOST shipment status
+              // if (oldDeliveryStatus !== 'DELIVERED') {
+              //   try {
+              //     const empostAPI = require('../services/empost-api');
+              //     const trackingNumber = invoiceRequest.tracking_code || invoiceRequest.invoice_number || invoiceRequest.empost_uhawb;
+              //     
+              //     if (trackingNumber && trackingNumber !== 'N/A') {
+              //       console.log(`🔄 Updating EMPOST shipment status from delivery assignment: ${trackingNumber} -> DELIVERED`);
+              //       
+              //       await empostAPI.updateShipmentStatus(trackingNumber, 'DELIVERED', {
+              //         deliveryDate: new Date()
+              //       });
+              //       
+              //       console.log('✅ EMPOST shipment status updated to DELIVERED');
+              //     }
+              //   } catch (empostError) {
+              //     console.error('❌ Failed to update EMPOST shipment status (non-critical):', empostError.message);
+              //   }
+              // }
             } else {
               console.warn('⚠️ Invoice request not found for invoice:', invoice.invoice_id || invoice._id);
             }

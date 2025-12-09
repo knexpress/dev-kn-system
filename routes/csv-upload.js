@@ -6,7 +6,8 @@ const { Readable } = require('stream');
 const crypto = require('crypto');
 const { Invoice, Client, DeliveryAssignment } = require('../models/unified-schema');
 const { Report, User } = require('../models');
-const empostAPI = require('../services/empost-api');
+// EMPOST API DISABLED
+// const empostAPI = require('../services/empost-api');
 const { generateUniqueInvoiceID, generateUniqueAWBNumber } = require('../utils/id-generators');
 
 const router = express.Router();
@@ -448,8 +449,8 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
         console.log('✅ Invoice created:', invoice.invoice_id || invoice._id);
         createdInvoices.push(invoice);
 
-        // EMpost integration disabled - no longer sending requests to EMpost for CSV invoices
-        // // Integrate with EMpost API
+        // EMPOST API DISABLED
+        // Integrate with EMpost API
         // try {
         //   // Populate invoice with client data for EMpost
         //   const populatedInvoice = await Invoice.findById(invoice._id)
@@ -1080,12 +1081,12 @@ router.post('/historical', auth, upload.single('csvFile'), async (req, res) => {
           client = await Client.findOne({ company_name: customerName });
         }
 
-        // EMpost integration disabled - no longer sending requests to EMpost for historical uploads
-        // // Map CSV data to EMPOST shipment format
-        // const shipmentData = await mapCSVToEMPOSTShipment(row, client);
+        // Map CSV data to EMPOST shipment format
+        const shipmentData = await mapCSVToEMPOSTShipment(row, client);
 
-        // // Call EMPOST API to create shipment
-        let uhawb = null; // Set to null since EMpost is disabled
+        // EMPOST API DISABLED
+        // Call EMPOST API to create shipment
+        let uhawb = null;
         // try {
         //   console.log(`📦 Creating shipment in EMPOST for AWB: ${shipmentData.trackingNumber}`);
         //   

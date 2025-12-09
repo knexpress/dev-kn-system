@@ -238,6 +238,10 @@ router.put('/:id/status', async (req, res) => {
       return res.status(404).json({ error: 'Shipment request not found' });
     }
 
+    // Store old statuses for comparison
+    const oldRequestStatus = shipmentRequest.status.request_status;
+    const oldDeliveryStatus = shipmentRequest.status.delivery_status;
+
     // Update status fields
     if (request_status) {
       shipmentRequest.status.request_status = request_status;
@@ -274,6 +278,32 @@ router.put('/:id/status', async (req, res) => {
 
     await shipmentRequest.save();
 
+    // EMPOST API DISABLED
+    // Update EMPOST shipment status if delivery_status or request_status changed
+    // const deliveryStatusChanged = delivery_status && delivery_status !== oldDeliveryStatus;
+    // const requestStatusChanged = request_status && request_status !== oldRequestStatus;
+    
+    // if (deliveryStatusChanged || (requestStatusChanged && request_status === 'CANCELLED')) {
+    //   try {
+    //     const empostAPI = require('../services/empost-api');
+    //     const trackingNumber = shipmentRequest.awb_number || shipmentRequest.tracking_code || shipmentRequest.empost_uhawb;
+    //     
+    //     if (trackingNumber && trackingNumber !== 'N/A') {
+    //       const statusToUpdate = delivery_status || request_status;
+    //       console.log(`🔄 Updating EMPOST shipment status from unified request: ${trackingNumber} -> ${statusToUpdate}`);
+    //       
+    //       await empostAPI.updateShipmentStatus(trackingNumber, statusToUpdate, {
+    //         deliveryDate: statusToUpdate === 'DELIVERED' || statusToUpdate === 'COMPLETED' ? new Date() : undefined
+    //       });
+    //       
+    //       console.log('✅ EMPOST shipment status updated successfully');
+    //     }
+    //   } catch (empostError) {
+    //     console.error('❌ Failed to update EMPOST shipment status (non-critical):', empostError.message);
+    //     // Don't fail the status update if EMPOST fails
+    //   }
+    // }
+
     res.json({
       success: true,
       data: shipmentRequest,
@@ -295,11 +325,37 @@ router.put('/:id/delivery-status', async (req, res) => {
       return res.status(404).json({ error: 'Shipment request not found' });
     }
 
+    // Store old delivery status for comparison
+    const oldDeliveryStatus = shipmentRequest.status.delivery_status;
+    
     shipmentRequest.status.delivery_status = delivery_status;
     if (notes) shipmentRequest.notes = notes;
     if (internal_notes) shipmentRequest.internal_notes = internal_notes;
 
     await shipmentRequest.save();
+
+    // EMPOST API DISABLED
+    // Update EMPOST shipment status if delivery_status changed
+    // if (delivery_status && delivery_status !== oldDeliveryStatus) {
+    //   try {
+    //     const empostAPI = require('../services/empost-api');
+    //     const trackingNumber = shipmentRequest.awb_number || shipmentRequest.tracking_code || shipmentRequest.empost_uhawb;
+    //     
+    //     if (trackingNumber && trackingNumber !== 'N/A') {
+    //       console.log(`🔄 Updating EMPOST shipment delivery status from unified request: ${trackingNumber} -> ${delivery_status}`);
+    //       
+    //       await empostAPI.updateShipmentStatus(trackingNumber, delivery_status, {
+    //         deliveryDate: delivery_status === 'DELIVERED' ? new Date() : undefined,
+    //         notes: notes || internal_notes
+    //       });
+    //       
+    //       console.log('✅ EMPOST shipment delivery status updated successfully');
+    //     }
+    //   } catch (empostError) {
+    //     console.error('❌ Failed to update EMPOST shipment delivery status (non-critical):', empostError.message);
+    //     // Don't fail the status update if EMPOST fails
+    //   }
+    // }
 
     res.json({
       success: true,

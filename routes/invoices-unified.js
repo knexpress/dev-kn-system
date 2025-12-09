@@ -18,6 +18,98 @@ const isPhToUaeService = (code = '') => {
   return normalized === 'PH_TO_UAE' || normalized.startsWith('PH_TO_UAE_');
 };
 
+const isUaeToPinasService = (code = '') => {
+  const normalized = normalizeServiceCode(code || '');
+  return normalized === 'UAE_TO_PINAS' || normalized.startsWith('UAE_TO_PINAS_');
+};
+
+const isUaeToPhService = (code = '') => {
+  const normalized = normalizeServiceCode(code || '');
+  return normalized === 'UAE_TO_PH' || normalized.startsWith('UAE_TO_PH_');
+};
+
+// For PH_TO_UAE we ignore incoming classifications and force GENERAL
+const normalizePhToUaeClassification = (invoiceRequest) => {
+  if (!invoiceRequest) return;
+  const code = (invoiceRequest.service_code || invoiceRequest.verification?.service_code || '').toUpperCase();
+  if (!code.includes('PH_TO_UAE')) return;
+
+  if (!invoiceRequest.verification) {
+    invoiceRequest.verification = {};
+  }
+  invoiceRequest.verification.shipment_classification = 'GENERAL';
+
+  if (Array.isArray(invoiceRequest.verification.boxes)) {
+    invoiceRequest.verification.boxes = invoiceRequest.verification.boxes.map((box) => ({
+      ...box,
+      classification: 'GENERAL',
+      shipment_classification: 'GENERAL',
+    }));
+  }
+};
+
+/**
+ * Check if a shipment is FLOWMIC or PERSONAL based on box classifications
+ * A shipment is FLOWMIC/PERSONAL if ANY box has classification === 'FLOWMIC' or 'PERSONAL'
+ * OR if the shipment-level classification is FLOWMIC or PERSONAL
+ * @param {Object} invoiceRequest - InvoiceRequest object
+ * @returns {boolean} True if shipment is FLOWMIC or PERSONAL
+ */
+function isFlowmicOrPersonalShipment(invoiceRequest) {
+  if (!invoiceRequest) return false;
+  
+  const serviceCode = (invoiceRequest.service_code || '').toUpperCase();
+  if (!serviceCode.includes('UAE_TO_PH')) return false;
+  
+  const norm = (v) => (v || '').toString().trim().toUpperCase();
+  
+  // Check box-level classification
+  const boxes = invoiceRequest.verification?.boxes || [];
+  if (Array.isArray(boxes) && boxes.length > 0) {
+    const hasFlowmicOrPersonal = boxes.some(box => {
+      const sc = norm(box.shipment_classification);
+      const c = norm(box.classification);
+      return sc === 'PERSONAL' || sc === 'FLOWMIC' || 
+             c === 'PERSONAL' || c === 'FLOWMIC';
+    });
+    if (hasFlowmicOrPersonal) return true;
+  }
+  
+  // Check top-level shipment classification
+  const topClass = norm(
+    invoiceRequest.verification?.shipment_classification ||
+    invoiceRequest.shipment?.classification
+  );
+  
+  return topClass === 'PERSONAL' || topClass === 'FLOWMIC';
+}
+
+/**
+ * Check if a shipment is FLOWMIC based on box classifications
+ * A shipment is FLOWMIC if ANY box has classification === 'FLOWMIC'
+ * @param {Object} invoiceRequest - InvoiceRequest object
+ * @returns {boolean} True if shipment is FLOWMIC
+ */
+function isFlowmicShipment(invoiceRequest) {
+  if (!invoiceRequest || !invoiceRequest.verification) return false;
+  
+  // Shipment-level marker
+  const shipmentClass = (invoiceRequest.verification.shipment_classification || '').toUpperCase();
+  if (shipmentClass === 'FLOWMIC' || shipmentClass === 'PERSONAL') {
+    return true;
+  }
+  
+  const boxes = invoiceRequest.verification.boxes || [];
+  if (!Array.isArray(boxes) || boxes.length === 0) return false;
+  
+  return boxes.some(box => {
+    const classification = (box.classification || '').toUpperCase();
+    const shipmentClassification = (box.shipment_classification || '').toUpperCase();
+    return classification === 'FLOWMIC' || classification === 'PERSONAL' ||
+           shipmentClassification === 'FLOWMIC' || shipmentClassification === 'PERSONAL';
+  });
+}
+
 // Helper function to convert Decimal128 to number
 const convertDecimal128 = (value) => {
   if (!value) return null;
@@ -31,6 +123,9 @@ const transformInvoice = (invoice) => {
     ...invoiceObj,
     amount: convertDecimal128(invoiceObj.amount),
     delivery_charge: convertDecimal128(invoiceObj.delivery_charge),
+    delivery_base_amount: convertDecimal128(invoiceObj.delivery_base_amount),
+    pickup_charge: convertDecimal128(invoiceObj.pickup_charge),
+    insurance_charge: convertDecimal128(invoiceObj.insurance_charge),
     base_amount: convertDecimal128(invoiceObj.base_amount),
     tax_amount: convertDecimal128(invoiceObj.tax_amount),
     total_amount: convertDecimal128(invoiceObj.total_amount),
@@ -404,6 +499,11 @@ router.post('/', async (req, res) => {
       created_by,
       due_date,
       has_delivery = false,
+      delivery_charge: providedDeliveryCharge, // Allow manual delivery charge entry
+      insurance_option = 'none',
+      insurance_manual_amount,
+      declared_amount,
+      insurance_fixed_type,
       customer_trn,
       batch_number
     } = req.body;
@@ -442,6 +542,7 @@ router.post('/', async (req, res) => {
     let invoiceRequest = null;
     try {
       invoiceRequest = await InvoiceRequest.findById(request_id);
+      normalizePhToUaeClassification(invoiceRequest);
     } catch (error) {
       console.log('⚠️ Could not fetch InvoiceRequest for delivery calculation:', error.message);
     }
@@ -475,54 +576,228 @@ router.post('/', async (req, res) => {
       serviceCode = invoiceRequest.service_code || invoiceRequest.verification?.service_code || null;
     }
     
-    // Calculate delivery charge
-    let deliveryCharge = 0;
-    if (has_delivery) {
-      if (weight > 30) {
-        // Weight > 30 kg: Delivery is FREE
-        deliveryCharge = 0;
-        console.log('✅ Delivery is FREE (weight > 30 kg)');
-      } else {
-        // Weight ≤ 30 kg: 20 AED for first box + 5 AED per additional box
-        if (numberOfBoxes === 1) {
-          deliveryCharge = 20;
-        } else {
-          deliveryCharge = 20 + ((numberOfBoxes - 1) * 5);
+    // Extract charges from line_items to calculate subtotal
+    // IMPORTANT: Parse line_items FIRST to get actual charges, then use calculated/provided values as fallback
+    let shippingCharge = 0;
+    let pickupCharge = 0;
+    let deliveryChargeFromItems = 0;
+    let insuranceChargeFromItems = 0;
+    
+    // Parse line_items to extract all charges (shipping, pickup, delivery, insurance)
+    if (line_items && Array.isArray(line_items)) {
+      line_items.forEach(item => {
+        const description = (item.description || '').toLowerCase();
+        const itemTotal = parseFloat(item.total?.toString() || item.unit_price?.toString() || 0);
+        
+        if (description.includes('pickup')) {
+          pickupCharge += itemTotal;
+        } else if (description.includes('delivery')) {
+          deliveryChargeFromItems += itemTotal;
+        } else if (description.includes('insurance')) {
+          insuranceChargeFromItems += itemTotal;
+        } else if (description.includes('shipping') || !description.includes('pickup') && !description.includes('delivery') && !description.includes('insurance')) {
+          // Shipping charge or any other charge that's not pickup/delivery/insurance
+          shippingCharge += itemTotal;
         }
-        console.log(`✅ Delivery charge calculated: ${deliveryCharge} AED (${numberOfBoxes} boxes, weight: ${weight} kg)`);
+      });
+    }
+    
+    // If shipping charge not found in line_items, use amount from request body
+    if (shippingCharge === 0) {
+      shippingCharge = parseFloat(amount) || 0;
+    }
+    
+    // Calculate delivery charge
+    // IMPORTANT: 
+    // - For UAE_TO_PINAS: Delivery charge is MANUAL (use provided value or 0)
+    // - For PH_TO_UAE: Delivery charge is AUTO-CALCULATED using box-based formula with base amount
+    let deliveryCharge = 0;
+    let deliveryBaseAmount = 20; // Default base amount
+    
+    // Check if delivery_base_amount is provided in request body or invoiceRequest
+    const providedDeliveryBaseAmount = req.body.delivery_base_amount !== undefined 
+      ? parseFloat(req.body.delivery_base_amount) 
+      : (invoiceRequest?.delivery_base_amount ? parseFloat(invoiceRequest.delivery_base_amount.toString()) : null);
+    
+    if (providedDeliveryBaseAmount !== null && providedDeliveryBaseAmount > 0) {
+      deliveryBaseAmount = providedDeliveryBaseAmount;
+    }
+    
+    const isUaeToPinas = isUaeToPinasService(serviceCode);
+    const isPhToUae = isPhToUaeService(serviceCode);
+    
+    if (has_delivery) {
+      if (isUaeToPinas) {
+        // UAE_TO_PINAS: Use manual delivery charge from request body
+        if (providedDeliveryCharge !== undefined && providedDeliveryCharge !== null) {
+          deliveryCharge = parseFloat(providedDeliveryCharge) || 0;
+          console.log(`✅ Using manual delivery charge for UAE_TO_PINAS: ${deliveryCharge} AED`);
+        } else {
+          deliveryCharge = 0;
+          console.log('ℹ️ No delivery charge provided for UAE_TO_PINAS, using 0');
+        }
+      } else if (isPhToUae) {
+        // PH_TO_UAE: Auto-calculate delivery charge using box-based formula
+        if (weight > 30) {
+          // Weight > 30 kg: Delivery is FREE
+          deliveryCharge = 0;
+          console.log('✅ Delivery is FREE (weight > 30 kg)');
+        } else if (numberOfBoxes <= 1) {
+          deliveryCharge = deliveryBaseAmount;
+        } else {
+          deliveryCharge = deliveryBaseAmount + ((numberOfBoxes - 1) * 5);
+        }
+        deliveryCharge = Math.round(deliveryCharge * 100) / 100;
+        console.log(`✅ Delivery charge auto-calculated for PH_TO_UAE: ${deliveryCharge} AED (base: ${deliveryBaseAmount}, boxes: ${numberOfBoxes}, weight: ${weight} kg)`);
+      } else {
+        // Unknown service code: Use provided delivery charge or from line_items
+        if (providedDeliveryCharge !== undefined && providedDeliveryCharge !== null) {
+          deliveryCharge = parseFloat(providedDeliveryCharge) || 0;
+          console.log(`✅ Using provided delivery charge: ${deliveryCharge} AED`);
+        } else if (deliveryChargeFromItems > 0) {
+          deliveryCharge = deliveryChargeFromItems;
+          console.log(`✅ Using delivery charge from line_items: ${deliveryCharge} AED`);
+        } else {
+          deliveryCharge = 0;
+          console.log('ℹ️ Unknown service code, no delivery charge provided, using 0');
+        }
       }
     } else {
       console.log('ℹ️ No delivery required, delivery charge = 0');
     }
     
-    // Calculate base amount (shipping + delivery)
-    const baseAmount = parseFloat(amount) + deliveryCharge;
-    
-    // Calculate tax: 5% on delivery only when delivery charge exists
-    let finalTaxRate = 0;
-    let taxOnShipping = 0;
-    let taxOnDelivery = 0;
-    
-    if (deliveryCharge > 0 && isPhToUaeService(serviceCode)) {
-      finalTaxRate = 5;
-      taxOnDelivery = (deliveryCharge * 5) / 100;
-      console.log('✅ Applying 5% tax on delivery charge only (PH to UAE)');
-    } else {
-      console.log('ℹ️ No applicable delivery tax (either no delivery charge or non PH to UAE service)');
+    // For PH_TO_UAE tax invoices, always use box-based formula (override line_items if present)
+    if (isPhToUae && has_delivery && weight <= 30) {
+      // Recalculate using box-based formula for tax invoices
+      if (numberOfBoxes <= 1) {
+        deliveryCharge = deliveryBaseAmount;
+      } else {
+        deliveryCharge = deliveryBaseAmount + ((numberOfBoxes - 1) * 5);
+      }
+      deliveryCharge = Math.round(deliveryCharge * 100) / 100;
+      console.log(`✅ Using box-based delivery charge for PH_TO_UAE tax invoice: ${deliveryCharge} AED (base: ${deliveryBaseAmount})`);
+    } else if (deliveryChargeFromItems > 0 && deliveryCharge === 0) {
+      // For other services, use delivery charge from line_items if present and not already calculated
+      deliveryCharge = deliveryChargeFromItems;
+      console.log(`✅ Using delivery charge from line_items: ${deliveryCharge} AED`);
     }
     
-    // Calculate total tax and total amount
-    const totalTaxAmount = taxOnShipping + taxOnDelivery;
-    const totalAmount = baseAmount + totalTaxAmount;
+    // Derive declared amount (from payload or fallback to invoiceRequest)
+    const declaredAmountValue = declared_amount !== undefined
+      ? parseFloat(declared_amount)
+      : (invoiceRequest?.declaredAmount ? parseFloat(invoiceRequest.declaredAmount.toString()) : 0);
+    
+    // Compute insurance charge based on option (only if not found in line_items)
+    let insuranceCharge = insuranceChargeFromItems;
+    if (isPhToUae) {
+      // PH_TO_UAE: insurance not offered, force to 0 and ignore inputs/line_items
+      insuranceCharge = 0;
+      insuranceChargeFromItems = 0;
+      console.log('ℹ️ PH_TO_UAE: Insurance disabled, forcing insuranceCharge = 0');
+    } else if (insuranceCharge === 0) {
+      const normalizedInsuranceOption = (insurance_option || 'none').toLowerCase();
+      const normalizedFixedType = (insurance_fixed_type || '').toLowerCase();
+      
+      if (normalizedInsuranceOption === 'percent') {
+        if (!declaredAmountValue || declaredAmountValue <= 0) {
+          return res.status(400).json({
+            success: false,
+            error: 'declared_amount is required and must be > 0 when insurance_option is percent'
+          });
+        }
+        insuranceCharge = declaredAmountValue * 0.01; // 1% of declared amount
+      } else if (normalizedInsuranceOption === 'fixed') {
+        if (normalizedFixedType === 'mobile') {
+          insuranceCharge = 300;
+        } else if (normalizedFixedType === 'laptop') {
+          insuranceCharge = 400;
+        } else if (normalizedFixedType === 'other') {
+          const manual = insurance_manual_amount !== undefined ? parseFloat(insurance_manual_amount) : 0;
+          if (!manual || manual <= 0) {
+            return res.status(400).json({
+              success: false,
+              error: 'insurance_manual_amount is required and must be > 0 when insurance_option is fixed and insurance_fixed_type is other'
+            });
+          }
+          insuranceCharge = manual;
+        } else {
+          return res.status(400).json({
+            success: false,
+            error: 'insurance_fixed_type must be one of: mobile, laptop, other when insurance_option is fixed'
+          });
+        }
+      }
+    } else {
+      console.log(`✅ Using insurance charge from line_items: ${insuranceCharge} AED`);
+    }
+    
+    // Round all charges to 2 decimal places
+    shippingCharge = Math.round(shippingCharge * 100) / 100;
+    pickupCharge = Math.round(pickupCharge * 100) / 100;
+    deliveryCharge = Math.round(deliveryCharge * 100) / 100;
+    insuranceCharge = Math.round(insuranceCharge * 100) / 100;
+    
+    // Calculate subtotal (all charges combined)
+    const subtotal = shippingCharge + pickupCharge + deliveryCharge + insuranceCharge;
+    const baseAmount = Math.round(subtotal * 100) / 100;
+    
+    console.log('📊 Charge Extraction Summary:');
+    console.log(`   Shipping Charge: ${shippingCharge} AED`);
+    console.log(`   Pickup Charge: ${pickupCharge} AED`);
+    console.log(`   Delivery Charge: ${deliveryCharge} AED`);
+    console.log(`   Insurance Charge: ${insuranceCharge} AED`);
+    console.log(`   Subtotal (base_amount): ${baseAmount} AED`);
+    
+    // ============================================
+    // VAT/Tax Calculation (Priority Order)
+    // ============================================
+    let finalTaxRate = 0;
+    let taxAmount = 0;
+    
+    // Reuse isPhToUae and isUaeToPinas already declared above
+    // Also check for UAE_TO_PH (different from UAE_TO_PINAS)
+    const normalizedServiceCode = (serviceCode || '').toUpperCase();
+    const isUaeToPh = normalizedServiceCode.includes('UAE_TO_PH');
+    const isFlowmicOrPersonal = invoiceRequest ? isFlowmicOrPersonalShipment(invoiceRequest) : false;
+    
+    if (isUaeToPh && isFlowmicOrPersonal) {
+      // Rule 1: Flowmic/Personal UAE_TO_PH - 5% VAT on subtotal
+      finalTaxRate = 5;
+      taxAmount = baseAmount * 0.05;
+      console.log('✅ Applying 5% VAT on subtotal (Flowmic/Personal UAE_TO_PH)');
+      console.log(`   Subtotal: ${baseAmount} AED`);
+      console.log(`   Tax (5%): ${taxAmount} AED`);
+    } else if (isPhToUae && deliveryCharge > 0) {
+      // Rule 2: PH_TO_UAE with delivery - 5% VAT on delivery charge only
+      finalTaxRate = 5;
+      taxAmount = deliveryCharge * 0.05;
+      console.log('✅ Applying 5% VAT on delivery charge only (PH_TO_UAE with delivery)');
+      console.log(`   Delivery Charge: ${deliveryCharge} AED`);
+      console.log(`   Tax (5%): ${taxAmount} AED`);
+    } else {
+      // Rule 3: No tax
+      finalTaxRate = 0;
+      taxAmount = 0;
+      console.log('ℹ️ No applicable tax');
+    }
+    
+    // Round tax amount to 2 decimal places
+    taxAmount = Math.round(taxAmount * 100) / 100;
+    
+    // Calculate total amount
+    const totalAmount = Math.round((baseAmount + taxAmount) * 100) / 100;
     
     console.log('📊 Invoice Calculation Summary:');
-    console.log(`   Shipping Amount: ${amount} AED`);
+    console.log(`   Shipping Charge (invoice.amount): ${shippingCharge} AED`);
+    console.log(`   Pickup Charge: ${pickupCharge} AED`);
     console.log(`   Delivery Charge: ${deliveryCharge} AED`);
-    console.log(`   Base Amount: ${baseAmount} AED`);
-    console.log(`   Tax on Shipping: ${taxOnShipping} AED`);
-    console.log(`   Tax on Delivery: ${taxOnDelivery} AED`);
-    console.log(`   Total Tax: ${totalTaxAmount} AED`);
-    console.log(`   Total Amount: ${totalAmount} AED`);
+    console.log(`   Insurance Charge: ${insuranceCharge} AED`);
+    console.log(`   Subtotal (invoice.base_amount): ${baseAmount} AED`);
+    console.log(`   Tax Rate: ${finalTaxRate}%`);
+    console.log(`   Tax Amount: ${taxAmount} AED`);
+    console.log(`   Total Amount (invoice.total_amount): ${totalAmount} AED`);
+    console.log(`   Service Code: ${serviceCode || 'N/A'}`);
+    console.log(`   Shipment Type: ${(isFlowmicOrPersonal ? 'FLOWMIC/PERSONAL' : 'COMMERCIAL')}`);
 
     // Calculate due date if not provided (30 days from now)
     const invoiceDueDate = due_date ? new Date(due_date) : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
@@ -577,18 +852,44 @@ router.post('/', async (req, res) => {
 
     // invoiceRequest already fetched above for delivery calculation
 
+    // Filter line_items to remove pickup charge (stored in invoice.pickup_charge) and
+    // remove insurance for PH_TO_UAE (insurance disabled there)
+    // Frontend logic: pickupCharge = invoice.pickup_charge + sum of line_items with "pickup"
+    // So we should NOT include pickup in line_items. Insurance for PH_TO_UAE must be excluded.
+    const filteredLineItems = (line_items || []).filter(item => {
+      const description = (item.description || '').toLowerCase();
+      // Remove pickup charge line items - they're stored in invoice.pickup_charge field
+      const isPickup = description.includes('pickup');
+      // Remove insurance for PH_TO_UAE
+      const isInsuranceForPhToUae = isPhToUae && description.includes('insurance');
+      if (isPickup) {
+        console.log(`⚠️ Filtering out pickup charge line item: ${item.description} (stored in invoice.pickup_charge field instead)`);
+      }
+      if (isInsuranceForPhToUae) {
+        console.log(`⚠️ Filtering out insurance line item for PH_TO_UAE: ${item.description} (insurance disabled)`);
+      }
+      return !isPickup && !isInsuranceForPhToUae;
+    });
+    
+    if (pickupCharge > 0) {
+      console.log(`✅ Pickup charge (${pickupCharge} AED) stored in invoice.pickup_charge field, NOT in line_items`);
+    }
+
     const invoiceData = {
       request_id,
       client_id,
-      amount: mongoose.Types.Decimal128.fromString(parseFloat(amount).toFixed(2)), // Base shipping amount
-      delivery_charge: mongoose.Types.Decimal128.fromString(deliveryCharge.toFixed(2)), // Add delivery charge field
-      base_amount: mongoose.Types.Decimal128.fromString(baseAmount.toFixed(2)), // Shipping + Delivery
+      amount: mongoose.Types.Decimal128.fromString(shippingCharge.toFixed(2)), // Shipping charge only (weight × rate)
+      delivery_charge: mongoose.Types.Decimal128.fromString(deliveryCharge.toFixed(2)), // Delivery charge
+      delivery_base_amount: isPhToUae && has_delivery ? mongoose.Types.Decimal128.fromString(deliveryBaseAmount.toFixed(2)) : undefined, // Base amount for PH_TO_UAE
+      pickup_charge: mongoose.Types.Decimal128.fromString(pickupCharge.toFixed(2)), // Pickup charge (NOT in line_items to prevent doubling)
+      base_amount: mongoose.Types.Decimal128.fromString(baseAmount.toFixed(2)), // Subtotal (all charges: shipping + pickup + delivery + insurance)
+      insurance_charge: mongoose.Types.Decimal128.fromString((isPhToUae ? 0 : insuranceCharge).toFixed(2)), // Force 0 for PH_TO_UAE
       due_date: invoiceDueDate,
       status: 'UNPAID',
-      line_items: line_items || [],
-      tax_rate: finalTaxRate, // Use calculated tax rate
-      tax_amount: mongoose.Types.Decimal128.fromString(totalTaxAmount.toFixed(2)), // Total tax (shipping + delivery)
-      total_amount: mongoose.Types.Decimal128.fromString(totalAmount.toFixed(2)), // Final total
+      line_items: filteredLineItems, // Filtered to exclude pickup charge
+      tax_rate: finalTaxRate, // Tax rate (0% or 5%)
+      tax_amount: mongoose.Types.Decimal128.fromString(taxAmount.toFixed(2)), // Calculated tax amount
+      total_amount: mongoose.Types.Decimal128.fromString(totalAmount.toFixed(2)), // Final total (base_amount + tax_amount)
       notes,
       created_by,
       has_delivery: has_delivery, // Store delivery flag
@@ -635,11 +936,10 @@ router.post('/', async (req, res) => {
     
     await invoice.save();
 
-    // EMpost integration disabled
-    // await syncInvoiceWithEMPost({
-    //   invoiceId: invoice._id,
-    //   reason: `Invoice created with status: ${invoice.status}`,
-    // });
+    await syncInvoiceWithEMPost({
+      invoiceId: invoice._id,
+      reason: `Invoice created with status: ${invoice.status}`,
+    });
     
     console.log('✅ Invoice saved successfully:', {
       _id: invoice._id,
@@ -653,33 +953,31 @@ router.post('/', async (req, res) => {
       .populate('client_id', 'company_name contact_name email phone address city country')
       .populate('created_by', 'full_name email department_id');
 
-    // EMpost integration disabled - no longer sending requests to EMpost
-    // // Integrate with EMpost API
-    // try {
-    //   console.log('📦 Starting EMpost integration for invoice:', invoice.invoice_id);
-    //   
-    //   // Create shipment in EMpost
-    //   const shipmentResult = await empostAPI.createShipment(populatedInvoice);
-    //   
-    //   if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
-    //     // Update invoice with uhawb
-    //     invoice.empost_uhawb = shipmentResult.data.uhawb;
-    //     await invoice.save();
-    //     console.log('✅ Updated invoice with EMpost uhawb:', shipmentResult.data.uhawb);
-    //   }
-    //   
-    //   // Issue invoice in EMpost
-    //   await empostAPI.issueInvoice(populatedInvoice);
-    //   console.log('✅ EMpost integration completed successfully');
-    //   
-    // } catch (empostError) {
-    //   // Log error but don't block invoice creation
-    //   console.error('❌ EMpost integration failed (invoice creation will continue):', empostError.message);
-    //   console.error('Error details:', empostError.response?.data || empostError.message);
-    //   
-    //   // Optionally, you could store the error in the invoice or a separate error log
-    //   // For now, we'll just log it and continue
-    // }
+    // Integrate with EMPOST API
+    try {
+      console.log('📦 Starting EMPOST integration for invoice:', invoice.invoice_id);
+      
+      // Create/update shipment in EMPOST
+      const shipmentResult = await empostAPI.createShipment(populatedInvoice);
+      
+      if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
+        // Update invoice with UHAWB if returned
+        if (invoice.empost_uhawb !== shipmentResult.data.uhawb) {
+          invoice.empost_uhawb = shipmentResult.data.uhawb;
+          await invoice.save();
+          console.log('✅ Updated invoice with EMPOST UHAWB:', shipmentResult.data.uhawb);
+        }
+      }
+      
+      // Issue invoice in EMPOST
+      await empostAPI.issueInvoice(populatedInvoice);
+      console.log('✅ EMPOST shipment + invoice issued successfully');
+      
+    } catch (empostError) {
+      // Log error but don't block invoice creation
+      console.error('❌ EMPOST integration failed (invoice creation will continue):', empostError.message);
+      console.error('Error details:', empostError.response?.data || empostError.message);
+    }
 
     // Create notifications for all users about the new invoice - DISABLED
     // await createNotificationsForAllUsers('invoice', invoice._id, created_by);
@@ -866,10 +1164,8 @@ router.put('/:id/status', async (req, res) => {
 
     await invoice.save();
 
-    await syncInvoiceWithEMPost({
-      invoiceId: invoice._id,
-      reason: 'Invoice remitted status update',
-    });
+    // Note: EMPOST shipment status is NOT updated when invoice status changes
+    // EMPOST is only updated when invoice is created, not on remitted/collected status changes
 
     // Sync invoice status to shipment request if they share the same ID
     try {
@@ -1055,30 +1351,123 @@ router.put('/:id', async (req, res) => {
       });
     }
 
-    // Recalculate totals if amount or tax_rate changes
-    if (updateData.amount || updateData.tax_rate !== undefined) {
-      const amount = updateData.amount || invoice.amount;
-      const taxRate = updateData.tax_rate !== undefined ? updateData.tax_rate : invoice.tax_rate;
-      const taxAmount = (amount * taxRate) / 100;
-      const totalAmount = amount + taxAmount;
+    // Recalculate totals if base_amount, delivery_charge, or tax_rate changes
+    // Note: invoice.amount is shipping charge only, invoice.base_amount is subtotal
+    const needsRecalculation = updateData.base_amount !== undefined || 
+                                updateData.delivery_charge !== undefined || 
+                                updateData.tax_rate !== undefined ||
+                                updateData.pickup_charge !== undefined ||
+                                updateData.insurance_charge !== undefined;
+    
+    if (needsRecalculation) {
+      // Get base_amount (subtotal) - handle both Decimal128 and number types
+      let baseAmountValue = 0;
+      if (updateData.base_amount !== undefined) {
+        baseAmountValue = typeof updateData.base_amount === 'object' && updateData.base_amount.toString 
+          ? parseFloat(updateData.base_amount.toString()) 
+          : parseFloat(updateData.base_amount);
+      } else {
+        // Recalculate base_amount from individual charges if not provided
+        const shippingCharge = updateData.amount !== undefined
+          ? (typeof updateData.amount === 'object' && updateData.amount.toString ? parseFloat(updateData.amount.toString()) : parseFloat(updateData.amount))
+          : (invoice.amount ? parseFloat(invoice.amount.toString()) : 0);
+        const pickupCharge = updateData.pickup_charge !== undefined
+          ? (typeof updateData.pickup_charge === 'object' && updateData.pickup_charge.toString ? parseFloat(updateData.pickup_charge.toString()) : parseFloat(updateData.pickup_charge))
+          : (invoice.pickup_charge ? parseFloat(invoice.pickup_charge.toString()) : 0);
+        const deliveryCharge = updateData.delivery_charge !== undefined
+          ? (typeof updateData.delivery_charge === 'object' && updateData.delivery_charge.toString ? parseFloat(updateData.delivery_charge.toString()) : parseFloat(updateData.delivery_charge))
+          : (invoice.delivery_charge ? parseFloat(invoice.delivery_charge.toString()) : 0);
+        const insuranceChargeRaw = updateData.insurance_charge !== undefined
+          ? (typeof updateData.insurance_charge === 'object' && updateData.insurance_charge.toString ? parseFloat(updateData.insurance_charge.toString()) : parseFloat(updateData.insurance_charge))
+          : (invoice.insurance_charge ? parseFloat(invoice.insurance_charge.toString()) : 0);
+        const insuranceCharge = isPhToUae ? 0 : insuranceChargeRaw;
+        
+        baseAmountValue = shippingCharge + pickupCharge + deliveryCharge + insuranceCharge;
+        baseAmountValue = Math.round(baseAmountValue * 100) / 100;
+        updateData.base_amount = mongoose.Types.Decimal128.fromString(baseAmountValue.toFixed(2));
+      }
       
-      updateData.tax_amount = taxAmount;
-      updateData.total_amount = totalAmount;
+      // If base_amount wasn't in updateData, get it from invoice
+      if (baseAmountValue === 0) {
+        baseAmountValue = invoice.base_amount ? parseFloat(invoice.base_amount.toString()) : 0;
+      }
+      
+      const taxRate = updateData.tax_rate !== undefined ? updateData.tax_rate : invoice.tax_rate;
+      
+      // Calculate tax based on rules (same as creation)
+      // For simplicity in updates, if tax_rate is 5%, calculate on base_amount
+      // (This assumes the invoice was created correctly with proper tax rules)
+      let taxAmount = 0;
+      if (taxRate === 5) {
+        // Check if this is PH_TO_UAE with delivery (tax on delivery only)
+        const serviceCode = invoice.service_code || '';
+        const normalizedServiceCode = serviceCode.toUpperCase();
+        const isPhToUae = normalizedServiceCode.includes('PH_TO_UAE');
+        const isUaeToPh = normalizedServiceCode.includes('UAE_TO_PH');
+        const deliveryCharge = updateData.delivery_charge !== undefined
+          ? (typeof updateData.delivery_charge === 'object' && updateData.delivery_charge.toString ? parseFloat(updateData.delivery_charge.toString()) : parseFloat(updateData.delivery_charge))
+          : (invoice.delivery_charge ? parseFloat(invoice.delivery_charge.toString()) : 0);
+        
+        // Try to get invoiceRequest for Flowmic/Personal check
+        let isFlowmicOrPersonal = false;
+        try {
+          if (invoice.request_id) {
+            const { InvoiceRequest } = require('../models');
+            const invoiceRequest = await InvoiceRequest.findById(invoice.request_id);
+            if (invoiceRequest) {
+              isFlowmicOrPersonal = isFlowmicOrPersonalShipment(invoiceRequest);
+            }
+          }
+        } catch (err) {
+          console.warn('Could not check Flowmic/Personal status for update:', err.message);
+        }
+        
+        if (isUaeToPh && isFlowmicOrPersonal) {
+          // Rule 1: Flowmic/Personal UAE_TO_PH - 5% on subtotal
+          taxAmount = baseAmountValue * 0.05;
+        } else if (isPhToUae && deliveryCharge > 0) {
+          // Rule 2: PH_TO_UAE with delivery - 5% on delivery charge only
+          taxAmount = deliveryCharge * 0.05;
+        } else {
+          // Default: 5% on subtotal
+          taxAmount = baseAmountValue * 0.05;
+        }
+      }
+      
+      taxAmount = Math.round(taxAmount * 100) / 100;
+      const totalAmount = Math.round((baseAmountValue + taxAmount) * 100) / 100;
+      
+      updateData.tax_amount = mongoose.Types.Decimal128.fromString(taxAmount.toFixed(2));
+      updateData.total_amount = mongoose.Types.Decimal128.fromString(totalAmount.toFixed(2));
+      
+      console.log('📊 Invoice Update - Tax Recalculation:');
+      console.log(`   Base Amount (subtotal): ${baseAmountValue} AED`);
+      console.log(`   Tax Rate: ${taxRate}%`);
+      console.log(`   Tax Amount: ${taxAmount.toFixed(2)} AED`);
+      console.log(`   Total Amount: ${totalAmount.toFixed(2)} AED`);
     }
 
     Object.assign(invoice, updateData);
     await invoice.save();
 
-    await syncInvoiceWithEMPost({
-      invoiceId: invoice._id,
-      reason: 'Invoice update',
-    });
+    // Note: EMPOST shipment is NOT updated on invoice updates
+    // EMPOST is only updated when invoice is created
 
     // Populate the updated invoice for response
     const populatedInvoice = await Invoice.findById(invoice._id)
       .populate('request_id', REQUEST_POPULATE_FIELDS)
       .populate('client_id', 'company_name contact_name email phone')
       .populate('created_by', 'full_name email department_id');
+
+    // Re-issue invoice in EMPOST when invoice is edited
+    try {
+      console.log('📄 Re-issuing EMPOST invoice after edit:', invoice.invoice_id);
+      await empostAPI.issueInvoice(populatedInvoice);
+      console.log('✅ EMPOST invoice re-issued successfully after edit');
+    } catch (empostError) {
+      console.error('❌ EMPOST invoice re-issue failed (edit will continue):', empostError.message);
+      console.error('Error details:', empostError.response?.data || empostError.message);
+    }
 
     res.json({
       success: true,

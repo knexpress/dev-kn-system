@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const { User, Employee } = require('../models');
 const auth = require('../middleware/auth');
 const requireAdmin = require('../middleware/roleAuth');
+const requireSuperAdmin = require('../middleware/roleAuth').requireSuperAdmin;
 
 const router = express.Router();
 
@@ -242,6 +243,88 @@ router.post('/change-password', auth, async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message || 'Failed to change password'
+    });
+  }
+});
+
+// Reset password endpoint - Requires SUPERADMIN role
+router.post('/:id/reset-password', auth, requireSuperAdmin, async (req, res) => {
+  try {
+    const userId = req.params.id;
+    const { password } = req.body;
+
+    // Validate user ID format
+    if (!userId || !userId.match(/^[0-9a-fA-F]{24}$/)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid user ID format'
+      });
+    }
+
+    // Find user by ID
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
+    }
+
+    let newPassword;
+    let message;
+
+    // Check if password is provided in request body
+    if (password !== undefined && password !== null && password !== '') {
+      // Validate password if provided
+      if (password.length < 4) {
+        return res.status(400).json({
+          success: false,
+          error: 'Password must be at least 4 characters long'
+        });
+      }
+
+      // Use provided password
+      newPassword = password;
+      message = 'Password reset successfully';
+    } else {
+      // Reset to default password
+      newPassword = 'password123';
+      message = 'Password reset to default (password123)';
+    }
+
+    // Set the password (plain text - will be hashed by pre-save hook)
+    user.password = newPassword;
+    await user.save();
+
+    // Return user data without password
+    const userData = {
+      _id: user._id,
+      email: user.email,
+      full_name: user.full_name
+    };
+
+    res.status(200).json({
+      success: true,
+      data: {
+        message: message,
+        user: userData
+      }
+    });
+
+  } catch (error) {
+    console.error('Error resetting password:', error);
+    
+    // Handle database errors
+    if (error.name === 'CastError') {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid user ID format'
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to reset password'
     });
   }
 });

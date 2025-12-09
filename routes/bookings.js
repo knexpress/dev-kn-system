@@ -7,13 +7,25 @@ const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/i
 
 const router = express.Router();
 
-// Get all bookings
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 200;
+const HEAVY_FIELDS_PROJECTION = '-identityDocuments -attachments -documents -images -files -selfie';
+
+// Get all bookings (paginated, light payload)
 router.get('/', async (req, res) => {
   try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || DEFAULT_LIMIT, 1), MAX_LIMIT);
+    const skip = (page - 1) * limit;
+
     // Use lean() to get plain JavaScript objects with all fields including OTP
     const bookings = await Booking.find()
+      .select(HEAVY_FIELDS_PROJECTION) // exclude heavy blobs to speed up review list
       .lean()
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit);
+    const total = await Booking.countDocuments();
     
     // Ensure OTP is included in response (it should be in otpVerification.otp)
     // Format bookings to explicitly include OTP information for manager dashboard
@@ -51,7 +63,7 @@ router.get('/', async (req, res) => {
       console.log('📦 Backend - OTP Info:', formattedBookings[0].otpInfo);
     }
     
-    res.json({ success: true, data: formattedBookings });
+    res.json({ success: true, data: formattedBookings, pagination: { page, limit, total } });
   } catch (error) {
     console.error('Error fetching bookings:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch bookings' });
@@ -62,10 +74,18 @@ router.get('/', async (req, res) => {
 router.get('/status/:reviewStatus', async (req, res) => {
   try {
     const { reviewStatus } = req.params;
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || DEFAULT_LIMIT, 1), MAX_LIMIT);
+    const skip = (page - 1) * limit;
+
     // Use lean() to get plain JavaScript objects with all fields including OTP
     const bookings = await Booking.find({ review_status: reviewStatus })
+      .select(HEAVY_FIELDS_PROJECTION)
       .lean()
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit);
+    const total = await Booking.countDocuments({ review_status: reviewStatus });
     
     // Format bookings to explicitly include OTP information
     const formattedBookings = bookings.map(booking => {
@@ -94,7 +114,7 @@ router.get('/status/:reviewStatus', async (req, res) => {
       };
     });
     
-    res.json({ success: true, data: formattedBookings });
+    res.json({ success: true, data: formattedBookings, pagination: { page, limit, total } });
   } catch (error) {
     console.error('Error fetching bookings by status:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch bookings' });
@@ -241,7 +261,7 @@ router.post('/:id/review', async (req, res) => {
       console.warn('⚠️ WARNING: Service code is empty! This will affect price bracket determination.');
     }
     
-    // Auto-generate Invoice ID and AWB number (same as sales person creates)
+    // Auto-generate Invoice ID and get AWB number from booking
     let invoiceNumber;
     let awbNumber;
     
@@ -250,24 +270,47 @@ router.post('/:id/review', async (req, res) => {
       invoiceNumber = await generateUniqueInvoiceID(InvoiceRequest);
       console.log('✅ Generated Invoice ID:', invoiceNumber);
       
-      // Generate unique AWB number following pattern PHL2VN3KT28US9H
-      // Use the already normalized serviceCode
-      const isPhToUae = serviceCode === 'PH_TO_UAE' || serviceCode.startsWith('PH_TO_UAE');
-      const isUaeToPh = serviceCode === 'UAE_TO_PH' || serviceCode.startsWith('UAE_TO_PH');
-      
-      // Determine AWB prefix based on service code
-      let awbPrefix = {};
-      if (isPhToUae) {
-        awbPrefix = { prefix: 'PHL' };
-        console.log('✅ PH_TO_UAE service detected - using PHL prefix for AWB');
-      } else if (isUaeToPh) {
-        // UAE to PH might use different prefix or no prefix
-        awbPrefix = {};
-        console.log('✅ UAE_TO_PH service detected - using default AWB generation');
+      // Get AWB number from booking (priority: booking.awb)
+      if (booking.awb && booking.awb.trim()) {
+        awbNumber = booking.awb.trim();
+        console.log('✅ Using AWB number from booking:', awbNumber);
+        
+        // Check if this AWB already exists in InvoiceRequest (to avoid duplicates)
+        const existingInvoiceRequest = await InvoiceRequest.findOne({
+          $or: [
+            { tracking_code: awbNumber },
+            { awb_number: awbNumber }
+          ]
+        });
+        
+        if (existingInvoiceRequest) {
+          console.warn(`⚠️  AWB ${awbNumber} already exists in InvoiceRequest. Generating new AWB as fallback.`);
+          // Fallback: generate new AWB if booking AWB already exists
+          const isPhToUae = serviceCode === 'PH_TO_UAE' || serviceCode.startsWith('PH_TO_UAE');
+          const awbPrefix = isPhToUae ? { prefix: 'PHL' } : {};
+          awbNumber = await generateUniqueAWBNumber(InvoiceRequest, awbPrefix);
+          console.log('✅ Generated new AWB Number as fallback:', awbNumber);
+        }
+      } else {
+        // Generate unique AWB number if not provided in booking
+        console.log('ℹ️  No AWB found in booking, generating new AWB number');
+        const isPhToUae = serviceCode === 'PH_TO_UAE' || serviceCode.startsWith('PH_TO_UAE');
+        const isUaeToPh = serviceCode === 'UAE_TO_PH' || serviceCode.startsWith('UAE_TO_PH');
+        
+        // Determine AWB prefix based on service code
+        let awbPrefix = {};
+        if (isPhToUae) {
+          awbPrefix = { prefix: 'PHL' };
+          console.log('✅ PH_TO_UAE service detected - using PHL prefix for AWB');
+        } else if (isUaeToPh) {
+          // UAE to PH might use different prefix or no prefix
+          awbPrefix = {};
+          console.log('✅ UAE_TO_PH service detected - using default AWB generation');
+        }
+        
+        awbNumber = await generateUniqueAWBNumber(InvoiceRequest, awbPrefix);
+        console.log('✅ Generated AWB Number:', awbNumber);
       }
-      
-      awbNumber = await generateUniqueAWBNumber(InvoiceRequest, awbPrefix);
-      console.log('✅ Generated AWB Number:', awbNumber);
     } catch (error) {
       console.error('❌ Error generating IDs:', error);
       return res.status(500).json({ 
@@ -302,6 +345,17 @@ router.post('/:id/review', async (req, res) => {
         return undefined;
       }
     };
+
+    // Normalize truthy/falsey values that may arrive as strings/numbers
+    const normalizeBoolean = (value) => {
+      if (value === undefined || value === null) return undefined;
+      if (typeof value === 'string') {
+        const lowered = value.trim().toLowerCase();
+        if (['true', '1', 'yes', 'y'].includes(lowered)) return true;
+        if (['false', '0', 'no', 'n'].includes(lowered)) return false;
+      }
+      return Boolean(value);
+    };
     
     // Map boxes if available (from booking or items)
     let verificationBoxes = [];
@@ -327,6 +381,21 @@ router.post('/:id/review', async (req, res) => {
     // Calculate number of boxes
     const numberOfBoxes = booking.number_of_boxes || verificationBoxes.length || items.length || 1;
     
+    // Capture booking snapshot for audit/debug (remove mongoose internals)
+    const bookingSnapshot = booking.toObject ? booking.toObject() : booking;
+    if (bookingSnapshot && bookingSnapshot.__v !== undefined) {
+      delete bookingSnapshot.__v;
+    }
+    if (bookingSnapshot && bookingSnapshot._id) {
+      bookingSnapshot._id = bookingSnapshot._id.toString();
+    }
+    
+    // Extract insurance data with fallbacks (check both top-level and sender object)
+    const insuredRaw = booking.insured ?? booking.insurance ?? booking.isInsured ?? booking.is_insured 
+      ?? sender.insured ?? sender.insurance ?? sender.isInsured ?? sender.is_insured;
+    const declaredAmountRaw = booking.declaredAmount ?? booking.declared_amount ?? booking.declared_value ?? booking.declaredValue
+      ?? sender.declaredAmount ?? sender.declared_amount ?? sender.declared_value ?? sender.declaredValue;
+
     // Build invoice request data (same structure as sales person creates)
     const invoiceRequestData = {
       // Auto-generated Invoice & Tracking Information (same as sales)
@@ -346,6 +415,22 @@ router.post('/:id/review', async (req, res) => {
       receiver_address: receiver.completeAddress || receiver.addressLine1 || receiver.address || booking.receiver_address || booking.receiverAddress || destinationPlace, // Use detailed address if available, fallback to destinationPlace
       receiver_phone: receiver.contactNo || receiver.phoneNumber || receiver.phone || booking.receiver_phone || booking.receiverPhone || '',
       receiver_company: receiver.company || booking.receiver_company || '',
+      
+      // Identity documents and customer images
+      identityDocuments: booking.identityDocuments || booking.identity_documents || {},
+      customerImage: booking.customerImage || booking.customer_image || '',
+      customerImages: Array.isArray(booking.customerImages) ? booking.customerImages : (booking.customer_images || []),
+      
+      // Booking snapshot
+      booking_snapshot: bookingSnapshot,
+      
+      // Delivery options (from booking sender and receiver)
+      sender_delivery_option: sender.deliveryOption || booking.sender?.deliveryOption || undefined,
+      receiver_delivery_option: receiver.deliveryOption || booking.receiver?.deliveryOption || undefined,
+      
+      // Insurance information (from booking)
+      insured: normalizeBoolean(insuredRaw) ?? false,
+      declaredAmount: toDecimal128(declaredAmountRaw),
       
       // Status (same as sales - defaults to DRAFT or can be SUBMITTED)
       status: 'SUBMITTED', // Ready for Operations to process
