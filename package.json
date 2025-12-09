@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
+    "build": "echo \"no build step\"",
     "seed": "node scripts/seed.js",
     "setup": "node setup-env.js",
     "test": "node -e \"require('dotenv').config(); const mongoose = require('mongoose'); mongoose.connect(process.env.MONGODB_URI).then(() => { console.log('✅ Backend test passed!'); process.exit(0); }).catch(err => { console.error('❌ Backend test failed:', err.message); process.exit(1); });\""
