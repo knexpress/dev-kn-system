@@ -6,8 +6,7 @@ const { Readable } = require('stream');
 const crypto = require('crypto');
 const { Invoice, Client, DeliveryAssignment } = require('../models/unified-schema');
 const { Report, User } = require('../models');
-// EMPOST API DISABLED
-// const empostAPI = require('../services/empost-api');
+const empostAPI = require('../services/empost-api');
 const { generateUniqueInvoiceID, generateUniqueAWBNumber } = require('../utils/id-generators');
 
 const router = express.Router();
@@ -885,20 +884,20 @@ async function mapCSVToEMPOSTShipment(row, client = null) {
   const additionalInfo1 = getColumnValue(row, ['additionalinfo1', 'additional_info1', 'additional info1']);
   const additionalInfo2 = getColumnValue(row, ['additionalinfo2', 'additional_info2', 'additional info2']);
   
-  // Get sender information (try client lookup first, then defaults)
-  let senderEmail = 'noreply@company.com';
-  let senderPhone = '+971500000000';
+  // Get sender information (try client lookup first, then defaults to "N/A")
+  let senderEmail = 'N/A';
+  let senderPhone = 'N/A';
   let senderAddress = originCity || 'N/A';
   
   if (client) {
-    senderEmail = client.email || senderEmail;
-    senderPhone = client.phone || senderPhone;
+    senderEmail = client.email || 'N/A';
+    senderPhone = client.phone || 'N/A';
     senderAddress = client.address || senderAddress;
   }
   
-  // Get receiver information (try parsing from AdditionalInfo fields)
-  let receiverName = 'Unknown Receiver';
-  let receiverPhone = '+971500000000';
+  // Get receiver information (try parsing from AdditionalInfo fields, default to "N/A")
+  let receiverName = 'N/A';
+  let receiverPhone = 'N/A';
   
   // Try to parse receiver info from AdditionalInfo1 or AdditionalInfo2
   if (additionalInfo1) {
@@ -917,11 +916,11 @@ async function mapCSVToEMPOSTShipment(row, client = null) {
   if (additionalInfo2) {
     const phoneRegex = /(\+?\d{10,15})/g;
     const phoneMatch = additionalInfo2.match(phoneRegex);
-    if (phoneMatch && receiverPhone === '+971500000000') {
+    if (phoneMatch && receiverPhone === 'N/A') {
       receiverPhone = phoneMatch[0];
     }
     // If AdditionalInfo2 doesn't look like a phone, treat it as name
-    if (!phoneMatch && additionalInfo2.length < 50 && receiverName === 'Unknown Receiver') {
+    if (!phoneMatch && additionalInfo2.length < 50 && receiverName === 'N/A') {
       receiverName = additionalInfo2;
     }
   }
@@ -942,24 +941,24 @@ async function mapCSVToEMPOSTShipment(row, client = null) {
   // Parse transaction date
   const parsedDate = transactionDate ? new Date(transactionDate) : new Date();
   
-  // Build EMPOST shipment payload
+  // Build EMPOST shipment payload (use "N/A" for all missing required fields)
   const shipmentData = {
-    trackingNumber: awbNo || '',
+    trackingNumber: awbNo || 'N/A',
     uhawb: '',
     sender: {
       name: customerName || 'N/A',
-      email: senderEmail,
-      phone: senderPhone,
-      countryCode: convertCountryToISO(originCountry),
-      city: originCity || 'Dubai',
-      line1: senderAddress
+      email: senderEmail || 'N/A',
+      phone: senderPhone || 'N/A',
+      countryCode: convertCountryToISO(originCountry || 'N/A'),
+      city: originCity || 'N/A',
+      line1: senderAddress || 'N/A'
     },
     receiver: {
-      name: receiverName,
-      phone: receiverPhone,
-      email: '',
-      countryCode: convertCountryToISO(destinationCountry),
-      city: destinationCity || 'Dubai',
+      name: receiverName || 'N/A',
+      phone: receiverPhone || 'N/A',
+      email: 'N/A',
+      countryCode: convertCountryToISO(destinationCountry || 'N/A'),
+      city: destinationCity || 'N/A',
       line1: destinationCity || 'N/A'
     },
     details: {
@@ -984,7 +983,7 @@ async function mapCSVToEMPOSTShipment(row, client = null) {
       numberOfPieces: 1
     },
     items: [{
-      description: shipmentType || 'General Goods',
+      description: shipmentType || 'N/A',
       countryOfOrigin: 'AE',
       quantity: 1,
       hsCode: '8504.40'
@@ -1024,6 +1023,7 @@ router.post('/historical', auth, upload.single('csvFile'), async (req, res) => {
       rows_processed: 0,
       rows_filtered_by_date: 0,
       shipments_created: 0,
+      invoices_created: 0,
       audit_entries_created: 0,
       errors: 0
     };
@@ -1084,34 +1084,97 @@ router.post('/historical', auth, upload.single('csvFile'), async (req, res) => {
         // Map CSV data to EMPOST shipment format
         const shipmentData = await mapCSVToEMPOSTShipment(row, client);
 
-        // EMPOST API DISABLED
         // Call EMPOST API to create shipment
         let uhawb = null;
-        // try {
-        //   console.log(`📦 Creating shipment in EMPOST for AWB: ${shipmentData.trackingNumber}`);
-        //   
-        //   const shipmentResult = await empostAPI.createShipmentFromData(shipmentData);
-        //   
-        //   if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
-        //     uhawb = shipmentResult.data.uhawb;
-        //     summary.shipments_created++;
-        //     console.log(`✅ Shipment created in EMPOST with UHAWB: ${uhawb}`);
-        //   } else {
-        //     throw new Error('EMPOST API did not return UHAWB');
-        //   }
-        // } catch (empostError) {
-        //   console.error(`❌ EMPOST API error for row ${rowNumber}:`, empostError.message);
-        //   errors.push({
-        //     row: rowNumber,
-        //     error: `EMPOST API error: ${empostError.response?.data?.message || empostError.message}`,
-        //     awb: awbNo || 'N/A'
-        //   });
-        //   summary.errors++;
-        //   continue; // Skip audit report creation if EMPOST fails
-        // }
+        try {
+          console.log(`📦 Creating shipment in EMPOST for AWB: ${shipmentData.trackingNumber || 'N/A'}`);
+          
+          const shipmentResult = await empostAPI.createShipmentFromData(shipmentData);
+          
+          if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
+            uhawb = shipmentResult.data.uhawb;
+            summary.shipments_created++;
+            console.log(`✅ Shipment created in EMPOST with UHAWB: ${uhawb}`);
+          } else {
+            console.warn(`⚠️ EMPOST shipment API did not return UHAWB for row ${rowNumber}`);
+          }
+        } catch (empostError) {
+          console.error(`❌ EMPOST shipment API error for row ${rowNumber}:`, empostError.message);
+          // Don't fail the entire process, just log the error
+          errors.push({
+            row: rowNumber,
+            error: `EMPOST shipment API error: ${empostError.response?.data?.message || empostError.message}`,
+            awb: awbNo || 'N/A'
+          });
+        }
+
+        // Extract invoice data from CSV and call invoice API
+        // IMPORTANT: For historical data, we ONLY send to EMPOST API and store in audit report
+        // We do NOT create Invoice documents in the database collection
+        try {
+          // Extract invoice-related fields from CSV (use "N/A" for missing data)
+          const invoiceAmount = parseFloat(getColumnValue(row, ['invoice_amount', 'invoiceamount', 'amount', 'total_amount', 'totalamount']) || 0);
+          const deliveryChargeValue = parseFloat(getColumnValue(row, ['delivery charge', 'delivery_charge', 'deliverycharge']) || 0);
+          const taxAmount = parseFloat(getColumnValue(row, ['tax_amount', 'taxamount', 'tax', 'vat']) || 0);
+          const weight = parseFloat(getColumnValue(row, ['weight']) || 0.1);
+          const invoiceNumber = getColumnValue(row, ['invoice_number', 'invoicenumber', 'invoice_id', 'invoiceid']) || awbNo || 'N/A';
+          
+          // Calculate amounts (use "N/A" defaults if missing)
+          const baseAmount = invoiceAmount > 0 ? invoiceAmount : (deliveryChargeValue > 0 ? deliveryChargeValue : 0);
+          const totalAmount = baseAmount + deliveryChargeValue + taxAmount;
+          
+          // Create invoice-like object for EMPOST invoice API (matching the expected structure)
+          // NOTE: This is only used for EMPOST API call, NOT saved to database
+          const invoiceData = {
+            awb_number: awbNo || 'N/A',
+            invoice_id: invoiceNumber,
+            issue_date: transactionDate ? new Date(transactionDate) : new Date(),
+            amount: baseAmount,
+            delivery_charge: deliveryChargeValue,
+            tax_amount: taxAmount,
+            total_amount: totalAmount,
+            weight_kg: weight > 0 ? weight : 0.1,
+            service_code: getColumnValue(row, ['service_code', 'servicecode']) || 'N/A',
+            client_id: client ? {
+              company_name: client.company_name || 'N/A',
+              contact_name: client.contact_name || 'N/A'
+            } : {
+              company_name: customerName || 'N/A',
+              contact_name: customerName || 'N/A'
+            }
+          };
+
+          console.log(`📄 Issuing invoice in EMPOST for AWB: ${invoiceData.awb_number} (historical data - NOT creating database record)`);
+          
+          // Call EMPOST invoice API - this only sends data to external API, does NOT create database records
+          const invoiceResult = await empostAPI.issueInvoice(invoiceData);
+          
+          if (invoiceResult) {
+            summary.invoices_created++;
+            console.log(`✅ Invoice issued in EMPOST for AWB: ${invoiceData.awb_number}`);
+          }
+        } catch (invoiceError) {
+          console.error(`❌ EMPOST invoice API error for row ${rowNumber}:`, invoiceError.message);
+          // Don't fail the entire process, just log the error
+          errors.push({
+            row: rowNumber,
+            error: `EMPOST invoice API error: ${invoiceError.response?.data?.message || invoiceError.message}`,
+            awb: awbNo || 'N/A'
+          });
+        }
 
         // Create audit report entry
+        // IMPORTANT: This is the ONLY place where historical invoice data is stored
+        // Historical data does NOT create Invoice documents in the database collection
         try {
+          // Extract invoice data for audit report (from the invoice API call above)
+          const invoiceAmount = parseFloat(getColumnValue(row, ['invoice_amount', 'invoiceamount', 'amount', 'total_amount', 'totalamount']) || 0);
+          const deliveryChargeValue = parseFloat(getColumnValue(row, ['delivery charge', 'delivery_charge', 'deliverycharge']) || 0);
+          const taxAmount = parseFloat(getColumnValue(row, ['tax_amount', 'taxamount', 'tax', 'vat']) || 0);
+          const invoiceNumber = getColumnValue(row, ['invoice_number', 'invoicenumber', 'invoice_id', 'invoiceid']) || awbNo || 'N/A';
+          const baseAmount = invoiceAmount > 0 ? invoiceAmount : (deliveryChargeValue > 0 ? deliveryChargeValue : 0);
+          const totalAmount = baseAmount + deliveryChargeValue + taxAmount;
+          
           const reportData = {
             awb_number: awbNo || 'N/A',
             transaction_date: transactionDate || 'N/A',
@@ -1129,7 +1192,15 @@ router.post('/historical', auth, upload.single('csvFile'), async (req, res) => {
             additional_info2: getColumnValue(row, ['additionalinfo2', 'additional_info2', 'additional info2']) || 'N/A',
             empost_uhawb: uhawb || 'N/A',
             upload_type: 'historical',
-            uploaded_at: new Date()
+            uploaded_at: new Date(),
+            // Store invoice data in audit report (for reference only, NOT in Invoice collection)
+            invoice_data: {
+              invoice_number: invoiceNumber,
+              invoice_amount: baseAmount,
+              invoice_delivery_charge: deliveryChargeValue,
+              invoice_tax_amount: taxAmount,
+              invoice_total_amount: totalAmount
+            }
           };
 
           const auditReport = new Report({
@@ -1177,6 +1248,7 @@ router.post('/historical', auth, upload.single('csvFile'), async (req, res) => {
     console.log(`  Rows processed: ${summary.rows_processed}`);
     console.log(`  Rows filtered by date: ${summary.rows_filtered_by_date}`);
     console.log(`  Shipments created: ${summary.shipments_created}`);
+    console.log(`  Invoices created: ${summary.invoices_created}`);
     console.log(`  Audit entries created: ${summary.audit_entries_created}`);
     console.log(`  Errors: ${summary.errors}`);
     console.log('===============================\n');
