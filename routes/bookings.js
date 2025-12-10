@@ -416,8 +416,7 @@ router.post('/:id/review', async (req, res) => {
       receiver_phone: receiver.contactNo || receiver.phoneNumber || receiver.phone || booking.receiver_phone || booking.receiverPhone || '',
       receiver_company: receiver.company || booking.receiver_company || '',
       
-      // Identity documents and customer images
-      identityDocuments: booking.identityDocuments || booking.identity_documents || {},
+      // Customer images (identityDocuments excluded)
       customerImage: booking.customerImage || booking.customer_image || '',
       customerImages: Array.isArray(booking.customerImages) ? booking.customerImages : (booking.customer_images || []),
       
@@ -484,10 +483,16 @@ router.post('/:id/review', async (req, res) => {
       }
     }
 
+    // Prepare invoice request response (exclude identityDocuments)
+    const invoiceRequestObj = invoiceRequest.toObject ? invoiceRequest.toObject() : invoiceRequest;
+    if (invoiceRequestObj.identityDocuments !== undefined) {
+      delete invoiceRequestObj.identityDocuments;
+    }
+
     res.json({
       success: true,
       booking: bookingDoc.toObject ? bookingDoc.toObject() : bookingDoc,
-      invoiceRequest: invoiceRequest.toObject ? invoiceRequest.toObject() : invoiceRequest,
+      invoiceRequest: invoiceRequestObj,
       message: 'Booking reviewed and converted to invoice request successfully. Ready for Operations verification.'
     });
   } catch (error) {

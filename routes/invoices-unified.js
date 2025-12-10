@@ -812,7 +812,17 @@ router.post('/', async (req, res) => {
     taxAmount = Math.round(taxAmount * 100) / 100;
     
     // Calculate total amount
-    const totalAmount = Math.round((baseAmount + taxAmount) * 100) / 100;
+    // For UAE to PH Flowmic/Personal: VAT is included in subtotal, so total = subtotal
+    // For all other invoices: VAT is added on top, so total = subtotal + tax
+    let totalAmount;
+    if (isUaeToPh && isFlowmicOrPersonal && finalTaxRate > 0) {
+      // VAT included in subtotal - total equals subtotal
+      totalAmount = Math.round(baseAmount * 100) / 100;
+      console.log('✅ VAT included in subtotal (UAE to PH Flowmic/Personal) - Total = Subtotal');
+    } else {
+      // VAT added on top - total = subtotal + tax
+      totalAmount = Math.round((baseAmount + taxAmount) * 100) / 100;
+    }
     
     console.log('📊 Invoice Calculation Summary:');
     console.log(`   Shipping Charge (invoice.amount): ${shippingCharge} AED`);
@@ -1486,7 +1496,19 @@ router.put('/:id', async (req, res) => {
       }
       
       taxAmount = Math.round(taxAmount * 100) / 100;
-      const totalAmount = Math.round((baseAmountValue + taxAmount) * 100) / 100;
+      
+      // Calculate total amount
+      // For UAE to PH Flowmic/Personal: VAT is included in subtotal, so total = subtotal
+      // For all other invoices: VAT is added on top, so total = subtotal + tax
+      let totalAmount;
+      if (isUaeToPh && isFlowmicOrPersonal && taxRate > 0) {
+        // VAT included in subtotal - total equals subtotal
+        totalAmount = Math.round(baseAmountValue * 100) / 100;
+        console.log('✅ VAT included in subtotal (UAE to PH Flowmic/Personal) - Total = Subtotal');
+      } else {
+        // VAT added on top - total = subtotal + tax
+        totalAmount = Math.round((baseAmountValue + taxAmount) * 100) / 100;
+      }
       
       updateData.tax_amount = mongoose.Types.Decimal128.fromString(taxAmount.toFixed(2));
       updateData.total_amount = mongoose.Types.Decimal128.fromString(totalAmount.toFixed(2));

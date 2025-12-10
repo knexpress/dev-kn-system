@@ -71,6 +71,11 @@ const normalizeInvoiceRequest = (request) => {
     }
   }
 
+  // Exclude identityDocuments from API responses
+  if (obj.identityDocuments !== undefined) {
+    delete obj.identityDocuments;
+  }
+
   return obj;
 };
 
