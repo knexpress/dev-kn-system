@@ -4,6 +4,7 @@ const { Booking, Employee, InvoiceRequest } = require('../models');
 const { createNotificationsForDepartment } = require('./notifications');
 const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/id-generators');
+const { syncClientFromBooking } = require('../utils/client-sync');
 const auth = require('../middleware/auth');
 
 const router = express.Router();
@@ -11,6 +12,75 @@ const router = express.Router();
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
 const HEAVY_FIELDS_PROJECTION = '-identityDocuments -attachments -documents -files';
+
+// Create new booking
+router.post('/', async (req, res) => {
+  try {
+    const bookingData = req.body;
+    
+    // Create booking
+    const booking = new Booking(bookingData);
+    await booking.save();
+    
+    // Sync client in background (don't wait for it to complete)
+    syncClientFromBooking(booking).catch(err => {
+      console.error('[CLIENT_SYNC] Background client sync failed:', err);
+    });
+    
+    res.status(201).json({
+      success: true,
+      data: booking,
+      message: 'Booking created successfully'
+    });
+  } catch (error) {
+    console.error('Error creating booking:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to create booking',
+      details: error.message
+    });
+  }
+});
+
+// Update booking
+router.put('/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updateData = req.body;
+    
+    // Find and update booking
+    const booking = await Booking.findByIdAndUpdate(
+      id,
+      updateData,
+      { new: true, runValidators: true }
+    );
+    
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        error: 'Booking not found'
+      });
+    }
+    
+    // Sync client in background (don't wait for it to complete)
+    syncClientFromBooking(booking).catch(err => {
+      console.error('[CLIENT_SYNC] Background client sync failed:', err);
+    });
+    
+    res.json({
+      success: true,
+      data: booking,
+      message: 'Booking updated successfully'
+    });
+  } catch (error) {
+    console.error('Error updating booking:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update booking',
+      details: error.message
+    });
+  }
+});
 
 // Get all bookings (paginated, light payload)
 router.get('/', async (req, res) => {

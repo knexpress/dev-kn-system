@@ -227,11 +227,9 @@ router.post('/change-password', auth, async (req, res) => {
       });
     }
 
-    // Hash new password (will be hashed by pre-save hook, but we can also do it explicitly)
-    const hashedPassword = await bcrypt.hash(password, 10);
-
-    // Update user password
-    user.password = hashedPassword;
+    // Set password as plain text - pre-save hook will hash it automatically
+    // This prevents double-hashing issues
+    user.password = password;
     await user.save();
 
     res.json({

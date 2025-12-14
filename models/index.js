@@ -88,6 +88,13 @@ userSchema.pre('save', async function(next) {
   if (!this.isModified('password')) return next();
   
   try {
+    // Check if password is already a bcrypt hash (starts with $2a$, $2b$, or $2y$)
+    // This prevents double-hashing when password is already hashed
+    if (this.password && /^\$2[ayb]\$.{56}$/.test(this.password)) {
+      // Password is already hashed, skip hashing
+      return next();
+    }
+    
     const salt = await bcrypt.genSalt(10);
     this.password = await bcrypt.hash(this.password, salt);
     next();
