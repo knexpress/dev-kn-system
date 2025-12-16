@@ -293,34 +293,42 @@ router.get('/', async (req, res) => {
 router.get('/status/:reviewStatus', async (req, res) => {
   try {
     const { reviewStatus } = req.params;
-    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || DEFAULT_LIMIT, 1), MAX_LIMIT);
-    const skip = (page - 1) * limit;
 
     // Build query based on review status
-    // For "not reviewed", include bookings where review_status is null, undefined, or 'not reviewed'
+    // For "not reviewed", check for absence of reviewed_at AND reviewed_by_employee_id
+    // A booking is "not reviewed" if BOTH fields are missing or null
     let query = {};
     if (reviewStatus === 'not reviewed' || reviewStatus === 'not_reviewed') {
       query = {
-        $or: [
-          { review_status: 'not reviewed' },
-          { review_status: { $exists: false } },
-          { review_status: null },
-          { review_status: '' }
+        $and: [
+          // reviewed_at must be missing or null
+          {
+            $or: [
+              { reviewed_at: { $exists: false } },
+              { reviewed_at: null }
+            ]
+          },
+          // reviewed_by_employee_id must be missing or null
+          {
+            $or: [
+              { reviewed_by_employee_id: { $exists: false } },
+              { reviewed_by_employee_id: null }
+            ]
+          }
         ]
       };
     } else {
+      // For other statuses, check review_status field
       query = { review_status: reviewStatus };
     }
 
     // Use lean() to get plain JavaScript objects with all fields including OTP
+    // Remove pagination limits to return ALL matching bookings
     const bookings = await Booking.find(query)
       .select(HEAVY_FIELDS_PROJECTION)
       .lean()
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit);
-    const total = await Booking.countDocuments(query);
+      .sort({ createdAt: -1 });
+    const total = bookings.length;
     
     // Format bookings to explicitly include OTP information and review_status
     const formattedBookings = bookings.map(booking => {
@@ -354,7 +362,7 @@ router.get('/status/:reviewStatus', async (req, res) => {
       };
     });
     
-    res.json({ success: true, data: formattedBookings, pagination: { page, limit, total } });
+    res.json({ success: true, data: formattedBookings, total });
   } catch (error) {
     console.error('Error fetching bookings by status:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch bookings' });
