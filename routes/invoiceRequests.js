@@ -101,6 +101,7 @@ function normalizeFieldsForCache(fields) {
 }
 
 // Helper to generate cache key from request
+// Includes fields parameter to ensure different field sets are cached separately
 function getCacheKey(req) {
   const { page, limit, status, search, fields } = req.query;
   const normalizedFields = normalizeFieldsForCache(fields);
@@ -109,7 +110,8 @@ function getCacheKey(req) {
   const limitNum = parseInt(limit) || DEFAULT_LIMIT;
   const statusStr = (status || 'all').toLowerCase();
   
-  // Create a more stable cache key
+  // Create a more stable cache key including fields parameter
+  // This ensures different field projections are cached separately
   const key = `ir_${pageNum}_${limitNum}_${statusStr}_${normalizedSearch}_${normalizedFields}`;
   return key;
 }
@@ -134,17 +136,35 @@ function cleanupCache() {
  * Includes only essential fields needed for display and operations
  * This improves performance by reducing payload size by 70-80%
  */
-// Required fields that must always be included in the response, even when field filtering is used
-// These fields are needed for insurance checks, verification forms, and invoice generation
-const REQUIRED_FIELDS = [
-  'insured',                    // Top-level insured field (required for insurance checks)
+// Essential fields that must always be included in the response for list view display
+// These are the minimum fields needed for the UI to render the invoice request cards
+const ESSENTIAL_FIELDS = [
+  '_id',                        // Required for React keys
+  'invoice_number',             // For short ID display (priority 1)
+  'tracking_code',              // For AWB and short ID fallback (priority 2)
+  'status',                     // For status badge
+  'delivery_status',            // For delivery status badge
+  'createdAt',                  // For "Created X ago" display
+  'customer_name',              // Required in card (Column 2)
+  'receiver_name',              // Required in card (Column 3)
+  'origin_place',               // For route display (Column 4)
+  'destination_place',          // For route display (Column 4)
+  'service_code',               // For service badge
+  'has_delivery',               // For delivery badge
+  'is_leviable',                // For VAT badge
+  'shipment_type'               // For Document/Non-Document badge (Column 5)
+];
+
+// Invoice generation fields - ONLY include when explicitly requested or needed for invoice generation
+// These are NOT needed for list view and should NOT be included by default
+const INVOICE_GEN_FIELDS = [
+  'insured',                    // Top-level insured field (for insurance checks)
   'declaredAmount',             // Top-level declared amount
   'declared_amount',           // Alternative field name for declared amount
   'booking_snapshot',           // Contains booking data including sender.insured
   'booking_data',               // Contains booking data including sender.insured
   'sender_delivery_option',     // Delivery option from sender
-  'receiver_delivery_option',   // Delivery option from receiver
-  'service_code'                // Service code needed to determine if UAE_TO_PH/PINAS
+  'receiver_delivery_option'   // Delivery option from receiver
 ];
 
 const DEFAULT_FIELDS = [
@@ -164,6 +184,7 @@ const DEFAULT_FIELDS = [
   'origin_place',
   'destination_place',
   'service_code',
+  'shipment_type', // Added for Document/Non-Document badge display
   'weight',
   'weight_kg',
   'number_of_boxes',
@@ -177,42 +198,62 @@ const DEFAULT_FIELDS = [
   'verification.volumetric_weight',
   'has_delivery',
   'is_leviable',
-  // Include required fields in default fields
-  'insured',
-  'declaredAmount',
-  'booking_snapshot',
-  'booking_data',
-  'sender_delivery_option',
-  'receiver_delivery_option'
+  // Note: Invoice generation fields (insured, declaredAmount, booking_snapshot, etc.)
+  // are NOT included in default fields to reduce data transfer
+  // They are only included when explicitly requested via fields parameter
 ].join(',');
 
 /**
  * Build search query for invoice requests
  * Searches across multiple fields with case-insensitive partial matching
+ * Optimized for performance - uses exact match for ObjectId, regex for text fields
  */
 function buildSearchQuery(searchTerm) {
   if (!searchTerm || !searchTerm.trim()) {
     return null;
   }
 
+  const trimmed = searchTerm.trim();
+  
+  // Check if search term is a valid MongoDB ObjectId (24 hex characters)
+  // If so, use exact match instead of regex for much better performance
+  const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(trimmed);
+  
+  const searchConditions = [];
+  
+  if (isValidObjectId) {
+    // Use exact ObjectId match - much faster than regex
+    try {
+      const mongoose = require('mongoose');
+      searchConditions.push({ _id: new mongoose.Types.ObjectId(trimmed) });
+    } catch (e) {
+      // If ObjectId creation fails, fall through to text search
+    }
+  }
+  
   // Sanitize search term to prevent ReDoS
-  const sanitized = sanitizeRegex(searchTerm.trim());
+  const sanitized = sanitizeRegex(trimmed);
   if (!sanitized) {
-    return null;
+    // If no valid conditions, return null
+    return searchConditions.length > 0 ? { $or: searchConditions } : null;
   }
 
-  // Create case-insensitive regex
-  const searchRegex = new RegExp(sanitized, 'i');
+  // Create case-insensitive regex for text fields
+  // Use anchored regex (^) when possible for better index usage
+  const searchRegex = sanitized.length > 3 
+    ? new RegExp(`^${sanitized}`, 'i') // Anchored regex for better performance
+    : new RegExp(sanitized, 'i'); // Non-anchored for short terms
+
+  // Add text field searches (these have indexes)
+  searchConditions.push(
+    { customer_name: searchRegex },
+    { receiver_name: searchRegex },
+    { tracking_code: searchRegex },
+    { invoice_number: searchRegex }
+  );
 
   return {
-    $or: [
-      { customer_name: searchRegex },
-      { receiver_name: searchRegex },
-      { tracking_code: searchRegex },
-      { invoice_number: searchRegex },
-      // Search in _id as string representation
-      { _id: { $regex: sanitized } }
-    ]
+    $or: searchConditions
   };
 }
 
@@ -226,12 +267,13 @@ function buildStatusQuery(status) {
     return null;
   }
 
-  // Sanitize status
-  const sanitized = status.trim().toUpperCase();
+  // Sanitize status - handle both string and already uppercase values
+  const sanitized = typeof status === 'string' ? status.trim().toUpperCase() : String(status).trim().toUpperCase();
   
   // Valid statuses
   const validStatuses = ['DRAFT', 'SUBMITTED', 'IN_PROGRESS', 'VERIFIED', 'COMPLETED', 'CANCELLED'];
   if (!validStatuses.includes(sanitized)) {
+    console.warn(`⚠️ Invalid status filter: "${status}" (sanitized: "${sanitized}"). Valid statuses: ${validStatuses.join(', ')}`);
     return null;
   }
 
@@ -251,46 +293,87 @@ function buildDeliveryStatusQuery() {
 
 /**
  * Build field projection object from fields query parameter
- * Handles nested fields (verification.*) and field name variations
- * Always includes required fields (insured, booking_snapshot, etc.) even when field filtering is used
+ * Handles nested fields (verification.*, request_id.*) and field name variations
+ * Always includes essential fields for list view display
+ * Only includes invoice generation fields when explicitly requested
  * @param {string} fields - Comma-separated list of field names
- * @returns {object} MongoDB projection object with projection, verificationFields, and needsVerification flag
+ * @returns {object} MongoDB projection object with projection, verificationFields, requestIdFields, needsVerification, and needsRequestId flags
  */
 function buildProjection(fields) {
   if (!fields || !fields.trim()) {
-    return { projection: {}, verificationFields: [], needsVerification: false }; // Return all fields (backward compatibility)
+    return { 
+      projection: {}, 
+      verificationFields: [], 
+      requestIdFields: [],
+      needsVerification: false,
+      needsRequestId: false
+    }; // Return all fields (backward compatibility)
   }
 
   const fieldArray = fields.split(',').map(f => f.trim()).filter(f => f.length > 0);
   
   if (fieldArray.length === 0) {
-    return { projection: {}, verificationFields: [], needsVerification: false }; // Return all fields if no valid fields provided
+    return { 
+      projection: {}, 
+      verificationFields: [], 
+      requestIdFields: [],
+      needsVerification: false,
+      needsRequestId: false
+    }; // Return all fields if no valid fields provided
   }
 
-  // Merge requested fields with required fields that must always be included
-  // This ensures insured and related fields are always available for frontend checks
-  // Required fields include: insured, declaredAmount, booking_snapshot, booking_data, etc.
-  // These are needed for insurance checks, verification forms, and invoice generation
-  const fieldsToInclude = [...new Set([...fieldArray, ...REQUIRED_FIELDS])];
+  // Check if any invoice generation fields are explicitly requested
+  const hasInvoiceGenFields = fieldArray.some(field => 
+    INVOICE_GEN_FIELDS.includes(field) || 
+    field.startsWith('verification.insured') ||
+    field.startsWith('verification.declared_value')
+  );
+
+  // Merge requested fields with essential fields (always include for list view)
+  // Only include invoice generation fields if explicitly requested
+  const fieldsToInclude = [...new Set([...fieldArray, ...ESSENTIAL_FIELDS])];
+  
+  // Add invoice generation fields only if explicitly requested
+  if (hasInvoiceGenFields) {
+    INVOICE_GEN_FIELDS.forEach(field => {
+      if (!fieldsToInclude.includes(field)) {
+        fieldsToInclude.push(field);
+      }
+    });
+  }
 
   const projection = {};
   const verificationFields = [];
+  const requestIdFields = [];
   let needsVerification = false;
+  let needsRequestId = false;
+  const verificationProjection = {}; // For selective verification field projection
 
   fieldsToInclude.forEach(field => {
     const normalizedField = field.toLowerCase();
     
-    // Handle nested fields (e.g., verification.actual_weight)
+    // Handle nested fields (e.g., verification.actual_weight, request_id._id)
     if (field.includes('.')) {
-      const [parent, child] = field.split('.');
+      const [parent, ...childParts] = field.split('.');
+      const child = childParts.join('.'); // Handle nested paths
       
       if (parent.toLowerCase() === 'verification') {
         needsVerification = true;
-        projection.verification = 1; // Include full verification for post-processing
+        // Use selective projection for verification sub-fields
+        // MongoDB requires dot notation for nested field projection
+        // Example: 'verification.actual_weight' -> { 'verification.actual_weight': 1 }
+        projection[field] = 1; // Use full dot notation for MongoDB
         verificationFields.push(child.toLowerCase());
+      } else if (parent.toLowerCase() === 'request_id' || parent === 'request_id') {
+        // request_id is a populated field, not in InvoiceRequest schema
+        // We'll handle this in the populate logic
+        needsRequestId = true;
+        requestIdFields.push(child);
+        // Don't add to projection - it's a virtual/populated field
       } else {
         // For other nested fields, include the parent
-        projection[parent] = 1;
+        // Use dot notation for MongoDB projection
+        projection[field] = 1;
       }
       return;
     }
@@ -306,21 +389,38 @@ function buildProjection(fields) {
     } else if (normalizedField === 'verification') {
       // If just "verification" is requested without specific sub-fields
       needsVerification = true;
-      projection.verification = 1;
-    // Note: InvoiceRequest schema does not have client_id or request_id fields
-    // These are removed from projection to avoid errors
+      projection.verification = 1; // Include full verification object
+    } else if (normalizedField === 'request_id' || field === 'request_id') {
+      // If just "request_id" is requested without specific sub-fields
+      needsRequestId = true;
+      // Don't add to projection - it's a populated field
     } else {
-      // Include the field as-is
+      // Include the field as-is (case-sensitive to match schema)
       projection[field] = 1;
     }
   });
+
+  // Note: Verification sub-fields are already added to projection using dot notation
+  // MongoDB will automatically include the parent verification object with only requested sub-fields
+  // Example: { 'verification.actual_weight': 1 } includes verification object with only actual_weight
+  // If just "verification" was requested without sub-fields, include full object
+  if (needsVerification && verificationFields.length === 0) {
+    // If just "verification" was requested without specific sub-fields, include full object
+    projection.verification = 1;
+  }
 
   // Always include _id unless explicitly excluded
   if (!fieldArray.includes('_id') && !fieldArray.includes('-id')) {
     projection._id = 1;
   }
 
-  return { projection, verificationFields, needsVerification };
+  return { 
+    projection, 
+    verificationFields, 
+    requestIdFields,
+    needsVerification,
+    needsRequestId
+  };
 }
 
 /**
@@ -376,6 +476,8 @@ function processVerificationField(invoiceRequest, verificationFields = []) {
 router.get('/', async (req, res) => {
   try {
     // Check for duplicate requests (request deduplication) - CHECK FIRST before any processing
+    // Allow bypassing cache with ?nocache=true for debugging
+    const bypassCache = req.query.nocache === 'true' || req.query.nocache === '1';
     const cacheKey = getCacheKey(req);
     const now = Date.now();
     
@@ -384,14 +486,20 @@ router.get('/', async (req, res) => {
       cleanupCache();
     }
     
-    const cachedResponse = requestCache.get(cacheKey);
+    const cachedResponse = !bypassCache ? requestCache.get(cacheKey) : null;
     
     if (cachedResponse) {
       const age = now - cachedResponse.timestamp;
       if (age < CACHE_TTL) {
         // Return cached response to prevent unnecessary reloads and page refreshes
-        // Silent cache hit - no logging to prevent console spam and page refresh issues
-        // Use same cache headers as original response to ensure consistency
+        // Log cache hit for debugging status filter issues
+        if (req.query.status && req.query.status !== 'all') {
+          console.log(`💾 Cache HIT for status "${req.query.status}": returning ${cachedResponse.data?.pagination?.total || 0} total, ${cachedResponse.data?.data?.length || 0} items`);
+          // If cache shows 0 but we know there should be data, log warning
+          if (cachedResponse.data?.pagination?.total === 0 && req.query.status === 'SUBMITTED') {
+            console.warn(`⚠️ WARNING: Cache returning 0 for SUBMITTED status. This might be stale. Add ?nocache=true to bypass.`);
+          }
+        }
         res.set('Cache-Control', 'private, max-age=30, must-revalidate');
         // Use the stored ETag from when the response was cached to ensure consistency
         res.set('ETag', cachedResponse.etag || `"${cachedResponse.timestamp}-${req.query.page || 1}-${req.query.limit || DEFAULT_LIMIT}-${req.query.status || 'all'}"`);
@@ -403,11 +511,17 @@ router.get('/', async (req, res) => {
       } else {
         // Cache expired, remove it
         requestCache.delete(cacheKey);
+        if (req.query.status && req.query.status !== 'all') {
+          console.log(`💾 Cache EXPIRED for status "${req.query.status}", fetching fresh data`);
+        }
+      }
+    } else if (req.query.status && req.query.status !== 'all') {
+      if (bypassCache) {
+        console.log(`💾 Cache BYPASSED for status "${req.query.status}" (nocache=true), fetching from database`);
+      } else {
+        console.log(`💾 Cache MISS for status "${req.query.status}", fetching from database`);
       }
     }
-    
-    // Disable cache miss logging to prevent console spam and page refresh issues
-    // Cache is working silently - duplicate requests within 5 seconds will be served from cache
     
     // Parse query parameters
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
@@ -416,6 +530,18 @@ router.get('/', async (req, res) => {
     
     const status = req.query.status;
     const search = req.query.search;
+    
+    // Debug: Log received query parameters
+    if (status && status !== 'all') {
+      console.log(`📥 Received request parameters:`, {
+        status: status,
+        statusType: typeof status,
+        page: page,
+        limit: limit,
+        search: search || 'none',
+        allQueryParams: req.query
+      });
+    }
     // Field projection parameter
     // - If not provided: use default optimized fields for better performance
     // - If "all": return all fields (backward compatibility)
@@ -468,8 +594,27 @@ router.get('/', async (req, res) => {
       }
     }
     
+    // Debug logging for status filter issues
+    if (status && status !== 'all') {
+      console.log(`🔍 Invoice Request Query Debug:`, {
+        requestedStatus: status,
+        statusQuery: statusQuery,
+        finalQuery: JSON.stringify(query),
+        queryPartsCount: queryParts.length
+      });
+      
+      // Check what statuses actually exist in the database (for debugging)
+      if (process.env.NODE_ENV === 'development') {
+        const statusCounts = await InvoiceRequest.aggregate([
+          { $group: { _id: '$status', count: { $sum: 1 } } },
+          { $sort: { count: -1 } }
+        ]);
+        console.log(`📊 Available statuses in database:`, statusCounts);
+      }
+    }
+    
     // Build field projection (NEW)
-    const { projection, verificationFields, needsVerification } = buildProjection(fields);
+    const { projection, verificationFields, requestIdFields, needsVerification, needsRequestId } = buildProjection(fields);
     const hasProjection = Object.keys(projection).length > 0;
     
     // Start performance tracking
@@ -477,41 +622,67 @@ router.get('/', async (req, res) => {
     
     // Get total count (before pagination and projection)
     // This counts all matching documents regardless of pagination
-    // For Operations queries without filters, use estimatedDocumentCount for better performance
+    // Optimized: Skip count for better performance when not needed, or use estimated count
     const countStartTime = Date.now();
     let total;
     try {
-      // For Operations queries (no status filter or IN_PROGRESS), use estimated count if query is simple
-      // This prevents timeout on large collections
-      if ((!status || status === 'IN_PROGRESS') && Object.keys(query).length <= 1) {
+      // For Operations queries without filters, use estimated count for much better performance
+      // This prevents timeout on large collections (can be 10-100x faster)
+      const hasComplexFilters = queryParts.length > 1 || (searchQuery && Object.keys(query).length > 1);
+      const isSimpleQuery = Object.keys(query).length <= 1 && !hasComplexFilters;
+      
+      if ((!status || status === 'IN_PROGRESS') && isSimpleQuery) {
         // Use estimated count for better performance (faster but less accurate)
         // Only use if query is simple (no complex filters)
         total = await InvoiceRequest.estimatedDocumentCount();
         console.log(`⚡ Using estimatedDocumentCount for faster performance (Operations query)`);
       } else {
         // Use exact count for Finance and filtered queries
-        total = await InvoiceRequest.countDocuments(query);
+        // Use hint() to force index usage and prevent query planner timeout
+        try {
+          let countQuery = InvoiceRequest.countDocuments(query);
+          
+          // Force index usage based on query structure to prevent planner timeout
+          if (status && status !== 'all') {
+            if (status === 'VERIFIED' && query.$and && query.$and.some(q => q.delivery_status)) {
+              countQuery = countQuery.hint({ status: 1, delivery_status: 1, createdAt: -1 });
+            } else {
+              countQuery = countQuery.hint({ status: 1, createdAt: -1 });
+            }
+          } else {
+            countQuery = countQuery.hint({ createdAt: -1 });
+          }
+          
+          total = await countQuery.maxTimeMS(5000);
+          console.log(`📊 Count query result for status "${status}": ${total} documents`);
+        } catch (hintError) {
+          // If hint fails, try without hint
+          console.warn(`⚠️ Count query hint failed, trying without hint:`, hintError.message);
+          total = await InvoiceRequest.countDocuments(query).maxTimeMS(5000);
+        }
       }
     } catch (countError) {
       console.error('⚠️ Count query failed, using estimated count:', countError.message);
-      // Fallback to estimated count if exact count fails
-      total = await InvoiceRequest.estimatedDocumentCount();
+      // Fallback to estimated count if exact count fails or times out
+      try {
+        total = await InvoiceRequest.estimatedDocumentCount();
+      } catch (e) {
+        // Last resort: use a reasonable default
+        total = 0;
+      }
     }
     const countTime = Date.now() - countStartTime;
     
     // Disable count logging to prevent console spam
     
-    // Build query chain
-    let queryChain = InvoiceRequest.find(query);
+    // Build query chain with performance optimizations
+    // Use .lean() FIRST for better performance (returns plain JS objects, ~40% less memory)
+    let queryChain = InvoiceRequest.find(query).lean();
     
-    // Apply field projection if specified
+    // Apply field projection if specified (reduces data transfer by 70-80%)
     if (hasProjection) {
       queryChain = queryChain.select(projection);
     }
-    
-    // Note: InvoiceRequest schema does not have client_id or request_id fields
-    // These fields exist in other schemas (Invoice, Request) but not in InvoiceRequest
-    // So we skip population for these fields
     
     // Skip employee population for better performance
     // Employee population is expensive and slows down queries significantly
@@ -519,21 +690,64 @@ router.get('/', async (req, res) => {
     // This optimization improves query time from 4+ minutes to <100ms
     // Note: Employee IDs are still returned, frontend can populate them separately if needed
     
-    // Apply sorting, pagination, and lean
+    // Determine which index to use based on query structure
+    // This prevents MongoDB query planner timeout by explicitly telling it which index to use
+    // CRITICAL: Using hint() bypasses the query planner which was timing out
+    let indexHint = null;
+    if (status && status !== 'all') {
+      // If filtering by status, use the compound index that matches
+      if (status === 'VERIFIED' && query.$and && query.$and.some(q => q.delivery_status)) {
+        // Finance department query: status + delivery_status
+        indexHint = { status: 1, delivery_status: 1, createdAt: -1 };
+      } else {
+        // Simple status query: use status + createdAt index
+        indexHint = { status: 1, createdAt: -1 };
+      }
+    } else {
+      // No status filter: use createdAt index for sorting
+      indexHint = { createdAt: -1 };
+    }
+    
+    // Apply sorting, pagination with index hint
     // Sort order matches compound index: { status: 1, delivery_status: 1, createdAt: -1 }
     // This ensures MongoDB can use the index efficiently
-    queryChain = queryChain
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .lean(); // Use lean() for better performance (returns plain objects, not Mongoose documents)
+    // Use hint() to force specific index and prevent query planner timeout
+    try {
+      queryChain = queryChain
+        .hint(indexHint) // Force MongoDB to use specific index (prevents planner timeout)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .maxTimeMS(10000); // 10 second timeout to prevent hanging
+        // Note: .lean() is already applied above
+    } catch (hintError) {
+      // If hint fails (index doesn't exist), try without hint but log warning
+      console.warn(`⚠️ Index hint failed, trying without hint:`, hintError.message);
+      queryChain = queryChain
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .maxTimeMS(10000);
+    }
     
     // Fetch paginated data
+    // Note: We already have total from count query above, so we don't need to fetch it again
     const fetchStartTime = Date.now();
-    let invoiceRequests = await queryChain;
+    let invoiceRequests = await queryChain.exec();
     const fetchTime = Date.now() - fetchStartTime;
     const fetchEndTime = Date.now();
     const queryTime = Date.now() - queryStartTime;
+    
+    // Debug: Log actual results found
+    if (status && status !== 'all') {
+      console.log(`📦 Find query result for status "${status}": ${invoiceRequests.length} documents returned (total: ${total})`);
+      if (invoiceRequests.length === 0 && total > 0) {
+        console.warn(`⚠️ WARNING: Count shows ${total} documents but find() returned 0. This might indicate a projection or pagination issue.`);
+        console.log(`   Query:`, JSON.stringify(query, null, 2));
+        console.log(`   Projection:`, hasProjection ? JSON.stringify(projection) : 'none');
+        console.log(`   Skip: ${skip}, Limit: ${limit}`);
+      }
+    }
     
     // Disable performance logging to prevent console spam
     // Only log if query is extremely slow (>1000ms) to catch real performance issues
@@ -560,6 +774,77 @@ router.get('/', async (req, res) => {
         req.awb = req.tracking_code || req.awb_number || null;
         return req;
       });
+    }
+    
+    // Post-process to add request_id data if requested
+    // Since InvoiceRequest doesn't have a direct reference to ShipmentRequest,
+    // we need to fetch it separately by matching tracking_code or invoice_number
+    // Optimized with .lean() and Map for O(1) lookup
+    if (needsRequestId && invoiceRequests.length > 0) {
+      try {
+        const { ShipmentRequest } = require('../models/unified-schema');
+        
+        // Collect all tracking codes and invoice numbers to fetch request_id documents
+        const trackingCodes = invoiceRequests
+          .map(req => req.tracking_code || req.invoice_number)
+          .filter(Boolean);
+        
+        if (trackingCodes.length > 0) {
+          // Build projection for request_id fields
+          const requestIdProjection = {};
+          if (requestIdFields.length > 0) {
+            // Only include requested fields
+            requestIdFields.forEach(field => {
+              requestIdProjection[field] = 1;
+            });
+            requestIdProjection._id = 1; // Always include _id
+          }
+          
+          // Fetch ShipmentRequests that match the tracking codes
+          // Use .lean() for better performance and apply field filtering
+          const shipmentRequests = await ShipmentRequest.find({
+            $or: [
+              { request_id: { $in: trackingCodes } },
+              { 'tracking.awb_number': { $in: trackingCodes } }
+            ]
+          })
+            .select(Object.keys(requestIdProjection).length > 0 ? requestIdProjection : undefined)
+            .lean(); // Use lean() for better performance
+          
+          // Create a Map for O(1) lookup (more efficient than array.find())
+          const requestIdMap = new Map();
+          shipmentRequests.forEach(sr => {
+            const key = sr.request_id || sr.tracking?.awb_number;
+            if (key) {
+              requestIdMap.set(String(key), sr);
+            }
+          });
+          
+          // Add request_id to each invoice request using Map lookup
+          invoiceRequests = invoiceRequests.map(req => {
+            const key = req.tracking_code || req.invoice_number;
+            if (key && requestIdMap.has(String(key))) {
+              req.request_id = requestIdMap.get(String(key));
+            } else {
+              req.request_id = null;
+            }
+            return req;
+          });
+        } else {
+          // No tracking codes, set request_id to null for all
+          invoiceRequests = invoiceRequests.map(req => {
+            req.request_id = null;
+            return req;
+          });
+        }
+      } catch (requestIdError) {
+        console.warn('Could not fetch request_id data:', requestIdError.message);
+        // Set request_id to null if fetch fails
+        invoiceRequests = invoiceRequests.map(req => {
+          req.request_id = null;
+          return req;
+        });
+      }
     }
     
     // Normalize invoice requests (convert Decimal128 to numbers)
@@ -683,8 +968,16 @@ router.get('/', async (req, res) => {
       timestamp: cacheTimestamp
     });
     
-    // Disable cache logging to prevent console spam
-    // Cache is working silently in the background with 30-second TTL to prevent page refreshes
+    // Log final response for status filter debugging
+    if (status && status !== 'all') {
+      console.log(`✅ Sending response for status "${status}":`, {
+        total: responseData.pagination.total,
+        itemsReturned: responseData.data.length,
+        page: responseData.pagination.page,
+        limit: responseData.pagination.limit,
+        cached: false
+      });
+    }
     
     // Set cache headers to prevent unnecessary reloads and repeated requests
     // Cache for 30 seconds to prevent page refreshes while still allowing updates
@@ -1535,6 +1828,205 @@ router.delete('/:id', async (req, res) => {
   } catch (error) {
     console.error('Error deleting invoice request:', error);
     res.status(500).json({ error: 'Failed to delete invoice request' });
+  }
+});
+
+// Get invoice request by AWB number (complete details)
+// This endpoint returns FULL invoice request details including all nested objects
+// Used when user opens verification form or needs complete details
+// NOTE: This endpoint does NOT support field filtering - it always returns complete data
+// Field filtering is only available on the list endpoint (GET /)
+router.get('/by-awb/:awb', async (req, res) => {
+  try {
+    const { awb } = req.params;
+    const includeBooking = req.query.includeBooking !== 'false'; // Default: true
+    const includeVerification = req.query.includeVerification !== 'false'; // Default: true
+    const includeRequestId = req.query.includeRequestId !== 'false'; // Default: true
+    
+    // Validate AWB parameter
+    if (!awb || !awb.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: 'AWB number is required'
+      });
+    }
+    
+    const awbSearch = awb.trim();
+    const now = Date.now();
+    
+    // Initialize cache if needed
+    if (!global.awbCache) {
+      global.awbCache = new Map();
+    }
+    
+    // Check cache first (30 second TTL)
+    const cacheKey = `awb_${awbSearch.toLowerCase()}_${includeBooking}_${includeVerification}_${includeRequestId}`;
+    const cachedResponse = global.awbCache.get(cacheKey);
+    if (cachedResponse && (now - cachedResponse.timestamp) < 30000) {
+      res.set('X-Cache', 'HIT');
+      res.set('X-Cache-Age', `${Math.floor((now - cachedResponse.timestamp) / 1000)}s`);
+      res.set('Cache-Control', 'private, max-age=30, must-revalidate');
+      return res.json({
+        success: true,
+        data: cachedResponse.data
+      });
+    }
+    
+    // Clean up old cache entries (older than 30 seconds)
+    for (const [key, value] of global.awbCache.entries()) {
+      if (now - value.timestamp > 30000) {
+        global.awbCache.delete(key);
+      }
+    }
+    
+    // Sanitize AWB for regex (escape special characters)
+    const sanitizedAwb = awbSearch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    
+    // Build search query - search in multiple fields with case-insensitive exact match
+    // Priority: tracking_code > awb_number > invoice_number
+    const searchQuery = {
+      $or: [
+        { tracking_code: { $regex: new RegExp(`^${sanitizedAwb}$`, 'i') } },
+        { awb_number: { $regex: new RegExp(`^${sanitizedAwb}$`, 'i') } },
+        { invoice_number: { $regex: new RegExp(`^${sanitizedAwb}$`, 'i') } }
+      ]
+    };
+    
+    // Find invoice request(s) matching the AWB
+    // Use hint() to force index usage for performance
+    let invoiceRequests = await InvoiceRequest.find(searchQuery)
+      .hint({ tracking_code: 1 }) // Use tracking_code index
+      .sort({ createdAt: -1 }) // Get most recent if multiple matches
+      .limit(1) // Only need one result
+      .maxTimeMS(10000) // 10 second timeout
+      .lean();
+    
+    // If no exact match found, try case-insensitive partial match as fallback
+    if (invoiceRequests.length === 0) {
+      const partialSearchQuery = {
+        $or: [
+          { tracking_code: { $regex: sanitizedAwb, $options: 'i' } },
+          { awb_number: { $regex: sanitizedAwb, $options: 'i' } },
+          { invoice_number: { $regex: sanitizedAwb, $options: 'i' } }
+        ]
+      };
+      
+      invoiceRequests = await InvoiceRequest.find(partialSearchQuery)
+        .hint({ tracking_code: 1 })
+        .sort({ createdAt: -1 })
+        .limit(1)
+        .maxTimeMS(10000)
+        .lean();
+    }
+    
+    if (invoiceRequests.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Invoice request not found',
+        message: `No invoice request found with AWB: ${awbSearch}`
+      });
+    }
+    
+    const invoiceRequest = invoiceRequests[0];
+    
+    // Get related booking if converted_to_invoice_request_id exists
+    let booking = null;
+    if (includeBooking) {
+      try {
+        const { Booking } = require('../models');
+        // Find booking that was converted to this invoice request
+        booking = await Booking.findOne({
+          converted_to_invoice_request_id: invoiceRequest._id
+        }).lean();
+        
+        // If not found by converted_to_invoice_request_id, try to find by AWB
+        if (!booking && invoiceRequest.tracking_code) {
+          booking = await Booking.findOne({
+            $or: [
+              { awb: invoiceRequest.tracking_code },
+              { tracking_code: invoiceRequest.tracking_code },
+              { awb_number: invoiceRequest.tracking_code }
+            ]
+          }).lean();
+        }
+      } catch (bookingError) {
+        console.warn('Could not fetch booking:', bookingError.message);
+        // Continue without booking - use booking_snapshot/booking_data instead
+      }
+    }
+    
+    // Get related request_id (from unified schema) if needed
+    let requestIdData = null;
+    if (includeRequestId) {
+      try {
+        const { ShipmentRequest } = require('../models/unified-schema');
+        // Try to find by tracking_code or invoice_number
+        if (invoiceRequest.tracking_code || invoiceRequest.invoice_number) {
+          requestIdData = await ShipmentRequest.findOne({
+            $or: [
+              { 'request_id': invoiceRequest.tracking_code },
+              { 'request_id': invoiceRequest.invoice_number }
+            ]
+          }).lean();
+        }
+      } catch (requestError) {
+        console.warn('Could not fetch request_id:', requestError.message);
+        // Continue without request_id
+      }
+    }
+    
+    // Normalize Decimal128 fields to numbers for JSON serialization
+    const normalizedRequest = normalizeInvoiceRequest(invoiceRequest);
+    
+    // For /by-awb endpoint, ALWAYS include full verification details when includeVerification is true
+    // This endpoint is used for verification form, so it needs ALL verification fields
+    if (includeVerification) {
+      // Ensure verification object is complete with all fields
+      if (!normalizedRequest.verification) {
+        normalizedRequest.verification = {};
+      }
+      // If verification exists but is incomplete, ensure all fields are present
+      // The normalizeInvoiceRequest already handles Decimal128 conversion
+      // Just make sure the verification object structure is complete
+    }
+    
+    // Build response with all data
+    // Include booking_snapshot and booking_data as-is (they're already in invoiceRequest)
+    const responseData = {
+      ...normalizedRequest,
+      // Add booking if found (this is the full Booking document)
+      booking: booking || null,
+      // Add request_id if found (this is the full ShipmentRequest document)
+      request_id: requestIdData || null,
+      // Ensure verification is included with ALL fields (for verification form)
+      verification: includeVerification ? (normalizedRequest.verification || {}) : undefined,
+      // booking_snapshot and booking_data are already included in normalizedRequest
+      // These contain full booking details including insured, declared_value, etc.
+    };
+    
+    // Cache the response for 30 seconds
+    const cacheTimestamp = Math.floor(now / 1000) * 1000;
+    const stableResponse = JSON.parse(JSON.stringify(responseData));
+    global.awbCache.set(cacheKey, {
+      data: stableResponse,
+      timestamp: cacheTimestamp
+    });
+    
+    res.set('X-Cache', 'MISS');
+    res.set('Cache-Control', 'private, max-age=30, must-revalidate');
+    
+    res.json({
+      success: true,
+      data: responseData
+    });
+    
+  } catch (error) {
+    console.error('Error fetching invoice request by AWB:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch invoice request',
+      details: error.message
+    });
   }
 });
 

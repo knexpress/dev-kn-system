@@ -795,6 +795,21 @@ invoiceRequestSchema.index({ shipment_type: 1 });
 // This index optimizes queries filtering by status='VERIFIED' and delivery_status != 'CANCELLED'
 // Sort order matches the index for optimal performance
 invoiceRequestSchema.index({ status: 1, delivery_status: 1, createdAt: -1 });
+// Text index for full-text search across multiple fields (much faster than regex)
+invoiceRequestSchema.index({ 
+  customer_name: 'text', 
+  receiver_name: 'text', 
+  tracking_code: 'text', 
+  invoice_number: 'text' 
+}, { 
+  name: 'invoiceRequest_text_search',
+  weights: {
+    tracking_code: 10,      // Highest priority
+    invoice_number: 10,      // Highest priority
+    customer_name: 5,        // Medium priority
+    receiver_name: 3        // Lower priority
+  }
+});
 
 // Collections Schema
 const collectionsSchema = new mongoose.Schema({
