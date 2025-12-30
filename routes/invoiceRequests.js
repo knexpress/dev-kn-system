@@ -1549,7 +1549,7 @@ router.put('/:id/verification', async (req, res) => {
           success: false,
           error: 'chargeable_weight must be a positive number greater than 0'
         });
-    }
+      }
     } else {
       // Auto-calculate: chargeable_weight = max(actual_weight, volumetric_weight)
       chargeableWeight = Math.max(actualWeight, volumetricWeight);
@@ -1566,9 +1566,7 @@ router.put('/:id/verification', async (req, res) => {
       invoiceRequest.verification.total_vm = invoiceRequest.verification.volumetric_weight;
     }
 
-    if (verificationData.rate_bracket !== undefined) {
-      invoiceRequest.verification.rate_bracket = verificationData.rate_bracket;
-    }
+    // Note: rate_bracket is now handled after total_kg is set (see below)
     if (verificationData.calculated_rate !== undefined && verificationData.calculated_rate !== null && verificationData.calculated_rate !== '') {
       invoiceRequest.verification.calculated_rate = toDecimal128(verificationData.calculated_rate);
     }
@@ -1597,22 +1595,59 @@ router.put('/:id/verification', async (req, res) => {
       invoiceRequest.verification.number_of_boxes = 1;
     }
 
-    // Validate and handle total_kg (required - manual input for Finance invoice generation)
-    if (verificationData.total_kg === undefined || verificationData.total_kg === null || verificationData.total_kg === '') {
-      return res.status(400).json({
-        success: false,
-        error: 'total_kg is required'
-      });
-    }
-    const totalKg = parseFloat(verificationData.total_kg);
-    if (isNaN(totalKg) || totalKg < 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'total_kg must be a positive number'
-      });
+    // Auto-set total_kg = chargeable_weight (for Finance invoice generation)
+    // If total_kg is manually provided, use that value (allows override)
+    let totalKg;
+    if (verificationData.total_kg !== undefined && verificationData.total_kg !== null && verificationData.total_kg !== '') {
+      // Manual override: use provided total_kg
+      totalKg = parseFloat(verificationData.total_kg);
+      if (isNaN(totalKg) || totalKg < 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'total_kg must be a positive number'
+        });
+      }
+      console.log(`✅ Using manually provided total_kg: ${totalKg} kg`);
+    } else {
+      // Auto-set: total_kg = chargeable_weight
+      totalKg = chargeableWeight;
+      console.log(`✅ Auto-set total_kg = chargeable_weight: ${totalKg} kg (for Finance invoice generation)`);
     }
     invoiceRequest.verification.total_kg = toDecimal128(totalKg);
-    console.log(`✅ Stored total_kg: ${totalKg} kg (for Finance invoice generation)`);
+
+    // Auto-determine rate_bracket based on total_kg (for PH_TO_UAE service)
+    // Rate bracket is determined by weight ranges
+    if (isPhToUae) {
+      let calculatedRateBracket = null;
+      
+      // Determine rate bracket based on total_kg weight ranges
+      // Common PH_TO_UAE rate brackets (adjust ranges as needed):
+      if (totalKg <= 5) {
+        calculatedRateBracket = '0-5';
+      } else if (totalKg <= 10) {
+        calculatedRateBracket = '5-10';
+      } else if (totalKg <= 20) {
+        calculatedRateBracket = '10-20';
+      } else if (totalKg <= 30) {
+        calculatedRateBracket = '20-30';
+      } else if (totalKg <= 50) {
+        calculatedRateBracket = '30-50';
+      } else {
+        calculatedRateBracket = '50+';
+      }
+      
+      // Use provided rate_bracket if available (manual override), otherwise use calculated
+      if (verificationData.rate_bracket !== undefined && verificationData.rate_bracket !== null && verificationData.rate_bracket !== '') {
+        invoiceRequest.verification.rate_bracket = verificationData.rate_bracket;
+        console.log(`✅ Using manually provided rate_bracket: ${verificationData.rate_bracket}`);
+      } else {
+        invoiceRequest.verification.rate_bracket = calculatedRateBracket;
+        console.log(`✅ Auto-determined rate_bracket based on total_kg (${totalKg} kg): ${calculatedRateBracket}`);
+      }
+    } else if (verificationData.rate_bracket !== undefined) {
+      // For other services, use provided rate_bracket if available
+      invoiceRequest.verification.rate_bracket = verificationData.rate_bracket;
+    }
 
     // Update service_code from verification data if provided (this is the source of truth)
     if (verificationData.service_code !== undefined && verificationData.service_code !== null && verificationData.service_code !== '') {
@@ -2032,7 +2067,15 @@ router.get('/by-awb/:awb', async (req, res) => {
 
 // Get invoice request details by ID (complete details for invoice generation dialog)
 // This endpoint returns FULL invoice request details including all nested information
-// Used when Finance user clicks "View" button in invoice generation dialog
+// Used when Finance user clicks "Generate Invoice" button
+// 
+// REQUIRED FIELDS FOR PH_TO_UAE:
+// - verification.total_kg (auto-set from chargeable_weight, required for invoice generation)
+// - verification.number_of_boxes (required for delivery calculation)
+// - verification.service_code (required for service detection)
+// - All other verification fields
+// - Nested data: request_id, booking, shipment, etc.
+//
 // Returns ALL verification data, booking data, and request_id data
 router.get('/:id/details', async (req, res) => {
   try {
@@ -2182,11 +2225,13 @@ router.get('/:id/details', async (req, res) => {
       tracking_code: normalizedRequest.tracking_code,
       awb_number: normalizedRequest.awb_number || normalizedRequest.tracking_code,
       weight: normalizedRequest.weight || normalizedRequest.weight_kg || normalizedRequest.verification?.chargeable_weight || null,
-      number_of_boxes: normalizedRequest.number_of_boxes || 
-                       normalizedRequest.verification?.number_of_boxes || 
-                       (requestIdData?.shipment?.number_of_boxes) || 
-                       (requestIdData?.verification?.number_of_boxes) || 
-                       1,
+      // Number of boxes (required for PH_TO_UAE delivery calculation)
+      number_of_boxes: normalizedRequest.verification?.number_of_boxes !== undefined && normalizedRequest.verification?.number_of_boxes !== null
+                       ? normalizedRequest.verification.number_of_boxes
+                       : (normalizedRequest.number_of_boxes || 
+                          (requestIdData?.shipment?.number_of_boxes) || 
+                          (requestIdData?.verification?.number_of_boxes) || 
+                          1),
       sender_delivery_option: normalizedRequest.sender_delivery_option,
       receiver_delivery_option: normalizedRequest.receiver_delivery_option,
       
@@ -2210,6 +2255,14 @@ router.get('/:id/details', async (req, res) => {
                           (requestIdData?.verification?.chargeable_weight) || 
                           (requestIdData?.shipment?.chargeable_weight) || 
                           null,
+        
+        // Total KG (auto-set from chargeable_weight for Finance invoice generation - highest priority)
+        // This is the weight used for invoice generation and rate bracket determination
+        total_kg: normalizedRequest.verification?.total_kg !== undefined && normalizedRequest.verification?.total_kg !== null
+                 ? (typeof normalizedRequest.verification.total_kg === 'object' && normalizedRequest.verification.total_kg.toString
+                    ? parseFloat(normalizedRequest.verification.total_kg.toString())
+                    : parseFloat(normalizedRequest.verification.total_kg))
+                 : null,
         
         // Weight type (check multiple locations)
         weight_type: normalizedRequest.verification?.weight_type || 

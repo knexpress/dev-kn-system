@@ -688,6 +688,16 @@ const invoiceSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.Decimal128,
     required: true,
   },
+  total_amount_cod: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: false,
+    // Total amount for COD Invoice (PH_TO_UAE only): Shipping + Delivery (base)
+  },
+  total_amount_tax_invoice: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: false,
+    // Total amount for Tax Invoice (PH_TO_UAE only): Delivery (calculated) + Tax
+  },
   notes: {
     type: String,
     required: false,
@@ -1421,6 +1431,56 @@ paymentRemittanceSchema.index({ driver_id: 1 });
 paymentRemittanceSchema.index({ status: 1 });
 paymentRemittanceSchema.index({ remitted_at: 1 });
 
+// Price Bracket Schema
+const priceBracketSchema = new mongoose.Schema({
+  route: {
+    type: String,
+    enum: ['PH_TO_UAE', 'UAE_TO_PH'],
+    required: true,
+    unique: true
+  },
+  brackets: [{
+    min: {
+      type: Number,
+      required: true,
+      min: 0
+    },
+    max: {
+      type: Number,
+      default: null, // null means infinity (unlimited)
+      validate: {
+        validator: function(value) {
+          return value === null || value > this.min;
+        },
+        message: 'Max must be greater than min or null'
+      }
+    },
+    rate: {
+      type: Number,
+      required: true,
+      min: 0
+    },
+    label: {
+      type: String,
+      required: true
+    }
+  }],
+  updated_at: {
+    type: Date,
+    default: Date.now
+  },
+  updated_by: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: false
+  }
+}, {
+  timestamps: true
+});
+
+// Price Bracket indexes
+priceBracketSchema.index({ route: 1 }, { unique: true });
+
 // ========================================
 // EXPORT MODELS
 // ========================================
@@ -1441,6 +1501,7 @@ const Driver = mongoose.models.Driver || mongoose.model('Driver', driverSchema);
 const DeliveryAssignment = mongoose.models.DeliveryAssignment || mongoose.model('DeliveryAssignment', deliveryAssignmentSchema);
 const QRPaymentSession = mongoose.models.QRPaymentSession || mongoose.model('QRPaymentSession', qrPaymentSessionSchema);
 const PaymentRemittance = mongoose.models.PaymentRemittance || mongoose.model('PaymentRemittance', paymentRemittanceSchema);
+const PriceBracket = mongoose.models.PriceBracket || mongoose.model('PriceBracket', priceBracketSchema);
 
 module.exports = {
   Department,
@@ -1456,5 +1517,6 @@ module.exports = {
   Driver,
   DeliveryAssignment,
   QRPaymentSession,
-  PaymentRemittance
+  PaymentRemittance,
+  PriceBracket
 };

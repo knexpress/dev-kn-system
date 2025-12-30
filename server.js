@@ -23,6 +23,7 @@ const { router: notificationRoutes } = require('./routes/notifications');
 const performanceRoutes = require('./routes/performance');
 const invoiceRoutes = require('./routes/invoices');
 const invoiceUnifiedRoutes = require('./routes/invoices-unified');
+const priceBracketsRoutes = require('./routes/price-brackets');
 
 // QR Payment Collection System routes
 const driverRoutes = require('./routes/drivers');
@@ -199,6 +200,7 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/performance', performanceRoutes);
 app.use('/api/invoices', invoiceRoutes);
 app.use('/api/invoices-unified', invoiceUnifiedRoutes);
+app.use('/api/price-brackets', priceBracketsRoutes);
 
 // QR Payment Collection System routes
 app.use('/api/drivers', driverRoutes);
