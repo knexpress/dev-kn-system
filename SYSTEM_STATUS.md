@@ -69,7 +69,7 @@
 - ✅ Review status management
 
 ### Verification System
-- ✅ FLOWMIC + UAE_TO_PINAS + insured validation
+- ✅ FLOMIC + UAE_TO_PINAS + insured validation
 - ✅ Declared value requirement for insured shipments
 - ✅ Total kilograms (`total_kg`) field support
 - ✅ Number of boxes priority handling

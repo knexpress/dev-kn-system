@@ -1479,27 +1479,27 @@ router.put('/:id/verification', async (req, res) => {
 
     // Shipment classification handling
     // PH_TO_UAE: Always GENERAL (enforce)
-    // UAE_TO_PH: Must be FLOWMIC or COMMERCIAL (validate)
+    // UAE_TO_PH: Must be FLOMIC or COMMERCIAL (validate)
     if (isPhToUae) {
       // PH_TO_UAE: Force to GENERAL regardless of input
       invoiceRequest.verification.shipment_classification = 'GENERAL';
       console.log('✅ PH_TO_UAE route detected - classification set to GENERAL');
     } else if (isUaeToPh) {
-      // UAE_TO_PH: Must be FLOWMIC or COMMERCIAL
+      // UAE_TO_PH: Must be FLOMIC or COMMERCIAL
     if (verificationData.shipment_classification !== undefined) {
         const normalizedClass = normalizeClass(verificationData.shipment_classification);
-        if (normalizedClass === 'FLOWMIC' || normalizedClass === 'COMMERCIAL') {
+        if (normalizedClass === 'FLOMIC' || normalizedClass === 'COMMERCIAL') {
           invoiceRequest.verification.shipment_classification = normalizedClass;
         } else {
           return res.status(400).json({
             success: false,
-            error: 'For UAE_TO_PH shipments, shipment_classification must be either FLOWMIC or COMMERCIAL'
+            error: 'For UAE_TO_PH shipments, shipment_classification must be either FLOMIC or COMMERCIAL'
           });
         }
       } else {
         return res.status(400).json({
           success: false,
-          error: 'shipment_classification is required for UAE_TO_PH shipments (must be FLOWMIC or COMMERCIAL)'
+          error: 'shipment_classification is required for UAE_TO_PH shipments (must be FLOMIC or COMMERCIAL)'
         });
       }
     } else if (verificationData.shipment_classification !== undefined) {
@@ -1566,10 +1566,26 @@ router.put('/:id/verification', async (req, res) => {
       invoiceRequest.verification.total_vm = invoiceRequest.verification.volumetric_weight;
     }
 
-    // Note: rate_bracket is now handled after total_kg is set (see below)
-    if (verificationData.calculated_rate !== undefined && verificationData.calculated_rate !== null && verificationData.calculated_rate !== '') {
+    // Handle special_rate: Updates both verification.amount and verification.calculated_rate
+    // Priority: special_rate > calculated_rate (for backward compatibility)
+    if (verificationData.special_rate !== undefined && verificationData.special_rate !== null && verificationData.special_rate !== '') {
+      const specialRateValue = parseFloat(verificationData.special_rate);
+      if (isNaN(specialRateValue) || specialRateValue < 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'special_rate must be a positive number'
+        });
+      }
+      // Update both amount and calculated_rate with special rate
+      invoiceRequest.verification.amount = toDecimal128(specialRateValue);
+      invoiceRequest.verification.calculated_rate = toDecimal128(specialRateValue);
+      console.log(`✅ Special rate applied: ${specialRateValue} (updated both verification.amount and verification.calculated_rate)`);
+    } else if (verificationData.calculated_rate !== undefined && verificationData.calculated_rate !== null && verificationData.calculated_rate !== '') {
+      // Backward compatibility: if calculated_rate is provided without special_rate, update it
       invoiceRequest.verification.calculated_rate = toDecimal128(verificationData.calculated_rate);
     }
+    
+    // Note: rate_bracket is now handled after total_kg is set (see below)
 
     // Auto-determine weight_type based on actual_weight and volumetric_weight comparison
     // weight_type = 'ACTUAL' if actual_weight >= volumetric_weight, else 'VOLUMETRIC'
@@ -1689,7 +1705,7 @@ router.put('/:id/verification', async (req, res) => {
     }
 
     // Validate: If UAE_TO_PH/PINAS + insured (from database) = true, declared_value is REQUIRED
-    // This applies to ALL classifications (FLOWMIC, COMMERCIAL, GENERAL, etc.), not just FLOWMIC
+    // This applies to ALL classifications (FLOMIC, COMMERCIAL, GENERAL, etc.), not just FLOMIC
     if (isUaeToPinas && isInsuredFromDatabase) {
       const declaredValue = invoiceRequest.verification.declared_value;
       if (!declaredValue || parseFloat(declaredValue.toString()) <= 0) {

@@ -623,6 +623,11 @@ const invoiceSchema = new mongoose.Schema({
     required: false,
     // Base amount for PH_TO_UAE delivery charge calculation (default: 20)
   },
+  pickup_base_amount: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: false,
+    // Base amount for PH_TO_UAE pickup charge (only when sender_delivery_option is 'pickup')
+  },
   pickup_charge: {
     type: mongoose.Schema.Types.Decimal128,
     required: false,

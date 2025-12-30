@@ -677,13 +677,13 @@ const invoiceRequestSchema = new mongoose.Schema({
       },
       classification: {
         type: String,
-          enum: ['FLOWMIC', 'COMMERCIAL', 'PERSONAL', 'GENERAL', 'Flowmic', 'Commercial', 'Personal', 'General', 'flowmic', 'commercial', 'personal', 'general'],
+          enum: ['FLOMIC', 'COMMERCIAL', 'PERSONAL', 'GENERAL', 'Flomic', 'Commercial', 'Personal', 'General', 'flomic', 'commercial', 'personal', 'general'],
         required: false,
       },
     }],
       shipment_classification: {
         type: String,
-        enum: ['FLOWMIC', 'COMMERCIAL', 'PERSONAL', 'GENERAL', 'Flowmic', 'Commercial', 'Personal', 'General', 'flowmic', 'commercial', 'personal', 'general'],
+        enum: ['FLOMIC', 'COMMERCIAL', 'PERSONAL', 'GENERAL', 'Flomic', 'Commercial', 'Personal', 'General', 'flomic', 'commercial', 'personal', 'general'],
         required: false,
       },
     total_vm: {
@@ -712,7 +712,7 @@ const invoiceRequestSchema = new mongoose.Schema({
     },
     shipment_classification: {
       type: String,
-      enum: ['FLOWMIC', 'COMMERCIAL', 'PERSONAL', 'GENERAL'],
+      enum: ['FLOMIC', 'COMMERCIAL', 'PERSONAL', 'GENERAL'],
       required: false,
     },
     weight_type: {
