@@ -1906,6 +1906,185 @@ router.put('/:id', async (req, res) => {
       });
     }
 
+    // Determine service route
+    const serviceCode = invoice.service_code || updateData.service_code || '';
+    const normalizedServiceCode = serviceCode.toUpperCase();
+    const isPhToUae = normalizedServiceCode.includes('PH_TO_UAE');
+
+    // Handle separate COD and Tax invoice edits for PH TO UAE
+    if (isPhToUae && updateData.invoice_type) {
+      const invoiceType = updateData.invoice_type.toUpperCase();
+      console.log(`📝 PH TO UAE Invoice Edit - Type: ${invoiceType}`);
+
+      if (invoiceType === 'COD') {
+        // COD Invoice Edit
+        // Validate required fields
+        if (updateData.amount === undefined || updateData.amount === null) {
+          return res.status(400).json({
+            success: false,
+            error: 'amount is required for COD invoice edit'
+          });
+        }
+        if (updateData.delivery_base_amount === undefined || updateData.delivery_base_amount === null) {
+          return res.status(400).json({
+            success: false,
+            error: 'delivery_base_amount is required for COD invoice edit'
+          });
+        }
+        if (updateData.total_amount_cod === undefined || updateData.total_amount_cod === null) {
+          return res.status(400).json({
+            success: false,
+            error: 'total_amount_cod is required for COD invoice edit'
+          });
+        }
+
+        // Parse values
+        const amount = typeof updateData.amount === 'object' && updateData.amount.toString
+          ? parseFloat(updateData.amount.toString())
+          : parseFloat(updateData.amount);
+        const deliveryBaseAmount = typeof updateData.delivery_base_amount === 'object' && updateData.delivery_base_amount.toString
+          ? parseFloat(updateData.delivery_base_amount.toString())
+          : parseFloat(updateData.delivery_base_amount);
+        const totalAmountCod = typeof updateData.total_amount_cod === 'object' && updateData.total_amount_cod.toString
+          ? parseFloat(updateData.total_amount_cod.toString())
+          : parseFloat(updateData.total_amount_cod);
+
+        // Validate calculations
+        const expectedTotal = amount + deliveryBaseAmount;
+        if (Math.abs(totalAmountCod - expectedTotal) > 0.01) {
+          console.warn(`⚠️ COD total validation: expected ${expectedTotal}, got ${totalAmountCod}`);
+        }
+
+        // Set COD invoice fields
+        updateData.amount = mongoose.Types.Decimal128.fromString(amount.toFixed(2));
+        updateData.delivery_base_amount = mongoose.Types.Decimal128.fromString(deliveryBaseAmount.toFixed(2));
+        updateData.total_amount_cod = mongoose.Types.Decimal128.fromString(totalAmountCod.toFixed(2));
+        updateData.tax_rate = 0;
+        updateData.tax_amount = mongoose.Types.Decimal128.fromString('0.00');
+        updateData.total_amount = mongoose.Types.Decimal128.fromString(totalAmountCod.toFixed(2));
+        updateData.base_amount = mongoose.Types.Decimal128.fromString(totalAmountCod.toFixed(2));
+        updateData.delivery_charge = mongoose.Types.Decimal128.fromString(deliveryBaseAmount.toFixed(2));
+
+        console.log('✅ COD Invoice Edit Applied:');
+        console.log(`   Amount (Shipping): ${amount} AED`);
+        console.log(`   Delivery Base Amount: ${deliveryBaseAmount} AED`);
+        console.log(`   Total Amount COD: ${totalAmountCod} AED`);
+        console.log(`   Tax Rate: 0%`);
+        console.log(`   Tax Amount: 0 AED`);
+
+        // Skip the general recalculation logic for COD edits
+        // Remove invoice_type from updateData before saving (it's not a database field)
+        delete updateData.invoice_type;
+        Object.assign(invoice, updateData);
+        await invoice.save();
+
+        // Populate the updated invoice for response
+        const populatedInvoice = await Invoice.findById(invoice._id)
+          .populate('request_id', REQUEST_POPULATE_FIELDS)
+          .populate('client_id', 'company_name contact_name email phone')
+          .populate('created_by', 'full_name email department_id');
+
+        // Re-issue invoice in EMPOST when invoice is edited
+        try {
+          const empostAPI = require('../services/empost-api');
+          console.log('📄 Re-issuing EMPOST invoice after COD edit:', invoice.invoice_id);
+          await empostAPI.issueInvoice(populatedInvoice);
+          console.log('✅ EMPOST invoice re-issued successfully after COD edit');
+        } catch (empostError) {
+          console.error('❌ EMPOST invoice re-issue failed (edit will continue):', empostError.message);
+        }
+
+        return res.json({
+          success: true,
+          data: transformInvoice(populatedInvoice),
+          message: 'COD invoice updated successfully'
+        });
+
+      } else if (invoiceType === 'TAX') {
+        // Tax Invoice Edit
+        // Validate required fields
+        if (updateData.delivery_charge === undefined || updateData.delivery_charge === null) {
+          return res.status(400).json({
+            success: false,
+            error: 'delivery_charge is required for Tax invoice edit'
+          });
+        }
+        if (updateData.tax_amount === undefined || updateData.tax_amount === null) {
+          return res.status(400).json({
+            success: false,
+            error: 'tax_amount is required for Tax invoice edit'
+          });
+        }
+        if (updateData.total_amount_tax_invoice === undefined || updateData.total_amount_tax_invoice === null) {
+          return res.status(400).json({
+            success: false,
+            error: 'total_amount_tax_invoice is required for Tax invoice edit'
+          });
+        }
+
+        // Parse values
+        const deliveryCharge = typeof updateData.delivery_charge === 'object' && updateData.delivery_charge.toString
+          ? parseFloat(updateData.delivery_charge.toString())
+          : parseFloat(updateData.delivery_charge);
+        const taxAmount = typeof updateData.tax_amount === 'object' && updateData.tax_amount.toString
+          ? parseFloat(updateData.tax_amount.toString())
+          : parseFloat(updateData.tax_amount);
+        const totalAmountTaxInvoice = typeof updateData.total_amount_tax_invoice === 'object' && updateData.total_amount_tax_invoice.toString
+          ? parseFloat(updateData.total_amount_tax_invoice.toString())
+          : parseFloat(updateData.total_amount_tax_invoice);
+
+        // Validate calculations
+        const expectedTotal = deliveryCharge + taxAmount;
+        if (Math.abs(totalAmountTaxInvoice - expectedTotal) > 0.01) {
+          console.warn(`⚠️ Tax invoice total validation: expected ${expectedTotal}, got ${totalAmountTaxInvoice}`);
+        }
+
+        // Set Tax invoice fields
+        updateData.delivery_charge = mongoose.Types.Decimal128.fromString(deliveryCharge.toFixed(2));
+        updateData.total_amount_tax_invoice = mongoose.Types.Decimal128.fromString(totalAmountTaxInvoice.toFixed(2));
+        updateData.tax_rate = 5;
+        updateData.tax_amount = mongoose.Types.Decimal128.fromString(taxAmount.toFixed(2));
+        updateData.amount = mongoose.Types.Decimal128.fromString('0.00'); // Shipping hidden in tax invoice
+        updateData.total_amount = mongoose.Types.Decimal128.fromString(totalAmountTaxInvoice.toFixed(2));
+        updateData.base_amount = mongoose.Types.Decimal128.fromString(deliveryCharge.toFixed(2)); // Subtotal = delivery charge only
+
+        console.log('✅ Tax Invoice Edit Applied:');
+        console.log(`   Delivery Charge: ${deliveryCharge} AED`);
+        console.log(`   Tax Amount (5%): ${taxAmount} AED`);
+        console.log(`   Total Amount Tax Invoice: ${totalAmountTaxInvoice} AED`);
+        console.log(`   Tax Rate: 5%`);
+        console.log(`   Amount (Shipping): 0 AED (hidden in tax invoice)`);
+
+        // Skip the general recalculation logic for Tax edits
+        // Remove invoice_type from updateData before saving (it's not a database field)
+        delete updateData.invoice_type;
+        Object.assign(invoice, updateData);
+        await invoice.save();
+
+        // Populate the updated invoice for response
+        const populatedInvoice = await Invoice.findById(invoice._id)
+          .populate('request_id', REQUEST_POPULATE_FIELDS)
+          .populate('client_id', 'company_name contact_name email phone')
+          .populate('created_by', 'full_name email department_id');
+
+        // Re-issue invoice in EMPOST when invoice is edited
+        try {
+          const empostAPI = require('../services/empost-api');
+          console.log('📄 Re-issuing EMPOST invoice after Tax edit:', invoice.invoice_id);
+          await empostAPI.issueInvoice(populatedInvoice);
+          console.log('✅ EMPOST invoice re-issued successfully after Tax edit');
+        } catch (empostError) {
+          console.error('❌ EMPOST invoice re-issue failed (edit will continue):', empostError.message);
+        }
+
+        return res.json({
+          success: true,
+          data: transformInvoice(populatedInvoice),
+          message: 'Tax invoice updated successfully'
+        });
+      }
+    }
+
     // Recalculate totals if base_amount, delivery_charge, or tax_rate changes
     // Note: invoice.amount is shipping charge only, invoice.base_amount is subtotal
     const needsRecalculation = updateData.base_amount !== undefined || 
