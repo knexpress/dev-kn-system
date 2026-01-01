@@ -3,8 +3,13 @@ const router = express.Router();
 const auth = require('../middleware/auth');
 const { DeliveryAssignment, Driver, ShipmentRequest, Invoice, Client } = require('../models/unified-schema');
 const crypto = require('crypto');
+const empostService = require('../services/empost-api');
 
-const normalizeAssignmentStatus = (status) => status === 'DELIVERED' ? 'DELIVERED' : 'NOT_DELIVERED';
+const normalizeAssignmentStatus = (status) => {
+  if (status === 'DELIVERED') return 'DELIVERED';
+  if (status === 'CANCELLED') return 'CANCELLED';
+  return 'NOT_DELIVERED';
+};
 
 // GET /api/delivery-assignments - Get all delivery assignments
 router.get('/', auth, async (req, res) => {
@@ -348,10 +353,36 @@ router.post('/', auth, async (req, res) => {
 // PUT /api/delivery-assignments/:id - Update assignment status
 router.put('/:id', auth, async (req, res) => {
   try {
-    const { status, pickup_date, delivery_date, payment_method, payment_reference, payment_notes, driver_name, driver_phone } = req.body;
-    const normalizedStatus = status === 'DELIVERED' ? 'DELIVERED' : 'NOT_DELIVERED';
+    const { status, pickup_date, delivery_date, payment_method, payment_reference, payment_notes, driver_name, driver_phone, cancellation_reason } = req.body;
+    
+    // Get current assignment to check old status
+    const currentAssignment = await DeliveryAssignment.findById(req.params.id);
+    if (!currentAssignment) {
+      return res.status(404).json({
+        success: false,
+        error: 'Delivery assignment not found'
+      });
+    }
+    
+    const oldStatus = currentAssignment.status;
+    const normalizedStatus = normalizeAssignmentStatus(status);
     
     const updateData = { status: normalizedStatus };
+    
+    // Handle cancellation
+    if (normalizedStatus === 'CANCELLED') {
+      updateData.cancelled_at = new Date();
+      if (cancellation_reason) {
+        updateData.cancellation_reason = cancellation_reason;
+      }
+      // Initialize empost_sync if not exists
+      if (!currentAssignment.empost_sync || currentAssignment.empost_sync.status === 'pending') {
+        updateData.empost_sync = {
+          status: 'pending',
+          retry_count: 0
+        };
+      }
+    }
     
     if (pickup_date) updateData.pickup_date = pickup_date;
     if (delivery_date) updateData.delivery_date = delivery_date;
@@ -415,6 +446,14 @@ router.put('/:id', auth, async (req, res) => {
       return res.status(404).json({
         success: false,
         error: 'Delivery assignment not found'
+      });
+    }
+    
+    // If status changed to CANCELLED, trigger Empost sync in background
+    if (normalizedStatus === 'CANCELLED' && oldStatus !== 'CANCELLED') {
+      // Don't wait for sync to complete - do it in background
+      syncWithEmpostAsync(assignment._id).catch(err => {
+        console.error('Background Empost sync failed:', err);
       });
     }
     
@@ -930,6 +969,205 @@ router.get('/driver/:driverId', auth, async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to fetch driver assignments'
+    });
+  }
+});
+
+// Background sync function for Empost
+async function syncWithEmpostAsync(assignmentId) {
+  try {
+    const assignment = await DeliveryAssignment.findById(assignmentId)
+      .populate('invoice_id', 'awb_number receiver_name receiver_phone receiver_address total_amount')
+      .populate('request_id', 'awb_number');
+    
+    if (!assignment || assignment.status !== 'CANCELLED') {
+      console.warn(`⚠️ Assignment ${assignmentId} is not cancelled, skipping Empost sync`);
+      return;
+    }
+    
+    // Prepare data for Empost
+    const awbNumber = assignment.invoice_id?.awb_number || 
+                     assignment.request_id?.awb_number || 
+                     assignment.assignment_id;
+    
+    const empostData = {
+      assignment_id: assignment.assignment_id,
+      awb_number: awbNumber,
+      tracking_code: assignment.assignment_id,
+      customer_name: assignment.receiver_name || assignment.invoice_id?.receiver_name || 'N/A',
+      customer_phone: assignment.receiver_phone || assignment.invoice_id?.receiver_phone || 'N/A',
+      delivery_address: assignment.delivery_address || assignment.invoice_id?.receiver_address || 'N/A',
+      amount: assignment.amount ? parseFloat(assignment.amount.toString()) : 0,
+      status: 'CANCELLED',
+      cancellation_reason: assignment.cancellation_reason,
+      cancelled_at: assignment.cancelled_at || new Date().toISOString(),
+      invoice_id: assignment.invoice_id?._id?.toString(),
+      driver_id: assignment.driver_id?.toString(),
+      original_status: 'NOT_DELIVERED'
+    };
+    
+    // Call Empost API
+    const empostResponse = await empostService.cancelDelivery(empostData);
+    
+    // Update assignment with sync status
+    if (empostResponse.success) {
+      assignment.empost_sync = {
+        status: 'synced',
+        reference: empostResponse.reference,
+        synced_at: new Date(),
+        error_message: null,
+        retry_count: assignment.empost_sync?.retry_count || 0
+      };
+      console.log(`✅ Empost sync successful for assignment ${assignmentId}, reference: ${empostResponse.reference}`);
+    } else {
+      // Handle sync failure
+      const retryCount = (assignment.empost_sync?.retry_count || 0) + 1;
+      assignment.empost_sync = {
+        status: retryCount < 3 ? 'pending' : 'failed',
+        reference: null,
+        synced_at: null,
+        error_message: empostResponse.error,
+        retry_count: retryCount
+      };
+      
+      // Retry logic with exponential backoff
+      if (retryCount < 3) {
+        const delay = retryCount === 1 ? 60000 : retryCount === 2 ? 300000 : 900000; // 1min, 5min, 15min
+        console.log(`⚠️ Empost sync failed for assignment ${assignmentId}, retrying in ${delay/1000}s (attempt ${retryCount}/3)`);
+        setTimeout(() => {
+          syncWithEmpostAsync(assignmentId).catch(err => {
+            console.error('Retry sync failed:', err);
+          });
+        }, delay);
+      } else {
+        console.error(`❌ Empost sync failed for assignment ${assignmentId} after ${retryCount} attempts: ${empostResponse.error}`);
+      }
+    }
+    
+    await assignment.save();
+  } catch (error) {
+    console.error(`❌ Error in background Empost sync for assignment ${assignmentId}:`, error);
+    // Update assignment with error status
+    try {
+      const assignment = await DeliveryAssignment.findById(assignmentId);
+      if (assignment) {
+        assignment.empost_sync = {
+          status: 'failed',
+          reference: null,
+          synced_at: null,
+          error_message: error.message,
+          retry_count: (assignment.empost_sync?.retry_count || 0) + 1
+        };
+        await assignment.save();
+      }
+    } catch (updateError) {
+      console.error('Failed to update assignment sync status:', updateError);
+    }
+  }
+}
+
+// POST /api/delivery-assignments/:id/sync-empost - Manually sync cancelled assignment with Empost
+router.post('/:id/sync-empost', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Find the assignment
+    const assignment = await DeliveryAssignment.findById(id)
+      .populate('invoice_id', 'awb_number receiver_name receiver_phone receiver_address total_amount')
+      .populate('request_id', 'awb_number');
+    
+    if (!assignment) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Assignment not found' 
+      });
+    }
+    
+    // Verify assignment is cancelled
+    if (assignment.status !== 'CANCELLED') {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Assignment must be cancelled before syncing with Empost' 
+      });
+    }
+    
+    // Prepare data for Empost
+    const awbNumber = assignment.invoice_id?.awb_number || 
+                     assignment.request_id?.awb_number || 
+                     assignment.assignment_id;
+    
+    const empostData = {
+      assignment_id: assignment.assignment_id,
+      awb_number: awbNumber,
+      tracking_code: assignment.assignment_id,
+      customer_name: assignment.receiver_name || assignment.invoice_id?.receiver_name || 'N/A',
+      customer_phone: assignment.receiver_phone || assignment.invoice_id?.receiver_phone || 'N/A',
+      delivery_address: assignment.delivery_address || assignment.invoice_id?.receiver_address || 'N/A',
+      amount: assignment.amount ? parseFloat(assignment.amount.toString()) : 0,
+      status: 'CANCELLED',
+      cancellation_reason: assignment.cancellation_reason,
+      cancelled_at: assignment.cancelled_at || new Date().toISOString(),
+      invoice_id: assignment.invoice_id?._id?.toString(),
+      driver_id: assignment.driver_id?.toString(),
+      original_status: 'NOT_DELIVERED'
+    };
+    
+    // Call Empost API
+    const empostResponse = await empostService.cancelDelivery(empostData);
+    
+    if (empostResponse.success) {
+      // Update assignment with sync status
+      assignment.empost_sync = {
+        status: 'synced',
+        reference: empostResponse.reference,
+        synced_at: new Date(),
+        error_message: null,
+        retry_count: assignment.empost_sync?.retry_count || 0
+      };
+      await assignment.save();
+      
+      return res.json({
+        success: true,
+        data: {
+          assignment_id: assignment.assignment_id,
+          empost_sync_status: 'synced',
+          empost_reference: empostResponse.reference,
+          synced_at: assignment.empost_sync.synced_at
+        }
+      });
+    } else {
+      // Handle sync failure
+      const retryCount = (assignment.empost_sync?.retry_count || 0) + 1;
+      assignment.empost_sync = {
+        status: retryCount < 3 ? 'pending' : 'failed',
+        reference: null,
+        synced_at: null,
+        error_message: empostResponse.error,
+        retry_count: retryCount
+      };
+      await assignment.save();
+      
+      // Trigger retry in background if retry count < 3
+      if (retryCount < 3) {
+        const delay = retryCount === 1 ? 60000 : retryCount === 2 ? 300000 : 900000;
+        setTimeout(() => {
+          syncWithEmpostAsync(assignment._id).catch(err => {
+            console.error('Retry sync failed:', err);
+          });
+        }, delay);
+      }
+      
+      return res.status(500).json({
+        success: false,
+        error: `Failed to sync with Empost: ${empostResponse.error}`
+      });
+    }
+  } catch (error) {
+    console.error('Error syncing with Empost:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Internal server error during Empost sync',
+      details: error.message
     });
   }
 });

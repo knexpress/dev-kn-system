@@ -28,3 +28,20 @@ Thumbs.db
 dist/
 build/
 
+# Temporary files and results
+*.pdf
+empost-*.json
+empost-*.xlsx
+EMPOST*.xlsx
+~$*.xlsx
+
+# Credentials and secrets
+client_secret_*.json
+credentials/
+*.pem
+*.key
+
+# Temporary scripts
+get-refresh-token.js
+pdfGenerator.ts
+

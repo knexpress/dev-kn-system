@@ -954,8 +954,39 @@ const deliveryAssignmentSchema = new mongoose.Schema({
   status: {
     type: String,
     required: true,
-    enum: ['DELIVERED', 'NOT_DELIVERED'],
+    enum: ['DELIVERED', 'NOT_DELIVERED', 'CANCELLED'],
     default: 'NOT_DELIVERED',
+  },
+  cancelled_at: {
+    type: Date,
+    required: false,
+  },
+  cancellation_reason: {
+    type: String,
+    required: false,
+  },
+  empost_sync: {
+    status: {
+      type: String,
+      enum: ['pending', 'synced', 'failed'],
+      default: 'pending',
+    },
+    reference: {
+      type: String,
+      required: false,
+    },
+    synced_at: {
+      type: Date,
+      required: false,
+    },
+    error_message: {
+      type: String,
+      required: false,
+    },
+    retry_count: {
+      type: Number,
+      default: 0,
+    },
   },
   pickup_date: {
     type: Date,

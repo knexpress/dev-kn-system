@@ -1,8 +1,61 @@
 const express = require('express');
 const mongoose = require('mongoose');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 const { ChatRoom, ChatMessage, Department, Employee, User } = require('../models');
+const { getWebSocketServer } = require('../services/websocket-server');
 
 const router = express.Router();
+
+// Configure multer for file uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const uploadPath = path.join(__dirname, '../uploads/chat');
+    // Create directory if it doesn't exist
+    if (!fs.existsSync(uploadPath)) {
+      fs.mkdirSync(uploadPath, { recursive: true });
+    }
+    cb(null, uploadPath);
+  },
+  filename: (req, file, cb) => {
+    // Generate unique filename: timestamp_random_string.extension
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const ext = path.extname(file.originalname);
+    cb(null, `${uniqueSuffix}${ext}`);
+  }
+});
+
+// File filter
+const fileFilter = (req, file, cb) => {
+  const allowedMimes = [
+    // Images
+    'image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp',
+    // Documents
+    'application/pdf', 'application/msword', 
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'text/plain'
+  ];
+  
+  if (allowedMimes.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error('Invalid file type. Only images and documents are allowed.'), false);
+  }
+};
+
+const upload = multer({
+  storage: storage,
+  fileFilter: fileFilter,
+  limits: {
+    fileSize: 10 * 1024 * 1024 // 10MB limit
+  }
+});
+
+// Helper function to validate ObjectId
+function isValidObjectId(id) {
+  return mongoose.Types.ObjectId.isValid(id);
+}
 
 // ========================================
 // CHAT ROOMS
@@ -138,6 +191,13 @@ router.post('/rooms/direct', async (req, res) => {
 // Get a specific chat room
 router.get('/rooms/:id', async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Invalid room ID format' 
+      });
+    }
+    
     const room = await ChatRoom.findById(req.params.id)
       .populate('department_ids', 'name description')
       .populate('participants', 'full_name email employee_id')
@@ -201,6 +261,13 @@ router.post('/rooms', async (req, res) => {
 // Update a chat room
 router.put('/rooms/:id', async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Invalid room ID format' 
+      });
+    }
+    
     const { name, description, department_ids, is_active } = req.body;
     
     const room = await ChatRoom.findById(req.params.id);
@@ -233,6 +300,13 @@ router.put('/rooms/:id', async (req, res) => {
 // Delete a chat room
 router.delete('/rooms/:id', async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Invalid room ID format' 
+      });
+    }
+    
     const room = await ChatRoom.findById(req.params.id);
     if (!room) {
       return res.status(404).json({ error: 'Chat room not found' });
@@ -262,10 +336,21 @@ router.get('/rooms/:roomId/messages', async (req, res) => {
     const { roomId } = req.params;
     const { limit = 50, before } = req.query; // Pagination support
     
+    // Validate roomId is a valid MongoDB ObjectId
+    if (!mongoose.Types.ObjectId.isValid(roomId)) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Invalid room ID format' 
+      });
+    }
+    
     // Check if room exists
     const room = await ChatRoom.findById(roomId);
     if (!room) {
-      return res.status(404).json({ error: 'Chat room not found' });
+      return res.status(404).json({ 
+        success: false,
+        error: 'Chat room not found' 
+      });
     }
     
     let query = { room_id: roomId };
@@ -302,8 +387,18 @@ router.post('/rooms/:roomId/messages', async (req, res) => {
     const { roomId } = req.params;
     const { sender_id, message, message_type = 'text', reply_to } = req.body;
     
+    if (!isValidObjectId(roomId)) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Invalid room ID format' 
+      });
+    }
+    
     if (!sender_id || !message) {
-      return res.status(400).json({ error: 'Sender ID and message are required' });
+      return res.status(400).json({ 
+        success: false,
+        error: 'Sender ID and message are required' 
+      });
     }
     
     // Check if room exists
@@ -373,6 +468,12 @@ router.post('/rooms/:roomId/messages', async (req, res) => {
       .populate('sender_id', 'full_name email employee_id')
       .populate('sender_department_id', 'name description')
       .populate('reply_to', 'message sender_id');
+    
+    // Broadcast via WebSocket
+    const wsServer = getWebSocketServer();
+    if (wsServer) {
+      await wsServer.broadcastNewMessage(roomId, populatedMessage);
+    }
     
     res.status(201).json({
       success: true,
@@ -494,6 +595,13 @@ router.get('/rooms/:roomId/history', async (req, res) => {
     const { roomId } = req.params;
     const { page = 1, limit = 50 } = req.query;
     
+    if (!isValidObjectId(roomId)) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Invalid room ID format' 
+      });
+    }
+    
     const room = await ChatRoom.findById(roomId);
     if (!room) {
       return res.status(404).json({ error: 'Chat room not found' });
@@ -535,8 +643,29 @@ router.delete('/messages/:messageId', async (req, res) => {
       return res.status(404).json({ error: 'Message not found' });
     }
     
+    const roomId = message.room_id;
+    const messageId = message._id;
+    
+    // Delete file if exists
+    if (message.file_url) {
+      const filePath = path.join(__dirname, '..', message.file_url);
+      if (fs.existsSync(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+        } catch (unlinkError) {
+          console.error('Error deleting file:', unlinkError);
+        }
+      }
+    }
+    
     // For now, we'll actually delete it. In production, you might want to soft delete
     await ChatMessage.findByIdAndDelete(req.params.messageId);
+    
+    // Broadcast deletion via WebSocket
+    const wsServer = getWebSocketServer();
+    if (wsServer) {
+      wsServer.broadcastMessageDelete(roomId, messageId);
+    }
     
     res.json({
       success: true,
@@ -578,6 +707,223 @@ router.get('/users', async (req, res) => {
   } catch (error) {
     console.error('Error fetching available users:', error);
     res.status(500).json({ error: 'Failed to fetch available users' });
+  }
+});
+
+// ========================================
+// FILE UPLOAD
+// ========================================
+
+// Upload chat file/image
+router.post('/rooms/:roomId/messages/upload', upload.single('file'), async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { sender_id, message, reply_to } = req.body;
+    
+    if (!isValidObjectId(roomId)) {
+      if (req.file) {
+        fs.unlinkSync(req.file.path);
+      }
+      return res.status(400).json({ 
+        success: false,
+        error: 'Invalid room ID format' 
+      });
+    }
+    
+    if (!req.file) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'File is required' 
+      });
+    }
+    
+    if (!sender_id) {
+      // Clean up uploaded file
+      fs.unlinkSync(req.file.path);
+      return res.status(400).json({ 
+        success: false,
+        error: 'Sender ID is required' 
+      });
+    }
+    
+    // Check if room exists
+    const room = await ChatRoom.findById(roomId);
+    if (!room) {
+      fs.unlinkSync(req.file.path);
+      return res.status(404).json({ 
+        success: false,
+        error: 'Chat room not found' 
+      });
+    }
+    
+    // Get sender
+    let sender = await Employee.findById(sender_id).populate('department_id');
+    let senderDepartmentId = null;
+    
+    if (!sender) {
+      const user = await User.findById(sender_id).populate('department_id');
+      if (user && user.employee_id) {
+        sender = await Employee.findById(user.employee_id).populate('department_id');
+        if (sender) {
+          senderDepartmentId = sender.department_id._id;
+        } else {
+          senderDepartmentId = user.department_id._id;
+          sender = {
+            _id: user._id,
+            full_name: user.full_name,
+            email: user.email,
+            department_id: user.department_id
+          };
+        }
+      } else if (user) {
+        senderDepartmentId = user.department_id._id;
+        sender = {
+          _id: user._id,
+          full_name: user.full_name,
+          email: user.email,
+          department_id: user.department_id
+        };
+      }
+    } else {
+      senderDepartmentId = sender.department_id._id;
+    }
+    
+    if (!sender || !senderDepartmentId) {
+      fs.unlinkSync(req.file.path);
+      return res.status(404).json({ 
+        success: false,
+        error: 'Sender not found or has no department' 
+      });
+    }
+    
+    // Determine message type based on file MIME type
+    const isImage = req.file.mimetype.startsWith('image/');
+    const message_type = isImage ? 'image' : 'file';
+    
+    // Generate file URL (in production, use cloud storage URL)
+    const fileUrl = `/uploads/chat/${req.file.filename}`;
+    
+    // Create message
+    const actualSenderId = sender._id;
+    const chatMessage = new ChatMessage({
+      room_id: roomId,
+      sender_id: actualSenderId,
+      sender_department_id: senderDepartmentId,
+      message: message || '', // Optional caption
+      message_type,
+      file_url: fileUrl,
+      file_name: req.file.originalname,
+      file_size: req.file.size,
+      reply_to,
+      is_read: false
+    });
+    
+    await chatMessage.save();
+    
+    // Populate the message
+    const populatedMessage = await ChatMessage.findById(chatMessage._id)
+      .populate('sender_id', 'full_name email employee_id')
+      .populate('sender_department_id', 'name description')
+      .populate('reply_to', 'message sender_id');
+    
+    // Broadcast via WebSocket
+    const wsServer = getWebSocketServer();
+    if (wsServer) {
+      await wsServer.broadcastNewMessage(roomId, populatedMessage);
+    }
+    
+    res.status(201).json({
+      success: true,
+      data: populatedMessage
+    });
+  } catch (error) {
+    console.error('Error uploading file:', error);
+    
+    // Clean up uploaded file on error
+    if (req.file && req.file.path) {
+      try {
+        fs.unlinkSync(req.file.path);
+      } catch (unlinkError) {
+        console.error('Error deleting file:', unlinkError);
+      }
+    }
+    
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({ 
+        success: false,
+        error: 'File too large. Maximum size is 10MB.' 
+      });
+    }
+    
+    if (error.message && error.message.includes('Invalid file type')) {
+      return res.status(415).json({ 
+        success: false,
+        error: error.message 
+      });
+    }
+    
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to upload file' 
+    });
+  }
+});
+
+// ========================================
+// MESSAGE SEARCH
+// ========================================
+
+// Search messages in room
+router.get('/rooms/:roomId/messages/search', async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { q, limit = 50 } = req.query;
+    
+    if (!isValidObjectId(roomId)) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Invalid room ID format' 
+      });
+    }
+    
+    if (!q || q.trim().length === 0) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Search query is required' 
+      });
+    }
+    
+    // Check if room exists
+    const room = await ChatRoom.findById(roomId);
+    if (!room) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'Chat room not found' 
+      });
+    }
+    
+    // Search messages (case-insensitive)
+    const searchRegex = new RegExp(q.trim(), 'i');
+    const messages = await ChatMessage.find({
+      room_id: roomId,
+      message: searchRegex
+    })
+      .populate('sender_id', 'full_name email employee_id')
+      .populate('sender_department_id', 'name description')
+      .populate('reply_to', 'message sender_id')
+      .sort({ createdAt: -1 }) // Newest first
+      .limit(parseInt(limit));
+    
+    res.json({
+      success: true,
+      data: messages
+    });
+  } catch (error) {
+    console.error('Error searching messages:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to search messages' 
+    });
   }
 });
 

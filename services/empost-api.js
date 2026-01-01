@@ -161,9 +161,10 @@ class EMpostAPIService {
    * @returns {Promise<Object>} EMpost shipment response
    */
   async createShipmentFromData(shipmentData) {
-    // EMPOST API is disabled for testing
-    console.log('[EMPOST DISABLED] Skipping shipment creation from data in EMPOST');
-    return { data: { uhawb: 'N/A' } };
+    if (process.env.EMPOST_API_DISABLED === 'true') {
+      console.log('[EMPOST DISABLED] Skipping shipment creation from data in EMPOST');
+      return { data: { uhawb: 'N/A' } };
+    }
     
     try {
       console.log('📦 Creating shipment in EMpost from raw data:', shipmentData.trackingNumber);
@@ -294,17 +295,25 @@ class EMpostAPIService {
    * @returns {Promise<Object>} EMpost invoice response
    */
   async issueInvoice(invoice) {
-    // EMPOST API is disabled for testing
-    console.log('[EMPOST DISABLED] Skipping invoice issuance in EMPOST');
-    return { success: true, message: 'EMPOST API disabled' };
+    if (process.env.EMPOST_API_DISABLED === 'true') {
+      console.log('[EMPOST DISABLED] Skipping invoice issuance in EMPOST');
+      return { success: true, message: 'EMPOST API disabled' };
+    }
     
     try {
-      console.log('📄 Issuing invoice in EMpost for invoice:', invoice.invoice_id);
+      // Check if invoice is already in Empost format (from script) or needs mapping
+      let invoiceData;
+      if (invoice.trackingNumber && invoice.charges && invoice.invoice) {
+        // Already in Empost format (from script)
+        invoiceData = invoice;
+        console.log('📄 Issuing invoice in EMpost for tracking:', invoice.trackingNumber);
+      } else {
+        // Needs mapping (from invoice object)
+        console.log('📄 Issuing invoice in EMpost for invoice:', invoice.invoice_id);
+        invoiceData = this.mapInvoiceToEMpostInvoice(invoice);
+      }
       
       const headers = await this.getAuthHeaders();
-      
-      // Map invoice data to EMpost invoice format
-      const invoiceData = this.mapInvoiceToEMpostInvoice(invoice);
       
       const issueInvoice = async () => {
         const response = await this.apiClient.post(
@@ -832,6 +841,77 @@ class EMpostAPIService {
    * @param {string} status - Invoice/Request status or delivery_status
    * @returns {string} EMpost delivery status (Pending, Delivered, or Cancelled)
    */
+  /**
+   * Cancel delivery assignment in EMpost
+   * @param {Object} assignmentData - Delivery assignment data
+   * @returns {Promise<Object>} EMpost cancellation response
+   */
+  async cancelDelivery(assignmentData) {
+    // EMPOST API is disabled for testing
+    if (process.env.EMPOST_API_DISABLED === 'true') {
+      console.log('[EMPOST DISABLED] Skipping delivery cancellation in EMPOST');
+      return { success: true, message: 'EMPOST API disabled', reference: 'MOCK-REF-' + Date.now() };
+    }
+    
+    try {
+      console.log(`🚫 Cancelling delivery in EMPOST: ${assignmentData.awb_number || assignmentData.tracking_code}`);
+      
+      const headers = await this.getAuthHeaders();
+      
+      // Prepare cancellation payload
+      const cancelData = {
+        awb_number: assignmentData.awb_number,
+        tracking_code: assignmentData.tracking_code,
+        customer_name: assignmentData.customer_name,
+        customer_phone: assignmentData.customer_phone,
+        delivery_address: assignmentData.delivery_address,
+        amount: assignmentData.amount,
+        status: 'CANCELLED',
+        cancellation_reason: assignmentData.cancellation_reason,
+        cancelled_at: assignmentData.cancelled_at || new Date().toISOString()
+      };
+      
+      const cancelDelivery = async () => {
+        try {
+          // Try the cancellation endpoint
+          const response = await this.apiClient.post(
+            '/empost/api/v1/deliveries/cancel',
+            cancelData,
+            { headers, timeout: 10000 }
+          );
+          return response.data;
+        } catch (error) {
+          // If specific cancellation endpoint doesn't exist, try status update
+          if (error.response?.status === 404) {
+            console.log('⚠️ Cancellation endpoint not found, trying status update instead');
+            return await this.updateShipmentStatus(
+              assignmentData.awb_number || assignmentData.tracking_code,
+              'CANCELLED',
+              { notes: assignmentData.cancellation_reason }
+            );
+          }
+          throw error;
+        }
+      };
+      
+      const result = await this.retryWithBackoff(cancelDelivery, 3, 1000);
+      
+      console.log('✅ Delivery cancellation synced to EMPOST');
+      return {
+        success: true,
+        reference: result.reference || result.trackingNumber || null,
+        message: result.message || 'Delivery cancellation synced successfully'
+      };
+    } catch (error) {
+      console.error('❌ Failed to cancel delivery in EMPOST:', error.response?.data || error.message);
+      return {
+        success: false,
+        error: error.response?.data?.message || error.message || 'Unknown error occurred',
+        reference: null
+      };
+    }
+  }
+
   mapDeliveryStatus(status) {
     if (!status) return 'Pending';
     

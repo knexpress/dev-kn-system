@@ -8,6 +8,8 @@ const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/i
 const { syncClientFromBooking } = require('../utils/client-sync');
 const auth = require('../middleware/auth');
 const { validateObjectIdParam, sanitizeRegex } = require('../middleware/security');
+const { generateBookingPDF } = require('../services/pdf-generator');
+const googleDriveService = require('../services/google-drive');
 
 const router = express.Router();
 
@@ -1722,12 +1724,28 @@ router.post('/:id/review', validateObjectIdParam('id'), async (req, res) => {
     const declaredAmountRaw = booking.declaredAmount ?? booking.declared_amount ?? booking.declared_value ?? booking.declaredValue
       ?? sender.declaredAmount ?? sender.declared_amount ?? sender.declared_value ?? sender.declaredValue;
 
+    // Extract shipment_status_history from booking (if it exists as an array, get the latest status)
+    let shipmentStatusHistory = null;
+    if (booking.shipment_status_history) {
+      if (Array.isArray(booking.shipment_status_history) && booking.shipment_status_history.length > 0) {
+        // Get the latest status from the history array
+        const latestStatus = booking.shipment_status_history[booking.shipment_status_history.length - 1];
+        shipmentStatusHistory = latestStatus.status || latestStatus;
+      } else if (typeof booking.shipment_status_history === 'string') {
+        shipmentStatusHistory = booking.shipment_status_history;
+      }
+    }
+    
     // Build invoice request data (same structure as sales person creates)
     const invoiceRequestData = {
       // Auto-generated Invoice & Tracking Information (same as sales)
       invoice_number: invoiceNumber, // Auto-generated Invoice ID
       tracking_code: awbNumber, // Auto-generated AWB number
       service_code: serviceCode || undefined, // Automatically selected from booking.service and normalized (PH_TO_UAE or UAE_TO_PH) for price bracket
+      
+      // Booking reference and shipment status history
+      booking_id: booking._id, // Reference to original booking
+      shipment_status_history: shipmentStatusHistory, // Copy from booking
       
       // Required fields
       customer_name: customerName,
@@ -1753,8 +1771,13 @@ router.post('/:id/review', validateObjectIdParam('id'), async (req, res) => {
       booking_data: bookingData,
       
       // Delivery options (from booking sender and receiver)
+      // Normalize receiver_delivery_option: 'address' -> 'delivery', 'warehouse' -> 'warehouse'
       sender_delivery_option: sender.deliveryOption || booking.sender?.deliveryOption || undefined,
-      receiver_delivery_option: receiver.deliveryOption || booking.receiver?.deliveryOption || undefined,
+      receiver_delivery_option: (() => {
+        const option = receiver.deliveryOption || booking.receiver?.deliveryOption;
+        if (option === 'address') return 'delivery'; // Map 'address' to 'delivery' for enum compatibility
+        return option || undefined;
+      })(),
       
       // Insurance information (from booking)
       insured: normalizeBoolean(insuredRaw) ?? false,
@@ -1811,6 +1834,12 @@ router.post('/:id/review', validateObjectIdParam('id'), async (req, res) => {
         await createNotificationsForDepartment('invoice_request', invoiceRequest._id, dept._id, reviewed_by_employee_id);
       }
     }
+
+    // Generate PDF and upload to Google Drive (in background - don't block response)
+    generateAndUploadBookingPDF(booking, invoiceRequest).catch(err => {
+      console.error('❌ Error generating/uploading booking PDF:', err);
+      // Don't fail the review if PDF generation fails
+    });
 
     // Prepare invoice request response (exclude identityDocuments)
     const invoiceRequestObj = invoiceRequest.toObject ? invoiceRequest.toObject() : invoiceRequest;
@@ -1900,6 +1929,149 @@ router.put('/:id/status', validateObjectIdParam('id'), async (req, res) => {
     });
   }
 });
+
+// Update booking shipment status history
+router.put('/:id/shipment-status-history', validateObjectIdParam('id'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { shipment_status_history } = req.body;
+    
+    if (!shipment_status_history || typeof shipment_status_history !== 'string') {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'shipment_status_history is required and must be a string' 
+      });
+    }
+    
+    const booking = await Booking.findById(id);
+    if (!booking) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Booking not found' 
+      });
+    }
+    
+    // Update shipment_status_history
+    // If it's an array, add new entry; otherwise, set as string or convert to array
+    const newStatusEntry = {
+      status: shipment_status_history,
+      updated_at: new Date(),
+      updated_by: req.body.updated_by || 'System',
+      notes: req.body.notes || ''
+    };
+    
+    if (Array.isArray(booking.shipment_status_history)) {
+      booking.shipment_status_history.push(newStatusEntry);
+    } else {
+      // Convert to array format
+      booking.shipment_status_history = [newStatusEntry];
+    }
+    
+    await booking.save();
+    
+    console.log(`✅ Updated booking ${id} shipment_status_history to "${shipment_status_history}"`);
+    
+    res.json({
+      success: true,
+      data: booking.toObject ? booking.toObject() : booking,
+      message: 'Shipment status history updated successfully'
+    });
+  } catch (error) {
+    console.error('Error updating booking shipment status history:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to update shipment status history',
+      details: error.message 
+    });
+  }
+});
+
+/**
+ * Generate PDF and upload to Google Drive for reviewed booking
+ * This runs in background and doesn't block the review response
+ */
+async function generateAndUploadBookingPDF(booking, invoiceRequest) {
+  try {
+    console.log(`📄 Starting PDF generation for booking: ${booking._id}`);
+    
+    // Extract booking data for PDF
+    const sender = booking.sender || {};
+    const receiver = booking.receiver || {};
+    const items = booking.items || [];
+    
+    // Get identity documents from booking
+    const identityDocs = booking.identityDocuments || {};
+    
+    // Prepare PDF data structure
+    const pdfData = {
+      referenceNumber: booking.referenceNumber || booking._id.toString(),
+      bookingId: booking._id.toString(),
+      awb: invoiceRequest.tracking_code || invoiceRequest.awb_number || booking.awb || booking.tracking_code || null,
+      service: booking.service || booking.service_code || invoiceRequest.service_code,
+      sender: {
+        fullName: sender.fullName || sender.name || (sender.firstName && sender.lastName ? `${sender.firstName} ${sender.lastName}` : '') || '',
+        completeAddress: sender.completeAddress || sender.address || sender.addressLine1 || '',
+        contactNo: sender.contactNo || sender.phoneNumber || sender.phone || '',
+        emailAddress: sender.emailAddress || sender.email || '',
+        agentName: sender.agentName || '',
+        deliveryOption: sender.deliveryOption || booking.sender_delivery_option
+      },
+      receiver: {
+        fullName: receiver.fullName || receiver.name || (receiver.firstName && receiver.lastName ? `${receiver.firstName} ${receiver.lastName}` : '') || '',
+        completeAddress: receiver.completeAddress || receiver.address || receiver.addressLine1 || '',
+        contactNo: receiver.contactNo || receiver.phoneNumber || receiver.phone || '',
+        emailAddress: receiver.emailAddress || receiver.email || '',
+        deliveryOption: receiver.deliveryOption || booking.receiver_delivery_option || 'address',
+        numberOfBoxes: booking.number_of_boxes || invoiceRequest.verification?.number_of_boxes || items.length || 1
+      },
+      items: items.map((item, index) => ({
+        id: item.id || `item-${index}`,
+        commodity: item.commodity || item.name || item.description || `Item ${index + 1}`,
+        qty: item.qty || item.quantity || 1
+      })),
+      eidFrontImage: identityDocs.eidFront || identityDocs.eid_front || identityDocs.emiratesIdFront || null,
+      eidBackImage: identityDocs.eidBack || identityDocs.eid_back || identityDocs.emiratesIdBack || null,
+      philippinesIdFront: identityDocs.philippinesIdFront || identityDocs.philippines_id_front || identityDocs.phIdFront || null,
+      philippinesIdBack: identityDocs.philippinesIdBack || identityDocs.philippines_id_back || identityDocs.phIdBack || null,
+      customerImage: booking.customerImage || booking.customer_image || null,
+      customerImages: booking.customerImages || booking.customer_images || (booking.customerImage ? [booking.customerImage] : []),
+      submissionTimestamp: booking.createdAt || booking.submittedAt || new Date().toISOString(),
+      declarationText: booking.declarationText || booking.declaration_text || null
+    };
+
+    // Generate PDF
+    console.log('📄 Generating PDF...');
+    const pdfBuffer = await generateBookingPDF(pdfData);
+    console.log(`✅ PDF generated: ${pdfBuffer.length} bytes`);
+
+    // Determine file name
+    const awb = pdfData.awb || pdfData.referenceNumber;
+    const fileName = `Booking-${awb}.pdf`;
+    
+    // Get year for folder
+    const year = new Date(pdfData.submissionTimestamp).getFullYear();
+    
+    // Upload to Google Drive
+    console.log(`☁️ Uploading PDF to Google Drive (folder: ${year}-saved-bookings)...`);
+    const uploadResult = await googleDriveService.uploadBookingPDF(
+      Buffer.from(pdfBuffer),
+      fileName,
+      year
+    );
+
+    if (uploadResult.success) {
+      console.log(`✅ PDF uploaded successfully to Google Drive:`);
+      console.log(`   📁 Folder: ${uploadResult.folderName}`);
+      console.log(`   📄 File: ${uploadResult.fileName}`);
+      console.log(`   🔗 View: ${uploadResult.webViewLink}`);
+    } else {
+      console.error(`❌ PDF upload failed: ${uploadResult.error}`);
+    }
+  } catch (error) {
+    console.error('❌ Error in generateAndUploadBookingPDF:', error);
+    // Don't throw - this is a background process
+  }
+}
 
 module.exports = router;
 

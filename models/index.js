@@ -405,6 +405,19 @@ const interDepartmentChatMessageSchema = new mongoose.Schema({
     enum: ['text', 'file', 'image', 'system'],
     default: 'text',
   },
+  // File upload fields
+  file_url: {
+    type: String,
+    required: false,
+  },
+  file_name: {
+    type: String,
+    required: false,
+  },
+  file_size: {
+    type: Number,
+    required: false,
+  },
   is_read: {
     type: Boolean,
     default: false,
@@ -432,6 +445,8 @@ interDepartmentChatMessageSchema.index({ room_id: 1, createdAt: -1 });
 interDepartmentChatMessageSchema.index({ sender_id: 1 });
 interDepartmentChatMessageSchema.index({ sender_department_id: 1 });
 interDepartmentChatMessageSchema.index({ is_read: 1 });
+// Text search index for message search functionality
+interDepartmentChatMessageSchema.index({ message: 'text' });
 
 // Invoice Request Schema
 const invoiceRequestSchema = new mongoose.Schema({
@@ -767,6 +782,19 @@ const invoiceRequestSchema = new mongoose.Schema({
     required: false,
   },
   
+  // Booking Reference
+  booking_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Booking',
+    required: false,
+  },
+  
+  // Shipment Status History (copied from booking when invoice request is created)
+  shipment_status_history: {
+    type: String,
+    required: false,
+  },
+  
   // EMPOST Integration
   empost_uhawb: {
     type: String,
@@ -1056,6 +1084,70 @@ bookingSchema.index({ 'sender.name': 'text', 'receiver.name': 'text', 'customer_
 
 const Booking = mongoose.models.Booking || mongoose.model('Booking', bookingSchema);
 
+// Audit Report Schema for tracking cancellations and deletions
+const auditReportSchema = new mongoose.Schema({
+  report_type: {
+    type: String,
+    required: true,
+    enum: ['invoice_request_cancellation', 'invoice_generation', 'delivery_assignment_cancellation', 'other'],
+    default: 'other'
+  },
+  invoice_request_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'InvoiceRequest',
+    required: false,
+  },
+  invoice_request_data: {
+    type: mongoose.Schema.Types.Mixed,
+    required: false,
+  },
+  related_invoice_data: {
+    type: mongoose.Schema.Types.Mixed,
+    required: false,
+  },
+  related_delivery_assignments: [{
+    assignment_id: String,
+    data: mongoose.Schema.Types.Mixed
+  }],
+  cancellation_reason: {
+    type: String,
+    required: false,
+  },
+  cancelled_by: {
+    employee_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Employee',
+      required: false,
+    },
+    employee_name: {
+      type: String,
+      required: false,
+    },
+    department: {
+      type: String,
+      required: false,
+    },
+  },
+  cancelled_at: {
+    type: Date,
+    required: false,
+  },
+  preserved_for_audit: {
+    type: Boolean,
+    default: true,
+  },
+}, {
+  timestamps: true,
+});
+
+auditReportSchema.index({ report_type: 1 });
+auditReportSchema.index({ invoice_request_id: 1 });
+auditReportSchema.index({ 'cancelled_by.employee_id': 1 });
+auditReportSchema.index({ cancelled_at: -1 });
+auditReportSchema.index({ createdAt: -1 });
+
+const AuditReport = mongoose.models.AuditReport || mongoose.model('AuditReport', auditReportSchema);
+
 module.exports = {
   Department,
   Employee,
@@ -1070,5 +1162,6 @@ module.exports = {
   PerformanceMetrics,
   Booking,
   ChatRoom,
-  ChatMessage
+  ChatMessage,
+  AuditReport
 };

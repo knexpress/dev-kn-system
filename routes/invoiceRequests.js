@@ -1,6 +1,7 @@
 const express = require('express');
 const mongoose = require('mongoose');
-const { InvoiceRequest, Employee, Collections } = require('../models');
+const { InvoiceRequest, Employee, Collections, AuditReport, Booking, Department } = require('../models');
+const { DeliveryAssignment, Invoice } = require('../models/unified-schema');
 const { createNotificationsForAllUsers, createNotificationsForDepartment } = require('./notifications');
 const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/id-generators');
@@ -1201,8 +1202,64 @@ router.put('/:id', async (req, res) => {
 
     await invoiceRequest.save();
 
-    // Sync status to EMPOST if status or delivery_status changed
+    // Auto-update booking's shipment_status_history when invoice request status changes
+    // Statuses that trigger shipment_status_history update
+    const statusesToUpdate = ['SUBMITTED', 'IN_PROGRESS', 'VERIFIED', 'COMPLETED'];
     const statusChanged = updateData.status && updateData.status !== oldStatus;
+    if (statusChanged && statusesToUpdate.includes(updateData.status)) {
+      try {
+        // Get booking_id from invoice request
+        let bookingId = null;
+        if (invoiceRequest.booking_id) {
+          bookingId = typeof invoiceRequest.booking_id === 'object' 
+            ? invoiceRequest.booking_id._id || invoiceRequest.booking_id 
+            : invoiceRequest.booking_id;
+        }
+        
+        // If booking_id not found, try to find booking by converted_to_invoice_request_id
+        if (!bookingId) {
+          const Booking = mongoose.model('Booking');
+          const booking = await Booking.findOne({ converted_to_invoice_request_id: invoiceRequest._id });
+          if (booking) {
+            bookingId = booking._id;
+            // Also update invoice request with booking_id for future reference
+            invoiceRequest.booking_id = bookingId;
+            await invoiceRequest.save();
+          }
+        }
+        
+        if (bookingId) {
+          const Booking = mongoose.model('Booking');
+          // Update booking's shipment_status_history
+          const booking = await Booking.findById(bookingId);
+          if (booking) {
+            const newStatusEntry = {
+              status: 'Shipment Processing',
+              updated_at: new Date(),
+              updated_by: 'System',
+              notes: `Invoice request status changed to ${updateData.status}`
+            };
+            
+            if (Array.isArray(booking.shipment_status_history)) {
+              booking.shipment_status_history.push(newStatusEntry);
+            } else {
+              // Convert to array format
+              booking.shipment_status_history = [newStatusEntry];
+            }
+            
+            await booking.save();
+            console.log(`✅ Updated booking ${bookingId} shipment_status_history to "Shipment Processing" (invoice request status: ${updateData.status})`);
+          }
+        } else {
+          console.warn(`⚠️ Could not find booking_id for invoice request ${invoiceRequest._id} - skipping shipment_status_history update`);
+        }
+      } catch (bookingUpdateError) {
+        // Log error but don't fail the invoice request update
+        console.error('Error updating booking shipment_status_history:', bookingUpdateError);
+      }
+    }
+
+    // Sync status to EMPOST if status or delivery_status changed
     const deliveryStatusChanged = updateData.delivery_status && updateData.delivery_status !== oldDeliveryStatus;
     
     if (statusChanged || deliveryStatusChanged) {
@@ -1286,6 +1343,63 @@ router.put('/:id/status', async (req, res) => {
     }
 
     await invoiceRequest.save();
+
+    // Auto-update booking's shipment_status_history when invoice request status changes
+    // Statuses that trigger shipment_status_history update
+    const statusesToUpdate = ['SUBMITTED', 'IN_PROGRESS', 'VERIFIED', 'COMPLETED'];
+    if (status && statusesToUpdate.includes(status) && status !== oldStatus) {
+      try {
+        // Get booking_id from invoice request
+        let bookingId = null;
+        if (invoiceRequest.booking_id) {
+          bookingId = typeof invoiceRequest.booking_id === 'object' 
+            ? invoiceRequest.booking_id._id || invoiceRequest.booking_id 
+            : invoiceRequest.booking_id;
+        }
+        
+        // If booking_id not found, try to find booking by converted_to_invoice_request_id
+        if (!bookingId) {
+          const Booking = mongoose.model('Booking');
+          const booking = await Booking.findOne({ converted_to_invoice_request_id: invoiceRequest._id });
+          if (booking) {
+            bookingId = booking._id;
+            // Also update invoice request with booking_id for future reference
+            invoiceRequest.booking_id = bookingId;
+            await invoiceRequest.save();
+          }
+        }
+        
+        if (bookingId) {
+          const Booking = mongoose.model('Booking');
+          // Update booking's shipment_status_history
+          // If shipment_status_history is an array, add new entry; otherwise, set as string
+          const booking = await Booking.findById(bookingId);
+          if (booking) {
+            const newStatusEntry = {
+              status: 'Shipment Processing',
+              updated_at: new Date(),
+              updated_by: 'System',
+              notes: `Invoice request status changed to ${status}`
+            };
+            
+            if (Array.isArray(booking.shipment_status_history)) {
+              booking.shipment_status_history.push(newStatusEntry);
+            } else {
+              // Convert to array format
+              booking.shipment_status_history = [newStatusEntry];
+            }
+            
+            await booking.save();
+            console.log(`✅ Updated booking ${bookingId} shipment_status_history to "Shipment Processing" (invoice request status: ${status})`);
+          }
+        } else {
+          console.warn(`⚠️ Could not find booking_id for invoice request ${invoiceRequest._id} - skipping shipment_status_history update`);
+        }
+      } catch (bookingUpdateError) {
+        // Log error but don't fail the invoice request update
+        console.error('Error updating booking shipment_status_history:', bookingUpdateError);
+      }
+    }
 
     // Sync status to EMPOST if status or delivery_status changed
     if ((status && status !== oldStatus) || (delivery_status && delivery_status !== oldDeliveryStatus)) {
@@ -2381,6 +2495,205 @@ router.get('/:id/details', async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to fetch invoice request details',
+      details: error.message
+    });
+  }
+});
+
+// POST /api/invoice-requests/:id/cancel - Cancel invoice request and delete from all collections
+router.post('/:id/cancel', async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
+  try {
+    const { id } = req.params;
+    const { cancellation_reason } = req.body;
+    
+    // Get user information from request (assuming auth middleware sets req.user)
+    const user = req.user || {};
+    const employeeId = user.employee_id || user._id || user.id;
+    const employeeName = user.full_name || user.name || 'System';
+    const department = user.department?.name || user.department || 'Unknown';
+    
+    // 1. Find the invoice request
+    const invoiceRequest = await InvoiceRequest.findById(id)
+      .populate('booking_id')
+      .populate('request_id')
+      .populate('created_by_employee_id', 'full_name email')
+      .session(session);
+    
+    if (!invoiceRequest) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({
+        success: false,
+        error: 'Invoice request not found'
+      });
+    }
+    
+    // 2. Check if already cancelled
+    if (invoiceRequest.status === 'CANCELLED') {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(400).json({
+        success: false,
+        error: 'Invoice request is already cancelled'
+      });
+    }
+    
+    // 3. Find related delivery assignments
+    const deliveryAssignments = await DeliveryAssignment.find({
+      $or: [
+        { invoice_id: id },
+        { request_id: id }
+      ]
+    }).session(session);
+    
+    // 4. Find related invoice if exists
+    const invoice = await Invoice.findOne({
+      $or: [
+        { request_id: id },
+        { invoice_request_id: id }
+      ]
+    }).session(session);
+    
+    // 5. Get employee information if available
+    let employeeInfo = {
+      employee_id: employeeId,
+      employee_name: employeeName,
+      department: department
+    };
+    
+    if (employeeId) {
+      try {
+        const employee = await Employee.findById(employeeId).session(session);
+        if (employee) {
+          employeeInfo.employee_name = employee.full_name || employee.name || employeeName;
+          // Try to get department from employee
+          if (employee.department_id) {
+            const dept = await Department.findById(employee.department_id).session(session);
+            if (dept) {
+              employeeInfo.department = dept.name;
+            }
+          }
+        }
+      } catch (empError) {
+        console.warn('Could not fetch employee info:', empError.message);
+      }
+    }
+    
+    // 6. Create audit entry BEFORE deletion (CRITICAL)
+    const auditEntry = await AuditReport.create([{
+      report_type: 'invoice_request_cancellation',
+      invoice_request_id: invoiceRequest._id,
+      invoice_request_data: {
+        ...invoiceRequest.toObject(),
+        status: 'CANCELLED'  // Mark as cancelled in audit
+      },
+      related_invoice_data: invoice ? {
+        ...invoice.toObject(),
+        cancellation_note: 'Invoice deleted due to invoice request cancellation'
+      } : null,
+      related_delivery_assignments: deliveryAssignments.map(a => ({
+        assignment_id: a.assignment_id || a._id.toString(),
+        data: {
+          ...a.toObject(),
+          cancellation_note: 'Delivery assignment deleted due to invoice request cancellation'
+        }
+      })),
+      cancellation_reason: cancellation_reason || 'User requested cancellation',
+      cancelled_by: employeeInfo,
+      cancelled_at: new Date(),
+      preserved_for_audit: true,
+      created_at: new Date()
+    }], { session });
+    
+    if (!auditEntry || auditEntry.length === 0) {
+      throw new Error('Failed to create audit entry');
+    }
+    
+    console.log(`✅ Audit entry created for invoice request cancellation: ${auditEntry[0]._id}`);
+    
+    // 7. Delete from delivery assignments
+    let deliveryDeleteResult = { deletedCount: 0 };
+    if (deliveryAssignments.length > 0) {
+      const deliveryIds = deliveryAssignments.map(a => a._id);
+      deliveryDeleteResult = await DeliveryAssignment.deleteMany({
+        _id: { $in: deliveryIds }
+      }).session(session);
+      console.log(`✅ Deleted ${deliveryDeleteResult.deletedCount} delivery assignment(s)`);
+    }
+    
+    // 8. Delete invoice if exists
+    let invoiceDeleted = false;
+    if (invoice) {
+      await Invoice.findByIdAndDelete(invoice._id).session(session);
+      invoiceDeleted = true;
+      console.log(`✅ Deleted invoice: ${invoice._id}`);
+    }
+    
+    // 9. Delete invoice request
+    await InvoiceRequest.findByIdAndDelete(id).session(session);
+    console.log(`✅ Deleted invoice request: ${id}`);
+    
+    // 10. Update booking's shipment_status_history if booking exists
+    if (invoiceRequest.booking_id) {
+      const bookingId = typeof invoiceRequest.booking_id === 'object' 
+        ? invoiceRequest.booking_id._id 
+        : invoiceRequest.booking_id;
+      
+      if (bookingId) {
+        const booking = await Booking.findById(bookingId).session(session);
+        if (booking) {
+          const newStatusEntry = {
+            status: 'Cancelled',
+            updated_at: new Date(),
+            updated_by: employeeInfo.employee_name || 'System',
+            notes: `Invoice request cancelled: ${cancellation_reason || 'User requested cancellation'}`
+          };
+          
+          if (Array.isArray(booking.shipment_status_history)) {
+            booking.shipment_status_history.push(newStatusEntry);
+          } else {
+            booking.shipment_status_history = [newStatusEntry];
+          }
+          
+          await booking.save({ session });
+          console.log(`✅ Updated booking ${bookingId} shipment_status_history to "Cancelled"`);
+        }
+      }
+    }
+    
+    // 11. Commit transaction
+    await session.commitTransaction();
+    session.endSession();
+    
+    console.log(`✅ Invoice request ${id} cancelled successfully. Audit entry: ${auditEntry[0]._id}`);
+    
+    return res.json({
+      success: true,
+      data: {
+        invoice_request_id: invoiceRequest._id,
+        deleted_from: {
+          delivery_assignments: deliveryDeleteResult.deletedCount > 0,
+          invoice_requests: true,
+          invoices: invoiceDeleted
+        },
+        preserved_in_audit: true,
+        audit_entry_id: auditEntry[0]._id,
+        cancelled_at: new Date()
+      }
+    });
+    
+  } catch (error) {
+    // Abort transaction on error
+    await session.abortTransaction();
+    session.endSession();
+    
+    console.error('❌ Error cancelling invoice request:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Internal server error during cancellation',
       details: error.message
     });
   }

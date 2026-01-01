@@ -1,6 +1,8 @@
 const express = require('express');
-const jwt = require('jsonwebtoken');
-const { PriceBracket, User } = require('../models/unified-schema');
+const mongoose = require('mongoose');
+const { PriceBracket } = require('../models/unified-schema');
+const { Department, Employee } = require('../models');
+const auth = require('../middleware/auth');
 
 const router = express.Router();
 
@@ -37,10 +39,21 @@ const getDefaultBrackets = (route) => {
   return [];
 };
 
+// Helper function to generate label from min/max
+function generateLabel(min, max) {
+  if (max === null) {
+    if (min === 0) {
+      return 'SPECIAL RATE';
+    }
+    return `${min}+ KG`;
+  }
+  return `${min}-${max} KG`;
+}
+
 // Validate brackets
 const validateBrackets = (brackets) => {
   if (!Array.isArray(brackets) || brackets.length === 0) {
-    return { valid: false, error: 'Brackets must be a non-empty array' };
+    return { valid: false, error: 'Brackets array is required and must not be empty' };
   }
 
   // Check each bracket
@@ -49,77 +62,85 @@ const validateBrackets = (brackets) => {
     
     // Check required fields
     if (typeof bracket.min !== 'number' || bracket.min < 0) {
-      return { valid: false, error: `brackets[${i}].min must be a number >= 0` };
+      return { valid: false, error: `Invalid min weight: ${bracket.min}. Must be a number >= 0` };
     }
     
-    if (bracket.max !== null && (typeof bracket.max !== 'number' || bracket.max <= bracket.min)) {
-      return { valid: false, error: `brackets[${i}].max must be null or a number greater than min` };
+    if (bracket.max !== null && bracket.max !== undefined && (typeof bracket.max !== 'number' || bracket.max <= bracket.min)) {
+      return { valid: false, error: `Invalid max weight: ${bracket.max}. Must be null or a number > min` };
     }
     
     if (typeof bracket.rate !== 'number' || bracket.rate < 0) {
-      return { valid: false, error: `brackets[${i}].rate must be a number >= 0` };
+      return { valid: false, error: `Invalid rate: ${bracket.rate}. Must be a number >= 0` };
     }
     
-    if (!bracket.label || typeof bracket.label !== 'string' || bracket.label.trim() === '') {
-      return { valid: false, error: `brackets[${i}].label must be a non-empty string` };
+    // Label is optional - will be auto-generated if not provided
+    if (bracket.label !== undefined && bracket.label !== null && typeof bracket.label !== 'string') {
+      return { valid: false, error: 'Label must be a string' };
     }
   }
 
-  // Check for at least one bracket with max: null (unlimited upper bound)
-  const hasUnlimitedBracket = brackets.some(b => b.max === null);
-  if (!hasUnlimitedBracket) {
-    return { valid: false, error: 'At least one bracket must have max: null (unlimited upper bound)' };
+  // Check for overlapping brackets (excluding special rate brackets with min: 0)
+  const sortedBrackets = [...brackets]
+    .filter(b => b.min !== 0 || b.max !== null) // Exclude special rate brackets from overlap check
+    .sort((a, b) => a.min - b.min);
+  
+  for (let i = 0; i < sortedBrackets.length - 1; i++) {
+    const current = sortedBrackets[i];
+    const next = sortedBrackets[i + 1];
+    
+    // If current bracket has a max, it should not overlap with next bracket
+    if (current.max !== null && current.max >= next.min) {
+      return { 
+        valid: false, 
+        error: `Bracket overlap detected: ${current.label || generateLabel(current.min, current.max)} overlaps with ${next.label || generateLabel(next.min, next.max)}` 
+      };
+    }
   }
-
-  // Check for overlapping brackets (simplified - just warn, don't block)
-  // In practice, brackets might overlap intentionally (e.g., special rates)
-  // So we'll allow overlaps but log a warning
 
   return { valid: true };
 };
 
-// Middleware to authenticate and check Finance department
-const requireFinanceAuth = async (req, res, next) => {
+// Middleware to authorize Finance department
+const authorizeFinance = async (req, res, next) => {
   try {
-    const token = req.headers.authorization?.replace('Bearer ', '');
-    
-    if (!token) {
-      return res.status(401).json({
-        success: false,
-        error: 'Authentication required'
+    if (!req.user) {
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Unauthorized' 
       });
     }
-
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.userId).populate('department_id');
     
-    if (!user || !user.isActive) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid or inactive user'
-      });
+    // Get department name from req.user.department
+    let departmentName = null;
+    if (req.user.department) {
+      if (typeof req.user.department === 'object' && req.user.department.name) {
+        departmentName = req.user.department.name;
+      } else if (typeof req.user.department === 'string') {
+        // If it's an ID, fetch the department
+        const dept = await Department.findById(req.user.department);
+        departmentName = dept?.name;
+      }
     }
-
-    // Check if user is in Finance department
-    if (!user.department_id || user.department_id.name !== 'Finance') {
+    
+    if (departmentName !== 'Finance') {
       return res.status(403).json({
         success: false,
-        error: 'Access denied. Finance department only.'
+        error: 'Forbidden: Only Finance department can update price brackets'
       });
     }
-
-    req.user = user;
+    
     next();
   } catch (error) {
-    return res.status(401).json({
+    console.error('Error in authorizeFinance middleware:', error);
+    return res.status(500).json({
       success: false,
-      error: 'Invalid authentication token'
+      error: 'Internal server error during authorization'
     });
   }
 };
 
 // GET /api/price-brackets/:route
-router.get('/:route', async (req, res) => {
+router.get('/:route', auth, async (req, res) => {
   try {
     const route = req.params.route.toUpperCase();
     
@@ -142,32 +163,44 @@ router.get('/:route', async (req, res) => {
       res.set('Pragma', 'no-cache');
       res.set('Expires', '0');
       
+      // Return in array format (frontend expects array)
       return res.json({
         success: true,
-        data: {
-          route,
-          brackets: defaultBrackets,
-          updated_at: null,
-          is_default: true
-        }
+        data: defaultBrackets.map(bracket => ({
+          _id: null,
+          min: bracket.min,
+          max: bracket.max,
+          rate: bracket.rate,
+          label: bracket.label,
+          route: route,
+          created_at: null,
+          updated_at: null
+        }))
       });
     }
 
+    // Sort brackets by min weight ascending
+    const sortedBrackets = [...priceBracket.brackets].sort((a, b) => a.min - b.min);
+    
     // Return brackets from database
     // Set cache headers to ensure real-time updates (very short TTL or no cache)
     res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
     res.set('Pragma', 'no-cache');
     res.set('Expires', '0');
     
+    // Return in the format expected by frontend (array of brackets)
     res.json({
       success: true,
-      data: {
+      data: sortedBrackets.map(bracket => ({
+        _id: bracket._id || null,
+        min: bracket.min,
+        max: bracket.max,
+        rate: bracket.rate,
+        label: bracket.label,
         route: priceBracket.route,
-        brackets: priceBracket.brackets,
-        updated_at: priceBracket.updated_at || priceBracket.updatedAt,
-        updated_by: priceBracket.updated_by,
-        is_default: false
-      }
+        created_at: priceBracket.createdAt,
+        updated_at: priceBracket.updated_at || priceBracket.updatedAt
+      }))
     });
   } catch (error) {
     console.error('Error fetching price brackets:', error);
@@ -179,12 +212,17 @@ router.get('/:route', async (req, res) => {
 });
 
 // PUT /api/price-brackets/:route
-router.put('/:route', requireFinanceAuth, async (req, res) => {
+router.put('/:route', auth, authorizeFinance, async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
   try {
     const route = req.params.route.toUpperCase();
     
     // Validate route
     if (route !== 'PH_TO_UAE' && route !== 'UAE_TO_PH') {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({
         success: false,
         error: 'Invalid route. Must be PH_TO_UAE or UAE_TO_PH'
@@ -193,44 +231,97 @@ router.put('/:route', requireFinanceAuth, async (req, res) => {
 
     const { brackets } = req.body;
 
+    // Validate brackets array
+    if (!Array.isArray(brackets) || brackets.length === 0) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(400).json({
+        success: false,
+        error: 'Brackets array is required and must not be empty'
+      });
+    }
+
     // Validate brackets
     const validation = validateBrackets(brackets);
     if (!validation.valid) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({
         success: false,
         error: `Validation failed: ${validation.error}`
       });
     }
 
+    // Prepare brackets with auto-generated labels if needed
+    const bracketsToSave = brackets.map(bracket => ({
+      min: bracket.min,
+      max: bracket.max === '' || bracket.max === undefined ? null : bracket.max,
+      rate: bracket.rate,
+      label: bracket.label || generateLabel(bracket.min, bracket.max)
+    }));
+
+    // Find existing price bracket to get old brackets count
+    const existingPriceBracket = await PriceBracket.findOne({ route }).session(session);
+    const deletedCount = existingPriceBracket ? existingPriceBracket.brackets.length : 0;
+    
     // Find or create price bracket
-    let priceBracket = await PriceBracket.findOne({ route });
+    let priceBracket = existingPriceBracket;
     
     if (!priceBracket) {
       // Create new price bracket
       priceBracket = new PriceBracket({
         route,
-        brackets,
-        updated_by: req.user._id
+        brackets: bracketsToSave,
+        updated_by: req.user.id || req.user._id
       });
     } else {
-      // Update existing price bracket
-      priceBracket.brackets = brackets;
+      // Update existing price bracket - replace all brackets
+      priceBracket.brackets = bracketsToSave;
       priceBracket.updated_at = new Date();
-      priceBracket.updated_by = req.user._id;
+      priceBracket.updated_by = req.user.id || req.user._id;
     }
 
-    await priceBracket.save();
+    // CRITICAL: Save to database immediately within transaction
+    await priceBracket.save({ session });
+    
+    // CRITICAL: Commit transaction to ensure data is persisted to database IMMEDIATELY
+    await session.commitTransaction();
+    session.endSession();
+    
+    // CRITICAL: Verify the save by reading back from database
+    // This ensures we return exactly what was saved and confirms database persistence
+    const verifiedPriceBracket = await PriceBracket.findOne({ route });
+    
+    if (!verifiedPriceBracket) {
+      throw new Error('Failed to verify price bracket save - document not found after save');
+    }
+    
+    // Sort brackets by min weight ascending
+    const sortedBrackets = [...verifiedPriceBracket.brackets].sort((a, b) => a.min - b.min);
 
     res.json({
       success: true,
       data: {
-        route: priceBracket.route,
-        brackets: priceBracket.brackets,
-        updated_at: priceBracket.updated_at || priceBracket.updatedAt,
-        updated_by: priceBracket.updated_by
+        route: verifiedPriceBracket.route,
+        brackets: sortedBrackets.map(bracket => ({
+          _id: bracket._id?.toString() || null,
+          min: bracket.min,
+          max: bracket.max,
+          rate: bracket.rate,
+          label: bracket.label,
+          route: verifiedPriceBracket.route,
+          created_at: verifiedPriceBracket.createdAt,
+          updated_at: verifiedPriceBracket.updated_at || verifiedPriceBracket.updatedAt
+        })),
+        deleted_count: deletedCount,
+        inserted_count: sortedBrackets.length,
+        message: 'Price brackets updated successfully in database'
       }
     });
   } catch (error) {
+    await session.abortTransaction();
+    session.endSession();
+    
     console.error('Error updating price brackets:', error);
     
     // Handle validation errors
@@ -243,7 +334,7 @@ router.put('/:route', requireFinanceAuth, async (req, res) => {
 
     res.status(500).json({
       success: false,
-      error: 'Failed to update price brackets'
+      error: 'Internal server error while updating brackets'
     });
   }
 });
