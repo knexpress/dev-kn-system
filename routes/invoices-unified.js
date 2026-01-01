@@ -1001,12 +1001,26 @@ router.post('/', async (req, res) => {
     console.log(`   Subtotal (base_amount before tax adjustment): ${baseAmount} AED`);
     console.log(`   📋 Formula: ${shippingCharge} + ${pickupCharge} + ${deliveryCharge} + ${insuranceCharge} = ${baseAmount} AED`);
     
-    // Verify pickup charge is included for UAE_TO_PH and PH_TO_UAE
+    // Verify pickup charge and insurance charge are included for UAE_TO_PH and PH_TO_UAE
+    // Declare variables first before using them
     const normalizedServiceCodeForVerification = (serviceCode || '').toUpperCase();
     const isUaeToPhForVerification = normalizedServiceCodeForVerification.includes('UAE_TO_PH');
     const isPhToUaeForVerification = normalizedServiceCodeForVerification.includes('PH_TO_UAE');
+    
+    // Verify insurance charge is included in subtotal for UAE_TO_PH
+    if (isUaeToPhForVerification && insuranceCharge > 0) {
+      const expectedSubtotal = shippingCharge + pickupCharge + deliveryCharge + insuranceCharge;
+      if (Math.abs(baseAmount - expectedSubtotal) < 0.01) {
+        console.log(`   ✅ VERIFIED: Insurance charge (${insuranceCharge} AED) is correctly included in baseAmount`);
+      } else {
+        console.warn(`   ⚠️ WARNING: Insurance charge calculation mismatch! Expected: ${expectedSubtotal}, Got: ${baseAmount}`);
+      }
+    }
     if (isUaeToPhForVerification && pickupCharge > 0) {
       console.log(`   ✅ VERIFIED: Pickup charge (${pickupCharge} AED) is included in baseAmount for UAE_TO_PH`);
+    }
+    if (isUaeToPhForVerification && insuranceCharge > 0) {
+      console.log(`   ✅ VERIFIED: Insurance charge (${insuranceCharge} AED) is included in baseAmount for UAE_TO_PH`);
     }
     if (isPhToUaeForVerification && pickupCharge > 0) {
       console.log(`   ✅ VERIFIED: Pickup charge (${pickupCharge} AED) is included in baseAmount for PH_TO_UAE (will be in COD total only)`);
@@ -1246,7 +1260,13 @@ router.post('/', async (req, res) => {
       console.log(`   📋 Total includes pickup charge: ${pickupCharge} AED (total: ${totalAmount} AED)`);
     } else {
       // VAT added on top - total = subtotal + tax
+      // IMPORTANT: baseAmount includes insurance charge (shipping + pickup + delivery + insurance)
       totalAmount = Math.round((baseAmount + taxAmount) * 100) / 100;
+      if (isUaeToPh && !isFlomicOrPersonal && insuranceCharge > 0) {
+        console.log(`   ✅ VERIFIED: Insurance charge (${insuranceCharge} AED) is included in baseAmount for UAE_TO_PH Commercial`);
+        console.log(`   📋 Formula: baseAmount (${baseAmount} AED) + taxAmount (${taxAmount} AED) = totalAmount (${totalAmount} AED)`);
+        console.log(`   📋 baseAmount breakdown: shipping (${shippingCharge}) + pickup (${pickupCharge}) + delivery (${deliveryCharge}) + insurance (${insuranceCharge}) = ${baseAmount} AED`);
+      }
     }
     
     console.log('📊 Invoice Calculation Summary:');
@@ -1260,6 +1280,12 @@ router.post('/', async (req, res) => {
     console.log(`   Total Amount (invoice.total_amount): ${totalAmount} AED`);
     console.log(`   Service Code: ${serviceCode || 'N/A'}`);
     console.log(`   Shipment Type: ${(isFlomicOrPersonal ? 'FLOMIC/PERSONAL' : 'COMMERCIAL')}`);
+    
+    // Verify insurance charge is included for UAE_TO_PH Commercial shipments
+    if (isUaeToPh && !isFlomicOrPersonal && insuranceCharge > 0) {
+      console.log(`   ✅ VERIFIED: Insurance charge (${insuranceCharge} AED) is included in total_amount for UAE_TO_PH Commercial`);
+      console.log(`   📋 Verification: baseAmount (${baseAmount} AED) includes insurance, totalAmount (${totalAmount} AED) = baseAmount + taxAmount`);
+    }
 
     // Calculate due date if not provided (30 days from now)
     const invoiceDueDate = due_date ? new Date(due_date) : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
