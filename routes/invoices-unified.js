@@ -2258,12 +2258,18 @@ router.put('/:id', async (req, res) => {
         console.warn('Could not check Flomic/Personal status for update:', err.message);
       }
       
+      // Get tax_rate early (needed for calculations below)
+      const taxRate = updateData.tax_rate !== undefined ? updateData.tax_rate : invoice.tax_rate;
+      
       // Get base_amount (subtotal) - handle both Decimal128 and number types
       let baseAmountValue = 0;
+      let subtotalForUpdate = 0; // Will be calculated based on baseAmountValue
       if (updateData.base_amount !== undefined) {
         baseAmountValue = typeof updateData.base_amount === 'object' && updateData.base_amount.toString 
           ? parseFloat(updateData.base_amount.toString()) 
           : parseFloat(updateData.base_amount);
+        // Initialize subtotalForUpdate with baseAmountValue (will be recalculated later if needed)
+        subtotalForUpdate = baseAmountValue;
       } else {
         // Recalculate base_amount from individual charges if not provided
         const shippingCharge = updateData.amount !== undefined
@@ -2282,6 +2288,15 @@ router.put('/:id', async (req, res) => {
         
         baseAmountValue = shippingCharge + pickupCharge + deliveryCharge + insuranceCharge;
         baseAmountValue = Math.round(baseAmountValue * 100) / 100;
+        
+        // Calculate subtotalForUpdate if needed (for UAE_TO_PH Flomic/Personal with tax)
+        subtotalForUpdate = baseAmountValue; // Default: use baseAmountValue as subtotal
+        if (isUaeToPh && isFlomicOrPersonal && taxRate > 0) {
+          // Base amount already includes tax, so we extract it:
+          // a = baseAmount / 1.05 (subtotal without tax) - stored as base_amount
+          subtotalForUpdate = baseAmountValue / 1.05;
+        }
+        
         // Use subtotalForUpdate if it was calculated, otherwise use baseAmountValue
         const baseAmountToStore = (isUaeToPh && isFlomicOrPersonal && taxRate > 0) ? subtotalForUpdate : baseAmountValue;
         updateData.base_amount = mongoose.Types.Decimal128.fromString(baseAmountToStore.toFixed(2));
@@ -2291,8 +2306,6 @@ router.put('/:id', async (req, res) => {
       if (baseAmountValue === 0) {
         baseAmountValue = invoice.base_amount ? parseFloat(invoice.base_amount.toString()) : 0;
       }
-      
-      const taxRate = updateData.tax_rate !== undefined ? updateData.tax_rate : invoice.tax_rate;
       
       // Calculate tax based on rules (same as creation)
       // For simplicity in updates, if tax_rate is 5%, calculate on base_amount
@@ -2330,7 +2343,7 @@ router.put('/:id', async (req, res) => {
         
         // For UAE_TO_PH Flomic/Personal: baseAmount already includes tax, need to extract subtotal
         // Note: isFlomicOrPersonal is already defined above
-        let subtotalForUpdate = baseAmountValue; // Default: use baseAmountValue as subtotal
+        subtotalForUpdate = baseAmountValue; // Default: use baseAmountValue as subtotal
         if (isUaeToPh && isFlomicOrPersonal) {
           // Rule 1: Flomic/Personal UAE_TO_PH - 5% VAT calculation
           // Base amount already includes tax, so we extract it:
