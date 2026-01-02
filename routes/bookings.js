@@ -1350,57 +1350,307 @@ router.put('/:id/shipment-status', auth, async (req, res) => {
   }
 });
 
+/**
+ * Helper function to ensure image URLs are full URLs (not relative paths)
+ * Converts relative paths to full URLs if needed, or returns base64/data URLs as-is
+ */
+function ensureFullImageUrl(imageValue) {
+  if (!imageValue || typeof imageValue !== 'string') {
+    return imageValue;
+  }
+  
+  // If already a base64 data URL or full HTTP/HTTPS URL, return as-is
+  if (imageValue.startsWith('data:') || 
+      imageValue.startsWith('http://') || 
+      imageValue.startsWith('https://')) {
+    return imageValue;
+  }
+  
+  // If it's a Google Drive file ID, construct a view URL
+  // Note: This assumes Google Drive file IDs are used. Adjust based on your storage system.
+  if (imageValue.length > 20 && !imageValue.includes('/') && !imageValue.includes('\\')) {
+    // Might be a Google Drive file ID - construct view URL
+    // You may need to adjust this based on your Google Drive setup
+    return `https://drive.google.com/file/d/${imageValue}/view`;
+  }
+  
+  // If it's a relative path, construct full URL (adjust base URL as needed)
+  const baseUrl = process.env.BACKEND_URL || process.env.API_URL || 'http://localhost:5000';
+  if (imageValue.startsWith('/')) {
+    return `${baseUrl}${imageValue}`;
+  }
+  
+  // Return as-is if we can't determine the format
+  return imageValue;
+}
+
+/**
+ * Transform identity documents to ensure all images are full URLs or base64
+ */
+function transformIdentityDocuments(identityDocs) {
+  if (!identityDocs || typeof identityDocs !== 'object') {
+    return identityDocs || {};
+  }
+  
+  const transformed = { ...identityDocs };
+  
+  // List of image fields that might need transformation
+  const imageFields = [
+    'eidFrontImage', 'eidBackImage',
+    'philippinesIdFront', 'philippinesIdBack',
+    'philippines_id_front', 'philippines_id_back',
+    'id_front_image', 'idBackImage', 'idFrontImage',
+    'customerImage', 'face_scan_image', 'faceScanImage'
+  ];
+  
+  // Transform each image field
+  imageFields.forEach(field => {
+    if (transformed[field]) {
+      transformed[field] = ensureFullImageUrl(transformed[field]);
+    }
+  });
+  
+  // Handle customerImages array
+  if (Array.isArray(transformed.customerImages)) {
+    transformed.customerImages = transformed.customerImages.map(img => ensureFullImageUrl(img));
+  }
+  
+  return transformed;
+}
+
+/**
+ * Merge data from multiple sources with priority order
+ * Priority: InvoiceRequest > booking_snapshot > booking_data > populated booking
+ */
+function mergeBookingData(invoiceRequest, booking = null) {
+  // Start with InvoiceRequest base data
+  const merged = invoiceRequest ? invoiceRequest.toObject ? invoiceRequest.toObject() : { ...invoiceRequest } : {};
+  
+  // Get booking from populated reference or separate query
+  const bookingData = booking ? (booking.toObject ? booking.toObject() : { ...booking }) : null;
+  
+  // Merge booking_snapshot (highest priority for complete booking data)
+  if (merged.booking_snapshot && typeof merged.booking_snapshot === 'object') {
+    Object.assign(merged, merged.booking_snapshot);
+  }
+  
+  // Merge booking_data (second priority)
+  if (merged.booking_data && typeof merged.booking_data === 'object') {
+    Object.assign(merged, merged.booking_data);
+  }
+  
+  // Merge populated booking (third priority)
+  if (bookingData) {
+    // Only merge fields that don't already exist in merged data
+    Object.keys(bookingData).forEach(key => {
+      if (merged[key] === undefined || merged[key] === null) {
+        merged[key] = bookingData[key];
+      }
+    });
+  }
+  
+  // Ensure identityDocuments is properly structured (PRIMARY SOURCE)
+  if (invoiceRequest && invoiceRequest.identityDocuments) {
+    merged.identityDocuments = transformIdentityDocuments(invoiceRequest.identityDocuments);
+  } else if (bookingData && bookingData.identityDocuments) {
+    merged.identityDocuments = transformIdentityDocuments(bookingData.identityDocuments);
+  } else {
+    merged.identityDocuments = merged.identityDocuments || {};
+  }
+  
+  // Ensure customerImage and customerImages are included
+  if (invoiceRequest && invoiceRequest.customerImage) {
+    merged.customerImage = ensureFullImageUrl(invoiceRequest.customerImage);
+  }
+  if (invoiceRequest && Array.isArray(invoiceRequest.customerImages)) {
+    merged.customerImages = invoiceRequest.customerImages.map(img => ensureFullImageUrl(img));
+  }
+  
+  // Ensure service code is available (check multiple locations)
+  merged.service = merged.service || 
+                   merged.service_code || 
+                   invoiceRequest?.service_code || 
+                   invoiceRequest?.verification?.service_code ||
+                   bookingData?.service || 
+                   bookingData?.service_code || 
+                   null;
+  merged.service_code = merged.service_code || merged.service;
+  
+  // Ensure AWB number is available (check multiple locations)
+  merged.awb = merged.awb || 
+               merged.awb_number || 
+               merged.awbNumber ||
+               invoiceRequest?.tracking_code ||
+               bookingData?.awb || 
+               bookingData?.awb_number || 
+               bookingData?.awbNumber || 
+               null;
+  merged.awb_number = merged.awb_number || merged.awb || merged.awbNumber;
+  merged.awbNumber = merged.awbNumber || merged.awb || merged.awb_number;
+  
+  // Ensure sender data structure
+  if (!merged.sender && (merged.customer_name || merged.sender_name)) {
+    merged.sender = {
+      fullName: merged.sender?.fullName || merged.customer_name || merged.sender_name || merged.name,
+      name: merged.sender?.name || merged.customer_name || merged.sender_name || merged.name,
+      completeAddress: merged.sender?.completeAddress || merged.sender_address || merged.senderAddress || merged.origin_place || merged.origin,
+      address: merged.sender?.address || merged.sender_address || merged.senderAddress || merged.origin_place || merged.origin,
+      contactNo: merged.sender?.contactNo || merged.customer_phone || merged.sender_phone || merged.phone,
+      phone: merged.sender?.phone || merged.customer_phone || merged.sender_phone || merged.phone,
+      phoneNumber: merged.sender?.phoneNumber || merged.customer_phone || merged.sender_phone || merged.phone,
+      emailAddress: merged.sender?.emailAddress || merged.customer_email || merged.sender_email || merged.email,
+      email: merged.sender?.email || merged.customer_email || merged.sender_email || merged.email,
+      agentName: merged.sender?.agentName || merged.agentName || merged.sales_agent_name || merged.agent?.name || merged.agent?.full_name || merged.created_by_employee?.full_name,
+      deliveryOption: merged.sender?.deliveryOption || merged.sender_delivery_option,
+      insured: merged.sender?.insured !== undefined ? merged.sender.insured : (merged.insured || false),
+      declaredAmount: merged.sender?.declaredAmount || merged.sender?.declared_amount || merged.declaredAmount || merged.declared_amount
+    };
+  }
+  
+  // Ensure receiver data structure
+  if (!merged.receiver && (merged.receiver_name || merged.receiverName)) {
+    merged.receiver = {
+      fullName: merged.receiver?.fullName || merged.receiver_name || merged.receiverName,
+      name: merged.receiver?.name || merged.receiver_name || merged.receiverName,
+      completeAddress: merged.receiver?.completeAddress || merged.receiver_address || merged.receiverAddress || merged.destination_place || merged.destination,
+      address: merged.receiver?.address || merged.receiver_address || merged.receiverAddress || merged.destination_place || merged.destination,
+      contactNo: merged.receiver?.contactNo || merged.receiver_phone || merged.receiverPhone,
+      phone: merged.receiver?.phone || merged.receiver_phone || merged.receiverPhone,
+      phoneNumber: merged.receiver?.phoneNumber || merged.receiver_phone || merged.receiverPhone,
+      emailAddress: merged.receiver?.emailAddress || merged.receiver_email || merged.receiverEmail,
+      email: merged.receiver?.email || merged.receiver_email || merged.receiverEmail,
+      deliveryOption: merged.receiver?.deliveryOption || merged.receiver_delivery_option,
+      numberOfBoxes: merged.receiver?.numberOfBoxes || merged.number_of_boxes || merged.numberOfBoxes || invoiceRequest?.verification?.number_of_boxes
+    };
+  }
+  
+  // Ensure items array is available
+  if (!merged.items && !merged.orderItems && !merged.listedItems) {
+    // Try to extract from verification.boxes if available
+    if (invoiceRequest?.verification?.boxes && Array.isArray(invoiceRequest.verification.boxes)) {
+      merged.items = invoiceRequest.verification.boxes.map((box, index) => ({
+        id: `item_${index + 1}`,
+        _id: `item_${index + 1}`,
+        commodity: box.items || box.commodity || 'N/A',
+        name: box.items || box.commodity || 'N/A',
+        description: box.items || box.commodity || 'N/A',
+        item: box.items || box.commodity || 'N/A',
+        title: box.items || box.commodity || 'N/A',
+        qty: box.quantity || 1,
+        quantity: box.quantity || 1,
+        count: box.quantity || 1
+      }));
+    }
+  }
+  
+  // Add request_id reference if it exists
+  if (invoiceRequest && invoiceRequest._id) {
+    merged.request_id = {
+      _id: invoiceRequest._id,
+      service: invoiceRequest.service_code || merged.service,
+      service_code: invoiceRequest.service_code || merged.service_code,
+      awb: invoiceRequest.tracking_code || merged.awb,
+      awb_number: invoiceRequest.tracking_code || merged.awb_number,
+      sender: {
+        insured: merged.sender?.insured || merged.insured || false,
+        declaredAmount: merged.sender?.declaredAmount || merged.declaredAmount
+      },
+      verification: invoiceRequest.verification || {}
+    };
+  }
+  
+  return merged;
+}
+
 // Get booking by ID for review (includes all identityDocuments images)
+// This endpoint queries InvoiceRequest collection first, then falls back to Booking collection
 // This endpoint must be defined BEFORE /:id to ensure proper route matching
 router.get('/:id/review', auth, validateObjectIdParam('id'), async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Find booking with ALL fields, especially identityDocuments
-    // Do NOT use any projection that excludes fields
-    const booking = await Booking.findById(id).lean();
+    // First, try to find in InvoiceRequest collection (by _id or booking_id)
+    let invoiceRequest = await InvoiceRequest.findById(id)
+      .populate('booking_id')
+      .populate('created_by_employee_id', 'full_name name')
+      .lean();
     
-    if (!booking) {
-      return res.status(404).json({
-        success: false,
-        error: 'Booking not found'
-      });
+    let booking = null;
+    
+    if (invoiceRequest) {
+      // If found by _id, also try to get the booking if booking_id exists
+      if (invoiceRequest.booking_id) {
+        booking = typeof invoiceRequest.booking_id === 'object' 
+          ? invoiceRequest.booking_id 
+          : await Booking.findById(invoiceRequest.booking_id).lean();
+      }
+    } else {
+      // Not found by _id, try to find by booking_id
+      invoiceRequest = await InvoiceRequest.findOne({ booking_id: id })
+        .populate('booking_id')
+        .populate('created_by_employee_id', 'full_name name')
+        .lean();
+      
+      if (invoiceRequest && invoiceRequest.booking_id) {
+        booking = typeof invoiceRequest.booking_id === 'object' 
+          ? invoiceRequest.booking_id 
+          : await Booking.findById(invoiceRequest.booking_id).lean();
+      }
     }
-
-    // Ensure identityDocuments is included and not filtered
-    // The booking should already have identityDocuments from the query
-    // But explicitly verify it exists
-    if (!booking.identityDocuments) {
-      console.warn(`Booking ${id} has no identityDocuments`);
+    
+    // If still not found in InvoiceRequest, fall back to Booking collection
+    if (!invoiceRequest) {
+      booking = await Booking.findById(id).lean();
+      
+      if (!booking) {
+        return res.status(404).json({
+          success: false,
+          error: 'Booking not found'
+        });
+      }
     }
-
-    // Extract OTP from otpVerification object for easy access in manager dashboard
+    
+    // Merge data from all sources
+    const mergedData = mergeBookingData(invoiceRequest, booking);
+    
+    // Extract OTP from otpVerification object for easy access
     const otpInfo = {
-      otp: booking.otpVerification?.otp || booking.otp || null,
-      verified: booking.otpVerification?.verified || booking.verified || false,
-      verifiedAt: booking.otpVerification?.verifiedAt || booking.verifiedAt || null,
-      phoneNumber: booking.otpVerification?.phoneNumber || booking.phoneNumber || null
+      otp: mergedData.otpVerification?.otp || mergedData.otp || null,
+      verified: mergedData.otpVerification?.verified || mergedData.verified || false,
+      verifiedAt: mergedData.otpVerification?.verifiedAt || mergedData.verifiedAt || null,
+      phoneNumber: mergedData.otpVerification?.phoneNumber || mergedData.phoneNumber || null
     };
     
     // Extract agentName from sender object for easy access
-    const agentName = booking.sender?.agentName || booking.agentName || null;
+    const agentName = mergedData.sender?.agentName || 
+                     mergedData.agentName || 
+                     mergedData.sales_agent_name || 
+                     mergedData.agent?.name || 
+                     mergedData.agent?.full_name || 
+                     mergedData.created_by_employee?.full_name ||
+                     mergedData.created_by_employee_id?.full_name ||
+                     null;
     
-    // Format booking with all data including identityDocuments
+    // Format final response with all data
     const formattedBooking = {
-      ...booking,
+      ...mergedData,
       // Include OTP info at top level for easy access
       otpInfo: otpInfo,
       // Include agentName at top level for easy access
       agentName: agentName,
       // Ensure sender object includes agentName
-      sender: booking.sender ? {
-        ...booking.sender,
-        agentName: booking.sender.agentName || null
+      sender: mergedData.sender ? {
+        ...mergedData.sender,
+        agentName: mergedData.sender.agentName || agentName
       } : null,
       // Keep original otpVerification object intact
-      otpVerification: booking.otpVerification || null,
-      // Ensure identityDocuments is explicitly included (should already be there)
-      identityDocuments: booking.identityDocuments || {}
+      otpVerification: mergedData.otpVerification || null,
+      // Ensure identityDocuments is explicitly included (PRIMARY SOURCE)
+      identityDocuments: mergedData.identityDocuments || {},
+      // Also include in collections structure for compatibility
+      collections: {
+        identityDocuments: mergedData.identityDocuments || {}
+      }
     };
 
     // Debug: Log identityDocuments structure for verification
@@ -1419,7 +1669,8 @@ router.get('/:id/review', auth, validateObjectIdParam('id'), async (req, res) =>
     console.error('Error fetching booking for review:', error);
     res.status(500).json({
       success: false,
-      error: 'Failed to fetch booking details'
+      error: 'Failed to fetch booking details',
+      details: error.message
     });
   }
 });
@@ -1735,7 +1986,7 @@ router.post('/:id/review', validateObjectIdParam('id'), async (req, res) => {
         shipmentStatusHistory = booking.shipment_status_history;
       }
     }
-    
+
     // Build invoice request data (same structure as sales person creates)
     const invoiceRequestData = {
       // Auto-generated Invoice & Tracking Information (same as sales)
