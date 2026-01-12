@@ -741,6 +741,14 @@ const invoiceSchema = new mongoose.Schema({
     required: false,
     default: 'N/A',
   },
+  cancelled_at: {
+    type: Date,
+    required: false,
+  },
+  cancellation_reason: {
+    type: String,
+    required: false,
+  },
 }, {
   timestamps: true,
 });

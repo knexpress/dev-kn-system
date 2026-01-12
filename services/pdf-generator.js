@@ -582,50 +582,104 @@ async function generateBookingPDF(data) {
   }
 
   // ============================================
-  // PAGE 4: SELFIE/FACE IMAGES
+  // PAGE 4: ADDITIONAL DOCUMENTS (only if documents exist)
   // ============================================
-  addNewPage();
-  const page4Number = doc.getNumberOfPages();
+  // Check if additional documents exist (only for UAE_TO_PH and PH_TO_UAE)
+  const hasAdditionalDocuments = data.confirmationForm || data.tradeLicense;
+  
+  // Only create additional documents page if at least one document exists
+  if (hasAdditionalDocuments) {
+    addNewPage();
+    const page4Number = doc.getNumberOfPages();
 
-  const page4ImageMargin = 20;
-  const page4ImageSpacing = 15;
-  const page4ImageWidth = (pageWidth - (page4ImageMargin * 2) - page4ImageSpacing) / 2;
-  const page4LeftImageX = page4ImageMargin;
-  const page4RightImageX = page4ImageMargin + page4ImageWidth + page4ImageSpacing;
-  const page4ImageStartY = 40;
-  const page4MaxImageHeight = (pageHeight - page4ImageStartY - margin) * 0.8;
+    // Header
+    doc.setFontSize(12);
+    doc.setFont('helvetica', 'bold');
+    doc.setTextColor(0, 128, 0);
+    doc.text('ADDITIONAL DOCUMENTS', margin, margin + 10);
+    yPos = margin + 20;
+    
+    drawLine(yPos);
+    yPos += 10;
 
+    const additionalImageMargin = 20;
+    const additionalImageSpacing = 15;
+    const additionalImageWidth = (pageWidth - (additionalImageMargin * 2) - additionalImageSpacing) / 2;
+    const additionalLeftImageX = additionalImageMargin;
+    const additionalRightImageX = additionalImageMargin + additionalImageWidth + additionalImageSpacing;
+    const additionalImageStartY = yPos + 10;
+    const additionalMaxImageHeight = 90;
+
+    // Top Row - Left: Confirmation Form
+    if (data.confirmationForm) {
+      await addImageToPDF(data.confirmationForm, additionalLeftImageX, additionalImageStartY, additionalImageWidth, additionalMaxImageHeight);
+      doc.setFontSize(9);
+      doc.setFont('helvetica', 'bold');
+      doc.setTextColor(0, 0, 0);
+      doc.text('Confirmation Form', additionalLeftImageX, additionalImageStartY - 8);
+    } else {
+      doc.setFontSize(9);
+      doc.setFont('helvetica', 'bold');
+      doc.setTextColor(128, 128, 128);
+      doc.text('Confirmation Form (Not Provided)', additionalLeftImageX, additionalImageStartY - 8);
+    }
+
+    // Top Row - Right: Trade License
+    if (data.tradeLicense) {
+      await addImageToPDF(data.tradeLicense, additionalRightImageX, additionalImageStartY, additionalImageWidth, additionalMaxImageHeight);
+      doc.setFontSize(9);
+      doc.setFont('helvetica', 'bold');
+      doc.setTextColor(0, 0, 0);
+      doc.text('Trade License', additionalRightImageX, additionalImageStartY - 8);
+    } else {
+      doc.setFontSize(9);
+      doc.setFont('helvetica', 'bold');
+      doc.setTextColor(128, 128, 128);
+      doc.text('Trade License (Not Provided)', additionalRightImageX, additionalImageStartY - 8);
+    }
+  }
+
+  // ============================================
+  // PAGE 5: SELFIE/FACE IMAGES (only if photos exist)
+  // ============================================
   const customerPhotos = data.customerImages && data.customerImages.length > 0 
     ? data.customerImages 
     : (data.customerImage ? [data.customerImage] : []);
   
+  // Only create customer photos page if photos are available
   if (customerPhotos.length > 0) {
+    addNewPage();
+    const page5Number = doc.getNumberOfPages();
+
+    const page5ImageMargin = 20;
+    const page5ImageSpacing = 15;
+    const page5ImageWidth = (pageWidth - (page5ImageMargin * 2) - page5ImageSpacing) / 2;
+    const page5LeftImageX = page5ImageMargin;
+    const page5RightImageX = page5ImageMargin + page5ImageWidth + page5ImageSpacing;
+    const page5ImageStartY = 40;
+    const page5MaxImageHeight = (pageHeight - page5ImageStartY - margin) * 0.8;
+
     if (customerPhotos.length === 1) {
-      const centeredX = (pageWidth - page4ImageWidth) / 2;
-      await addImageToPDF(customerPhotos[0], centeredX, page4ImageStartY, page4ImageWidth, page4MaxImageHeight);
+      const centeredX = (pageWidth - page5ImageWidth) / 2;
+      await addImageToPDF(customerPhotos[0], centeredX, page5ImageStartY, page5ImageWidth, page5MaxImageHeight);
       doc.setFontSize(9);
       doc.setFont('helvetica', 'bold');
-      doc.text('Customer Photo', centeredX, page4ImageStartY - 8);
+      doc.text('Customer Photo', centeredX, page5ImageStartY - 8);
     } else {
       if (customerPhotos[0]) {
-        await addImageToPDF(customerPhotos[0], page4LeftImageX, page4ImageStartY, page4ImageWidth, page4MaxImageHeight);
+        await addImageToPDF(customerPhotos[0], page5LeftImageX, page5ImageStartY, page5ImageWidth, page5MaxImageHeight);
         doc.setFontSize(9);
         doc.setFont('helvetica', 'bold');
-        doc.text('Customer Photo - 1', page4LeftImageX, page4ImageStartY - 8);
+        doc.text('Customer Photo - 1', page5LeftImageX, page5ImageStartY - 8);
       }
 
       if (customerPhotos.length > 1 && customerPhotos[1]) {
-        await addImageToPDF(customerPhotos[1], page4RightImageX, page4ImageStartY, page4ImageWidth, page4MaxImageHeight);
+        await addImageToPDF(customerPhotos[1], page5RightImageX, page5ImageStartY, page5ImageWidth, page5MaxImageHeight);
         doc.setFontSize(9);
         doc.setFont('helvetica', 'bold');
-        doc.text('Customer Photo - 2', page4RightImageX, page4ImageStartY - 8);
+        doc.text('Customer Photo - 2', page5RightImageX, page5ImageStartY - 8);
       }
     }
-  } else {
-    doc.setFontSize(10);
-    doc.setFont('helvetica', 'normal');
-    doc.setTextColor(128, 128, 128);
-    doc.text('No customer photos available', margin, page4ImageStartY);
   }
 
   // Add footer to all pages

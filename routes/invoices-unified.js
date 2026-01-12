@@ -1,7 +1,7 @@
 const express = require('express');
 const mongoose = require('mongoose');
-const { Invoice, ShipmentRequest, Client, Employee } = require('../models/unified-schema');
-const { InvoiceRequest } = require('../models');
+const { Invoice, ShipmentRequest, Client, Employee, DeliveryAssignment } = require('../models/unified-schema');
+const { InvoiceRequest, Booking } = require('../models');
 const empostAPI = require('../services/empost-api');
 const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 const { validateObjectIdParam } = require('../middleware/security');
@@ -2708,8 +2708,8 @@ router.put('/:id', async (req, res) => {
       // Calculate total amount
       // For UAE to PH Flomic/Personal: Base amount already includes tax, so total = baseAmount (original)
       // For all other invoices: VAT is added on top, so total = subtotal + tax
+      let totalAmount;
       if (!hasManualTotal) {
-        let totalAmount;
         if (isUaeToPh && isFlomicOrPersonal && taxRate > 0) {
           // Base amount already includes tax - total equals original baseAmountValue
           totalAmount = Math.round(baseAmountValue * 100) / 100;
@@ -2722,7 +2722,8 @@ router.put('/:id', async (req, res) => {
         updateData.total_amount = mongoose.Types.Decimal128.fromString(totalAmount.toFixed(2));
       } else {
         // Use manual total value (already in preparedUpdate)
-        console.log('✅ Using manual total value:', parseDecimal(updateData.total_amount));
+        totalAmount = parseDecimal(updateData.total_amount);
+        console.log('✅ Using manual total value:', totalAmount);
       }
       
       console.log('📊 Invoice Update - Tax Recalculation:');
@@ -2845,6 +2846,193 @@ router.get('/status/:status', async (req, res) => {
     res.status(500).json({ 
       success: false,
       error: 'Failed to fetch invoices by status' 
+    });
+  }
+});
+
+// Cancel invoice
+router.post('/:invoiceId/cancel', validateObjectIdParam('invoiceId'), async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
+  try {
+    const { invoiceId } = req.params;
+    const { reason } = req.body;
+    
+    // Step 1: Fetch Invoice
+    const invoice = await Invoice.findById(invoiceId).session(session);
+    if (!invoice) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Invoice not found' 
+      });
+    }
+    
+    // Check if already cancelled
+    if (invoice.status === 'CANCELLED') {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Invoice is already cancelled' 
+      });
+    }
+    
+    // Store original status for EMPOST logic
+    const wasCompleted = invoice.status === 'COMPLETED' || invoice.status === 'REMITTED';
+    const hasInvoiceRequest = !!invoice.request_id;
+    const shouldUpdateEmpost = wasCompleted || hasInvoiceRequest;
+    
+    const cancellationData = {
+      cancelled_at: new Date(),
+      cancellation_reason: reason || null,
+      updatedAt: new Date()
+    };
+    
+    // Step 2: Update Invoice
+    await Invoice.findByIdAndUpdate(
+      invoiceId,
+      {
+        $set: {
+          status: 'CANCELLED',
+          ...cancellationData
+        }
+      },
+      { session }
+    );
+    
+    let invoiceRequestUpdated = false;
+    let bookingUpdated = false;
+    let deliveryAssignmentsCount = 0;
+    let empostUpdated = false;
+    
+    // Step 3: Update InvoiceRequest (if request_id exists)
+    if (invoice.request_id) {
+      const invoiceRequestResult = await InvoiceRequest.findByIdAndUpdate(
+        invoice.request_id,
+        {
+          $set: {
+            status: 'CANCELLED',
+            ...cancellationData
+          }
+        },
+        { session }
+      );
+      invoiceRequestUpdated = !!invoiceRequestResult;
+      
+      // Step 4: Update Booking (if booking_id exists in InvoiceRequest)
+      if (invoiceRequestResult) {
+        // Try to find booking by booking_id in InvoiceRequest
+        const invoiceRequest = await InvoiceRequest.findById(invoice.request_id).session(session);
+        if (invoiceRequest && invoiceRequest.booking_id) {
+          const bookingResult = await Booking.findByIdAndUpdate(
+            invoiceRequest.booking_id,
+            {
+              $set: {
+                status: 'CANCELLED',
+                ...cancellationData
+              }
+            },
+            { session }
+          );
+          bookingUpdated = !!bookingResult;
+        } else {
+          // Fallback: Try to find booking by request_id (if they share the same ID)
+          const bookingResult = await Booking.findByIdAndUpdate(
+            invoice.request_id,
+            {
+              $set: {
+                status: 'CANCELLED',
+                ...cancellationData
+              }
+            },
+            { session }
+          );
+          bookingUpdated = !!bookingResult;
+        }
+      }
+    }
+    
+    // Step 5: Cancel Delivery Assignments
+    const deliveryAssignmentsResult = await DeliveryAssignment.updateMany(
+      {
+        $or: [
+          { request_id: invoice.request_id },
+          { invoice_id: invoice._id },
+          { assignment_id: invoice.awb_number }
+        ]
+      },
+      {
+        $set: {
+          status: 'CANCELLED',
+          ...cancellationData
+        }
+      },
+      { session }
+    );
+    deliveryAssignmentsCount = deliveryAssignmentsResult.modifiedCount;
+    
+    // Step 6: Update EMPOST (if was COMPLETED OR invoice_request exists)
+    if (shouldUpdateEmpost) {
+      try {
+        const trackingNumber = invoice.empost_uhawb && invoice.empost_uhawb !== 'N/A' 
+          ? invoice.empost_uhawb 
+          : invoice.awb_number || invoice.invoice_id;
+        
+        if (trackingNumber) {
+          await empostAPI.updateShipmentStatus(
+            trackingNumber,
+            'CANCELLED',
+            { 
+              notes: reason || 'Invoice cancelled',
+              cancellation_reason: reason || null
+            }
+          );
+          empostUpdated = true;
+          console.log('✅ EMPOST shipment status updated to CANCELLED');
+        }
+      } catch (empostError) {
+        // Log error but don't fail the transaction
+        console.error('⚠️ Failed to update EMPOST status (continuing with cancellation):', empostError.message);
+        empostUpdated = false;
+      }
+    }
+    
+    // Commit transaction
+    await session.commitTransaction();
+    session.endSession();
+    
+    // Fetch updated invoice for response
+    const updatedInvoice = await Invoice.findById(invoiceId)
+      .populate('request_id', REQUEST_POPULATE_FIELDS)
+      .populate('client_id', 'company_name contact_name email phone')
+      .populate('created_by', 'full_name email department_id');
+    
+    res.json({
+      success: true,
+      message: 'Invoice and related entities cancelled successfully',
+      data: {
+        invoice: transformInvoice(updatedInvoice),
+        updatedEntities: {
+          invoice: true,
+          invoiceRequest: invoiceRequestUpdated,
+          booking: bookingUpdated,
+          deliveryAssignments: deliveryAssignmentsCount,
+          empost: empostUpdated
+        }
+      }
+    });
+  } catch (error) {
+    await session.abortTransaction();
+    session.endSession();
+    
+    console.error('Error cancelling invoice:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to cancel invoice',
+      details: error.message 
     });
   }
 });

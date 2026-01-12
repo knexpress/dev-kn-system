@@ -193,7 +193,9 @@ async function processCSVInBatches(csvData, batchSize, processor) {
   return results;
 }
 
-// CSV Upload endpoint - creates invoices and delivery assignments
+// CSV Upload endpoints removed - functionality removed from frontend
+// Removed endpoints: /bulk-create, /historical, /template
+/*
 router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => {
   try {
     if (!req.file) {
@@ -904,6 +906,7 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
     });
   }
 });
+*/
 
 // Helper function to convert country name to ISO country code
 // Returns 2-character ISO code (required by Empost API)
@@ -1172,8 +1175,8 @@ async function mapCSVToEMPOSTShipment(row, client = null) {
   return shipmentData;
 }
 
-// Historical Upload endpoint - uploads historical shipment data to EMPOST
-// Accept both 'csvFile' and 'file' field names for flexibility
+// Historical Upload endpoint removed - functionality removed from frontend
+/*
 router.post('/historical', auth, upload.fields([{ name: 'csvFile', maxCount: 1 }, { name: 'file', maxCount: 1 }]), async (req, res) => {
   try {
     // Get file from either field name
@@ -1539,8 +1542,10 @@ router.post('/historical', auth, upload.fields([{ name: 'csvFile', maxCount: 1 }
     });
   }
 });
+*/
 
-// Historical Template endpoint - returns CSV template for historical upload
+// Historical Template and Template endpoints removed - functionality removed from frontend
+/*
 router.get('/historical-template', (req, res) => {
   const csvTemplate = `CustomerName,AWBNo,TransactionDate,OriginCountry,OriginCity,DestinationCountry,DestinationCity,ShipmentType,ShipmentStatus,Weight,Delivery Charge,Dispatcher,AdditionalInfo1,AdditionalInfo2
 ABC Company,AWB123456,2024-01-15,UAE,Dubai,Philippines,Manila,Electronics,In Transit,10.5,50,John Doe,Receiver Name,+971501234567
@@ -1551,8 +1556,6 @@ XYZ Corp,AWB789012,2024-03-20,Philippines,Manila,UAE,Abu Dhabi,Documents,Deliver
   res.send(csvTemplate);
 });
 
-// Template download endpoint - provides CSV template
-// Template matches the required columns: Invoice Number, Created At, Tracking Code, Service Code, Weight (KG), Volume (CBM), Amount (AED), Sender Name, Receiver Name, Receiver Address, Receiver Mobile
 router.get('/template', (req, res) => {
   const csvTemplate = `Invoice Number,Created At,Tracking Code,Service Code,Weight (KG),Volume (CBM),Amount (AED),Sender Name,Receiver Name,Receiver Address,Receiver Mobile,Tax Rate,Description,Notes,Delivery Type
 INV-001,2024-12-01,TRK123456789,SVC-EXPRESS,10.5,0.5,500,ABC Company,John Doe,"123 Main Street, Dubai, UAE",+971501234567,5,Shipping Service,Sample invoice,COD
@@ -1562,5 +1565,6 @@ INV-002,2024-12-02,TRK987654321,SVC-STANDARD,5.2,0.3,750,XYZ Corp,Jane Smith,"45
   res.setHeader('Content-Disposition', 'attachment; filename="invoice_bulk_upload_template.csv"');
   res.send(csvTemplate);
 });
+*/
 
 module.exports = router;

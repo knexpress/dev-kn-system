@@ -472,6 +472,49 @@ function validateSalesBooking(req) {
       if (!idDocs.philippinesIdBack) errors.push('identityDocuments.philippinesIdBack is required for PH_TO_UAE');
       // EID is optional for PH_TO_UAE (can be null/undefined)
     }
+    
+    // Validate optional additional documents (only for UAE_TO_PH and PH_TO_UAE)
+    if (isUaeToPh || isPhToUae) {
+      // Validate confirmationForm if provided
+      if (idDocs.confirmationForm !== null && idDocs.confirmationForm !== undefined) {
+        if (typeof idDocs.confirmationForm !== 'string' || !idDocs.confirmationForm.startsWith('data:image/')) {
+          errors.push('identityDocuments.confirmationForm must be a valid base64 image data URI');
+        } else {
+          // Validate image format and size
+          const base64Data = idDocs.confirmationForm.split(',')[1];
+          if (base64Data) {
+            const imageSizeMB = (base64Data.length * 3) / 4 / 1024 / 1024; // Approximate size in MB
+            if (imageSizeMB > 10) {
+              errors.push('identityDocuments.confirmationForm image exceeds maximum size of 10MB');
+            }
+          }
+        }
+      }
+      
+      // Validate tradeLicense if provided
+      if (idDocs.tradeLicense !== null && idDocs.tradeLicense !== undefined) {
+        if (typeof idDocs.tradeLicense !== 'string' || !idDocs.tradeLicense.startsWith('data:image/')) {
+          errors.push('identityDocuments.tradeLicense must be a valid base64 image data URI');
+        } else {
+          // Validate image format and size
+          const base64Data = idDocs.tradeLicense.split(',')[1];
+          if (base64Data) {
+            const imageSizeMB = (base64Data.length * 3) / 4 / 1024 / 1024; // Approximate size in MB
+            if (imageSizeMB > 10) {
+              errors.push('identityDocuments.tradeLicense image exceeds maximum size of 10MB');
+            }
+          }
+        }
+      }
+    } else {
+      // For other service types, these fields should not be provided
+      if (idDocs.confirmationForm !== null && idDocs.confirmationForm !== undefined) {
+        errors.push('identityDocuments.confirmationForm is only valid for UAE_TO_PH and PH_TO_UAE service types');
+      }
+      if (idDocs.tradeLicense !== null && idDocs.tradeLicense !== undefined) {
+        errors.push('identityDocuments.tradeLicense is only valid for UAE_TO_PH and PH_TO_UAE service types');
+      }
+    }
   }
 
   // Validate insurance
@@ -583,6 +626,11 @@ router.post('/', async (req, res) => {
         quantity: item.quantity || item.qty
       }));
 
+      // Extract service code to determine if additional documents are valid
+      const serviceCode = normalizeServiceCode(bookingData.service_code || bookingData.service);
+      const isUaeToPh = serviceCode === 'UAE_TO_PH' || (serviceCode && serviceCode.startsWith('UAE_TO_PH'));
+      const isPhToUae = serviceCode === 'PH_TO_UAE' || (serviceCode && serviceCode.startsWith('PH_TO_UAE'));
+
       // Prepare identity documents (base64 images)
       // Decode HTML entities to ensure images are stored correctly (e.g., &#x2F; -> /)
       // Include all provided documents (some may be null/undefined for PH_TO_UAE)
@@ -590,7 +638,14 @@ router.post('/', async (req, res) => {
         eidFrontImage: bookingData.identityDocuments.eidFrontImage ? decodeImageField(bookingData.identityDocuments.eidFrontImage) : null,
         eidBackImage: bookingData.identityDocuments.eidBackImage ? decodeImageField(bookingData.identityDocuments.eidBackImage) : null,
         philippinesIdFront: bookingData.identityDocuments.philippinesIdFront ? decodeImageField(bookingData.identityDocuments.philippinesIdFront) : null,
-        philippinesIdBack: bookingData.identityDocuments.philippinesIdBack ? decodeImageField(bookingData.identityDocuments.philippinesIdBack) : null
+        philippinesIdBack: bookingData.identityDocuments.philippinesIdBack ? decodeImageField(bookingData.identityDocuments.philippinesIdBack) : null,
+        // Additional optional documents (only for UAE_TO_PH and PH_TO_UAE)
+        confirmationForm: (isUaeToPh || isPhToUae) && bookingData.identityDocuments.confirmationForm 
+          ? decodeImageField(bookingData.identityDocuments.confirmationForm) 
+          : null,
+        tradeLicense: (isUaeToPh || isPhToUae) && bookingData.identityDocuments.tradeLicense 
+          ? decodeImageField(bookingData.identityDocuments.tradeLicense) 
+          : null
       };
 
       // Extract AWB if provided from frontend (optional)
@@ -638,6 +693,28 @@ router.post('/', async (req, res) => {
       });
     } else {
       // Regular booking (customer-created or other sources)
+      // Handle identityDocuments for regular bookings (decode images and include additional documents)
+      if (bookingData.identityDocuments) {
+        const serviceCode = normalizeServiceCode(bookingData.service_code || bookingData.service);
+        const isUaeToPh = serviceCode === 'UAE_TO_PH' || (serviceCode && serviceCode.startsWith('UAE_TO_PH'));
+        const isPhToUae = serviceCode === 'PH_TO_UAE' || (serviceCode && serviceCode.startsWith('PH_TO_UAE'));
+        
+        const idDocs = bookingData.identityDocuments;
+        bookingData.identityDocuments = {
+          eidFrontImage: idDocs.eidFrontImage ? decodeImageField(idDocs.eidFrontImage) : null,
+          eidBackImage: idDocs.eidBackImage ? decodeImageField(idDocs.eidBackImage) : null,
+          philippinesIdFront: idDocs.philippinesIdFront ? decodeImageField(idDocs.philippinesIdFront) : null,
+          philippinesIdBack: idDocs.philippinesIdBack ? decodeImageField(idDocs.philippinesIdBack) : null,
+          // Additional optional documents (only for UAE_TO_PH and PH_TO_UAE)
+          confirmationForm: (isUaeToPh || isPhToUae) && idDocs.confirmationForm 
+            ? decodeImageField(idDocs.confirmationForm) 
+            : null,
+          tradeLicense: (isUaeToPh || isPhToUae) && idDocs.tradeLicense 
+            ? decodeImageField(idDocs.tradeLicense) 
+            : null
+        };
+      }
+      
       // Create booking
       const booking = new Booking(bookingData);
       await booking.save();
@@ -679,6 +756,120 @@ router.put('/:id', validateObjectIdParam('id'), async (req, res) => {
   try {
     const { id } = req.params;
     const updateData = req.body;
+    
+    // Get existing booking to check service code
+    const existingBooking = await Booking.findById(id);
+    if (!existingBooking) {
+      return res.status(404).json({
+        success: false,
+        error: 'Booking not found'
+      });
+    }
+    
+    // Extract service code to validate additional documents
+    const serviceCode = normalizeServiceCode(
+      updateData.service_code || 
+      existingBooking.service_code || 
+      updateData.service || 
+      existingBooking.service
+    );
+    const isUaeToPh = serviceCode === 'UAE_TO_PH' || (serviceCode && serviceCode.startsWith('UAE_TO_PH'));
+    const isPhToUae = serviceCode === 'PH_TO_UAE' || (serviceCode && serviceCode.startsWith('PH_TO_UAE'));
+    
+    // Handle identityDocuments update - decode image fields if provided
+    if (updateData.identityDocuments) {
+      const idDocs = updateData.identityDocuments;
+      
+      // Decode existing image fields if provided
+      if (idDocs.eidFrontImage !== undefined) {
+        idDocs.eidFrontImage = idDocs.eidFrontImage ? decodeImageField(idDocs.eidFrontImage) : null;
+      }
+      if (idDocs.eidBackImage !== undefined) {
+        idDocs.eidBackImage = idDocs.eidBackImage ? decodeImageField(idDocs.eidBackImage) : null;
+      }
+      if (idDocs.philippinesIdFront !== undefined) {
+        idDocs.philippinesIdFront = idDocs.philippinesIdFront ? decodeImageField(idDocs.philippinesIdFront) : null;
+      }
+      if (idDocs.philippinesIdBack !== undefined) {
+        idDocs.philippinesIdBack = idDocs.philippinesIdBack ? decodeImageField(idDocs.philippinesIdBack) : null;
+      }
+      
+      // Handle additional documents (only for UAE_TO_PH and PH_TO_UAE)
+      if (isUaeToPh || isPhToUae) {
+        // Validate and decode confirmationForm if provided
+        if (idDocs.confirmationForm !== undefined) {
+          if (idDocs.confirmationForm === null) {
+            // Allow setting to null to remove
+            idDocs.confirmationForm = null;
+          } else if (typeof idDocs.confirmationForm === 'string' && idDocs.confirmationForm.startsWith('data:image/')) {
+            // Validate size
+            const base64Data = idDocs.confirmationForm.split(',')[1];
+            if (base64Data) {
+              const imageSizeMB = (base64Data.length * 3) / 4 / 1024 / 1024;
+              if (imageSizeMB > 10) {
+                return res.status(400).json({
+                  success: false,
+                  error: 'identityDocuments.confirmationForm image exceeds maximum size of 10MB'
+                });
+              }
+            }
+            idDocs.confirmationForm = decodeImageField(idDocs.confirmationForm);
+          } else {
+            return res.status(400).json({
+              success: false,
+              error: 'identityDocuments.confirmationForm must be a valid base64 image data URI or null'
+            });
+          }
+        }
+        
+        // Validate and decode tradeLicense if provided
+        if (idDocs.tradeLicense !== undefined) {
+          if (idDocs.tradeLicense === null) {
+            // Allow setting to null to remove
+            idDocs.tradeLicense = null;
+          } else if (typeof idDocs.tradeLicense === 'string' && idDocs.tradeLicense.startsWith('data:image/')) {
+            // Validate size
+            const base64Data = idDocs.tradeLicense.split(',')[1];
+            if (base64Data) {
+              const imageSizeMB = (base64Data.length * 3) / 4 / 1024 / 1024;
+              if (imageSizeMB > 10) {
+                return res.status(400).json({
+                  success: false,
+                  error: 'identityDocuments.tradeLicense image exceeds maximum size of 10MB'
+                });
+              }
+            }
+            idDocs.tradeLicense = decodeImageField(idDocs.tradeLicense);
+          } else {
+            return res.status(400).json({
+              success: false,
+              error: 'identityDocuments.tradeLicense must be a valid base64 image data URI or null'
+            });
+          }
+        }
+      } else {
+        // For other service types, reject these fields
+        if (idDocs.confirmationForm !== undefined) {
+          return res.status(400).json({
+            success: false,
+            error: 'identityDocuments.confirmationForm is only valid for UAE_TO_PH and PH_TO_UAE service types'
+          });
+        }
+        if (idDocs.tradeLicense !== undefined) {
+          return res.status(400).json({
+            success: false,
+            error: 'identityDocuments.tradeLicense is only valid for UAE_TO_PH and PH_TO_UAE service types'
+          });
+        }
+      }
+      
+      // Merge with existing identityDocuments to preserve fields not being updated
+      const existingIdDocs = existingBooking.identityDocuments || {};
+      updateData.identityDocuments = {
+        ...existingIdDocs,
+        ...idDocs
+      };
+    }
     
     // Find and update booking
     const booking = await Booking.findByIdAndUpdate(
@@ -1751,7 +1942,8 @@ function transformIdentityDocuments(identityDocs) {
     'philippinesIdFront', 'philippinesIdBack',
     'philippines_id_front', 'philippines_id_back',
     'id_front_image', 'idBackImage', 'idFrontImage',
-    'customerImage', 'face_scan_image', 'faceScanImage'
+    'customerImage', 'face_scan_image', 'faceScanImage',
+    'confirmationForm', 'tradeLicense'  // Additional documents for UAE_TO_PH and PH_TO_UAE
   ];
   
   // Transform each image field
@@ -2747,6 +2939,17 @@ async function generateAndUploadBookingPDF(booking, invoiceRequest) {
       fullBooking.phIdBack
     ]);
     
+    // Extract Additional Documents - Confirmation Form and Trade License (only for UAE_TO_PH and PH_TO_UAE)
+    const confirmationForm = getImage([
+      bookingIdentityDocs.confirmationForm,
+      fullBooking.confirmationForm
+    ]);
+    
+    const tradeLicense = getImage([
+      bookingIdentityDocs.tradeLicense,
+      fullBooking.tradeLicense
+    ]);
+    
     // Extract Customer Images - ONLY from booking collection
     const customerImage = getImage([
       fullBooking.customerImage,
@@ -2775,6 +2978,8 @@ async function generateAndUploadBookingPDF(booking, invoiceRequest) {
     console.log(`   EID Back: ${eidBackImage ? '✅ Found' : '❌ Not found'}`);
     console.log(`   PH ID Front: ${philippinesIdFront ? '✅ Found' : '❌ Not found'}`);
     console.log(`   PH ID Back: ${philippinesIdBack ? '✅ Found' : '❌ Not found'}`);
+    console.log(`   Confirmation Form: ${confirmationForm ? '✅ Found' : '❌ Not found'}`);
+    console.log(`   Trade License: ${tradeLicense ? '✅ Found' : '❌ Not found'}`);
     console.log(`   Customer Images: ${customerImages.length} found`);
     
     // Prepare PDF data structure
@@ -2808,6 +3013,8 @@ async function generateAndUploadBookingPDF(booking, invoiceRequest) {
       eidBackImage: eidBackImage,
       philippinesIdFront: philippinesIdFront,
       philippinesIdBack: philippinesIdBack,
+      confirmationForm: confirmationForm,  // Additional document for UAE_TO_PH and PH_TO_UAE
+      tradeLicense: tradeLicense,          // Additional document for UAE_TO_PH and PH_TO_UAE
       customerImage: customerImage,
       customerImages: customerImages,
       submissionTimestamp: fullBooking.createdAt || fullBooking.submittedAt || new Date().toISOString(),
