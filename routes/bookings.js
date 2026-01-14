@@ -3157,7 +3157,7 @@ async function generateAndUploadBookingPDF(booking, invoiceRequest) {
     };
     
     // Extract EID Front Image - check booking only
-    const eidFrontImage = getImage([
+    const eidFrontImageRaw = getImage([
       bookingIdentityDocs.eidFrontImage,
       bookingIdentityDocs.eidFront,
       bookingIdentityDocs.eid_front,
@@ -3166,9 +3166,11 @@ async function generateAndUploadBookingPDF(booking, invoiceRequest) {
       fullBooking.eid_front_image,
       fullBooking.emiratesIdFront
     ]);
+    // Decode HTML entities (e.g., &#x2F; -> /) to ensure proper image processing
+    const eidFrontImage = eidFrontImageRaw ? decodeImageField(eidFrontImageRaw) : null;
     
     // Extract EID Back Image - check booking only
-    const eidBackImage = getImage([
+    const eidBackImageRaw = getImage([
       bookingIdentityDocs.eidBackImage,
       bookingIdentityDocs.eidBack,
       bookingIdentityDocs.eid_back,
@@ -3177,9 +3179,11 @@ async function generateAndUploadBookingPDF(booking, invoiceRequest) {
       fullBooking.eid_back_image,
       fullBooking.emiratesIdBack
     ]);
+    // Decode HTML entities to ensure proper image processing
+    const eidBackImage = eidBackImageRaw ? decodeImageField(eidBackImageRaw) : null;
     
     // Extract Philippines ID Front - check booking only
-    const philippinesIdFront = getImage([
+    const philippinesIdFrontRaw = getImage([
       bookingIdentityDocs.philippinesIdFront,
       bookingIdentityDocs.philippines_id_front,
       bookingIdentityDocs.phIdFront,
@@ -3187,9 +3191,11 @@ async function generateAndUploadBookingPDF(booking, invoiceRequest) {
       fullBooking.philippines_id_front,
       fullBooking.phIdFront
     ]);
+    // Decode HTML entities to ensure proper image processing
+    const philippinesIdFront = philippinesIdFrontRaw ? decodeImageField(philippinesIdFrontRaw) : null;
     
     // Extract Philippines ID Back - check booking only
-    const philippinesIdBack = getImage([
+    const philippinesIdBackRaw = getImage([
       bookingIdentityDocs.philippinesIdBack,
       bookingIdentityDocs.philippines_id_back,
       bookingIdentityDocs.phIdBack,
@@ -3197,32 +3203,44 @@ async function generateAndUploadBookingPDF(booking, invoiceRequest) {
       fullBooking.philippines_id_back,
       fullBooking.phIdBack
     ]);
+    // Decode HTML entities to ensure proper image processing
+    const philippinesIdBack = philippinesIdBackRaw ? decodeImageField(philippinesIdBackRaw) : null;
     
     // Extract Additional Documents - Confirmation Form and Trade License (only for UAE_TO_PH and PH_TO_UAE)
-    const confirmationForm = getImage([
+    const confirmationFormRaw = getImage([
       bookingIdentityDocs.confirmationForm,
       fullBooking.confirmationForm
     ]);
+    // Decode HTML entities to ensure proper image processing
+    const confirmationForm = confirmationFormRaw ? decodeImageField(confirmationFormRaw) : null;
     
-    const tradeLicense = getImage([
+    const tradeLicenseRaw = getImage([
       bookingIdentityDocs.tradeLicense,
       fullBooking.tradeLicense
     ]);
+    // Decode HTML entities to ensure proper image processing
+    const tradeLicense = tradeLicenseRaw ? decodeImageField(tradeLicenseRaw) : null;
     
     // Extract Customer Images - ONLY from booking collection
-    const customerImage = getImage([
+    const customerImageRaw = getImage([
       fullBooking.customerImage,
       fullBooking.customer_image
     ]);
+    // Decode HTML entities to ensure proper image processing
+    const customerImage = customerImageRaw ? decodeImageField(customerImageRaw) : null;
     
     const customerImages = (() => {
       // Check booking customerImages array
       if (fullBooking.customerImages && Array.isArray(fullBooking.customerImages) && fullBooking.customerImages.length > 0) {
-        return fullBooking.customerImages.filter(img => img && img.trim());
+        return fullBooking.customerImages
+          .filter(img => img && img.trim())
+          .map(img => decodeImageField(img)); // Decode each image
       }
       // Check booking customer_images array
       if (fullBooking.customer_images && Array.isArray(fullBooking.customer_images) && fullBooking.customer_images.length > 0) {
-        return fullBooking.customer_images.filter(img => img && img.trim());
+        return fullBooking.customer_images
+          .filter(img => img && img.trim())
+          .map(img => decodeImageField(img)); // Decode each image
       }
       // Fall back to single customerImage
       if (customerImage) {
@@ -3234,12 +3252,31 @@ async function generateAndUploadBookingPDF(booking, invoiceRequest) {
     // Log image extraction for debugging
     console.log('📸 Image extraction summary:');
     console.log(`   EID Front: ${eidFrontImage ? '✅ Found' : '❌ Not found'}`);
+    if (eidFrontImage) {
+      console.log(`      Format: ${eidFrontImage.substring(0, 30)}...`);
+      console.log(`      Contains HTML entities: ${eidFrontImage.includes('&#') ? '⚠️ YES (should be decoded)' : '✅ No'}`);
+    }
     console.log(`   EID Back: ${eidBackImage ? '✅ Found' : '❌ Not found'}`);
+    if (eidBackImage) {
+      console.log(`      Format: ${eidBackImage.substring(0, 30)}...`);
+      console.log(`      Contains HTML entities: ${eidBackImage.includes('&#') ? '⚠️ YES (should be decoded)' : '✅ No'}`);
+    }
     console.log(`   PH ID Front: ${philippinesIdFront ? '✅ Found' : '❌ Not found'}`);
     console.log(`   PH ID Back: ${philippinesIdBack ? '✅ Found' : '❌ Not found'}`);
     console.log(`   Confirmation Form: ${confirmationForm ? '✅ Found' : '❌ Not found'}`);
     console.log(`   Trade License: ${tradeLicense ? '✅ Found' : '❌ Not found'}`);
+    console.log(`   Customer Image: ${customerImage ? '✅ Found' : '❌ Not found'}`);
+    if (customerImage) {
+      console.log(`      Format: ${customerImage.substring(0, 30)}...`);
+      console.log(`      Contains HTML entities: ${customerImage.includes('&#') ? '⚠️ YES (should be decoded)' : '✅ No'}`);
+    }
     console.log(`   Customer Images: ${customerImages.length} found`);
+    if (customerImages.length > 0) {
+      customerImages.forEach((img, idx) => {
+        console.log(`      Image ${idx + 1}: ${img.substring(0, 30)}...`);
+        console.log(`         Contains HTML entities: ${img.includes('&#') ? '⚠️ YES (should be decoded)' : '✅ No'}`);
+      });
+    }
     
     // Prepare PDF data structure
     const pdfData = {
