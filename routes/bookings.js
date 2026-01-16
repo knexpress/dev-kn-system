@@ -593,14 +593,41 @@ function validateSalesBooking(req) {
     }
   }
 
-  // Validate insurance
-  if (data.insured === true && (!data.declaredAmount || data.declaredAmount <= 0)) {
-    errors.push('declaredAmount must be a positive number when insured is true');
+  // Validate shipmentType
+  if (data.shipmentType && !['document', 'non_document'].includes(data.shipmentType)) {
+    errors.push('shipmentType must be either "document" or "non_document"');
   }
-  if (data.insured === false && data.declaredAmount !== null && data.declaredAmount !== undefined) {
-    // Allow declaredAmount to be null/undefined when not insured, but if provided, it should be null
-    if (data.declaredAmount !== null) {
-      errors.push('declaredAmount must be null when insured is false');
+
+  // Validate insurance and declaredAmount based on shipmentType
+  if (data.shipmentType === 'document') {
+    // Document shipments: insured must be false, declaredAmount must be 0
+    if (data.insured === true) {
+      errors.push('Insurance cannot be enabled for document shipments');
+    }
+    if (data.declaredAmount !== null && data.declaredAmount !== undefined && data.declaredAmount !== 0) {
+      errors.push('Declared amount must be 0 for document shipments');
+    }
+  } else if (data.shipmentType === 'non_document') {
+    // Non-document shipments: insured must be true, declaredAmount must be > 0
+    if (data.insured === false) {
+      errors.push('Insurance must be enabled for non-document shipments');
+    }
+    if (!data.declaredAmount || data.declaredAmount <= 0) {
+      errors.push('Declared amount is required and must be greater than 0 for non-document shipments');
+    }
+    if (data.declaredAmount && (isNaN(data.declaredAmount) || !isFinite(data.declaredAmount))) {
+      errors.push('Declared amount must be a valid number');
+    }
+  } else {
+    // Legacy validation for bookings without shipmentType (backward compatibility)
+    if (data.insured === true && (!data.declaredAmount || data.declaredAmount <= 0)) {
+      errors.push('declaredAmount must be a positive number when insured is true');
+    }
+    if (data.insured === false && data.declaredAmount !== null && data.declaredAmount !== undefined) {
+      // Allow declaredAmount to be null/undefined when not insured, but if provided, it should be null
+      if (data.declaredAmount !== null) {
+        errors.push('declaredAmount must be null when insured is false');
+      }
     }
   }
 
@@ -728,6 +755,24 @@ router.post('/', async (req, res) => {
       const awb = bookingData.awb || bookingData.awb_number || bookingData.tracking_code;
       const awbValue = awb ? awb.toUpperCase().trim() : null;
 
+      // Enforce shipmentType business rules
+      const shipmentType = bookingData.shipmentType || 'non_document'; // Default to non_document for backward compatibility
+      let insured = bookingData.insured || false;
+      let declaredAmount = bookingData.declaredAmount || null;
+
+      if (shipmentType === 'document') {
+        // Document shipments: insured must be false, declaredAmount must be 0
+        insured = false;
+        declaredAmount = 0;
+      } else if (shipmentType === 'non_document') {
+        // Non-document shipments: insured must be true, declaredAmount must be > 0
+        insured = true;
+        // Ensure declaredAmount is provided and > 0 (validation already checked in validateSalesBooking)
+        if (!declaredAmount || declaredAmount <= 0) {
+          throw new Error('Declared amount is required and must be greater than 0 for non-document shipments');
+        }
+      }
+
       // Prepare booking data
       const salesBookingData = {
         service: bookingData.service,
@@ -739,8 +784,9 @@ router.post('/', async (req, res) => {
         receiver: receiver,
         items: items,
         identityDocuments: identityDocuments,
-        insured: bookingData.insured || false,
-        declaredAmount: bookingData.insured ? (bookingData.declaredAmount || null) : null,
+        shipmentType: shipmentType,
+        insured: insured,
+        declaredAmount: declaredAmount,
         created_by_employee_id: bookingData.created_by_employee_id,
         referenceNumber: referenceNumber,
         number_of_boxes: bookingData.number_of_boxes || items.length || 1
@@ -790,6 +836,29 @@ router.post('/', async (req, res) => {
             : null
         };
       }
+      
+      // Enforce shipmentType business rules for regular bookings
+      const shipmentType = bookingData.shipmentType || 'non_document'; // Default to non_document for backward compatibility
+      
+      if (shipmentType === 'document') {
+        // Document shipments: insured must be false, declaredAmount must be 0
+        bookingData.insured = false;
+        bookingData.declaredAmount = 0;
+      } else if (shipmentType === 'non_document') {
+        // Non-document shipments: insured must be true, declaredAmount must be > 0
+        bookingData.insured = true;
+        // Validate declaredAmount is provided and > 0
+        if (!bookingData.declaredAmount || bookingData.declaredAmount <= 0) {
+          return res.status(400).json({
+            success: false,
+            error: 'Validation error',
+            details: ['Declared amount is required and must be greater than 0 for non-document shipments']
+          });
+        }
+      }
+      
+      // Ensure shipmentType is set
+      bookingData.shipmentType = shipmentType;
       
       // Create booking
       const booking = new Booking(bookingData);
@@ -946,6 +1015,70 @@ router.put('/:id', validateObjectIdParam('id'), async (req, res) => {
         ...idDocs
       };
     }
+    
+    // Handle shipmentType validation and enforcement
+    const shipmentType = updateData.shipmentType || existingBooking.shipmentType || 'non_document';
+    
+    // Validate shipmentType if provided
+    if (updateData.shipmentType && !['document', 'non_document'].includes(updateData.shipmentType)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation error',
+        details: ['shipmentType must be either "document" or "non_document"']
+      });
+    }
+    
+    // Enforce business rules based on shipmentType
+    if (shipmentType === 'document') {
+      // Document shipments: insured must be false, declaredAmount must be 0
+      updateData.insured = false;
+      updateData.declaredAmount = 0;
+      
+      // Reject if user tries to send non-zero declared amount
+      if (updateData.declaredAmount !== undefined && updateData.declaredAmount !== 0 && updateData.declaredAmount !== null) {
+        return res.status(400).json({
+          success: false,
+          error: 'Validation error',
+          details: ['Declared amount must be 0 for document shipments']
+        });
+      }
+      
+      // Reject if user tries to enable insurance
+      if (updateData.insured === true) {
+        return res.status(400).json({
+          success: false,
+          error: 'Validation error',
+          details: ['Insurance cannot be enabled for document shipments']
+        });
+      }
+    } else if (shipmentType === 'non_document') {
+      // Non-document shipments: insured must be true, declaredAmount must be > 0
+      updateData.insured = true;
+      
+      // Validate declaredAmount is provided and > 0
+      const declaredAmount = updateData.declaredAmount !== undefined ? updateData.declaredAmount : existingBooking.declaredAmount;
+      if (!declaredAmount || declaredAmount <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Validation error',
+          details: ['Declared amount is required and must be greater than 0 for non-document shipments']
+        });
+      }
+      
+      // Ensure declaredAmount is a valid number
+      if (isNaN(declaredAmount) || !isFinite(declaredAmount)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Validation error',
+          details: ['Declared amount must be a valid number']
+        });
+      }
+      
+      updateData.declaredAmount = declaredAmount;
+    }
+    
+    // Ensure shipmentType is set in updateData
+    updateData.shipmentType = shipmentType;
     
     // Find and update booking
     const booking = await Booking.findByIdAndUpdate(
@@ -2575,13 +2708,24 @@ router.post('/:id/review', validateObjectIdParam('id'), async (req, res) => {
       .filter(Boolean)
       .join(', ') || '';
     
-    // Determine shipment type - check if items contain document-related keywords
-    const documentKeywords = ['document', 'documents', 'paper', 'papers', 'letter', 'letters', 'file', 'files'];
-    const isDocument = items.some(item => {
-      const commodity = (item.commodity || item.name || item.description || '').toLowerCase();
-      return documentKeywords.some(keyword => commodity.includes(keyword));
-    });
-    const shipment_type = isDocument ? 'DOCUMENT' : 'NON_DOCUMENT';
+    // Determine shipment type - use booking.shipmentType if available, otherwise infer from items
+    let shipmentType = booking.shipmentType || 'non_document'; // Default to non_document
+    let shipment_type = 'NON_DOCUMENT'; // Default for InvoiceRequest schema (uppercase enum)
+    
+    if (shipmentType === 'document') {
+      shipment_type = 'DOCUMENT';
+    } else {
+      // Fallback: check if items contain document-related keywords (for backward compatibility)
+      const documentKeywords = ['document', 'documents', 'paper', 'papers', 'letter', 'letters', 'file', 'files'];
+      const isDocument = items.some(item => {
+        const commodity = (item.commodity || item.name || item.description || '').toLowerCase();
+        return documentKeywords.some(keyword => commodity.includes(keyword));
+      });
+      if (isDocument) {
+        shipment_type = 'DOCUMENT';
+        shipmentType = 'document'; // Update shipmentType to match
+      }
+    }
     
     // Get origin and destination
     const originPlace = booking.origin_place || booking.origin || sender.completeAddress || sender.addressLine1 || sender.address || sender.country || '';
@@ -2880,7 +3024,8 @@ router.post('/:id/review', validateObjectIdParam('id'), async (req, res) => {
       receiver_name: receiverName,
       origin_place: originPlace,
       destination_place: destinationPlace,
-      shipment_type: shipment_type,
+      shipment_type: shipment_type, // For InvoiceRequest schema (DOCUMENT/NON_DOCUMENT)
+      shipmentType: shipmentType, // Copy from booking (document/non_document) for consistency
       
       // Customer details
       customer_phone: sender.contactNo || sender.phoneNumber || sender.phone || booking.customer_phone || '',

@@ -1062,6 +1062,14 @@ const bookingSchema = new mongoose.Schema({
     },
   }],
   
+  // Shipment Type: Document or Non-Document
+  shipmentType: {
+    type: String,
+    enum: ['document', 'non_document'],
+    required: false, // Optional for backward compatibility, will default to 'non_document'
+    default: 'non_document',
+  },
+  
   // All other fields from existing Bookings collection are allowed
 }, {
   timestamps: true,

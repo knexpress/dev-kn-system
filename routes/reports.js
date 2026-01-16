@@ -88,8 +88,17 @@ router.get('/', async (req, res) => {
               reportData.cargo_details = reportData.cargo_details || {};
               reportData.cargo_details.delivery_status = invoiceRequest.delivery_status;
               
-              // Save the updated report
-              await report.save();
+              // Save the updated report using findByIdAndUpdate since report is a lean object
+              await Report.findByIdAndUpdate(
+                report._id,
+                { 
+                  $set: { 
+                    'report_data.current_status': invoiceRequest.delivery_status,
+                    'report_data.cargo_details.delivery_status': invoiceRequest.delivery_status
+                  }
+                },
+                { new: true }
+              );
               console.log(`✅ Updated report ${report._id} with delivery_status: ${invoiceRequest.delivery_status}`);
             }
           } else {
@@ -103,7 +112,17 @@ router.get('/', async (req, res) => {
               reportData.cargo_details = reportData.cargo_details || {};
               reportData.cargo_details.delivery_status = invoiceRequest.delivery_status;
               
-              await report.save();
+              // Save the updated report using findByIdAndUpdate since report is a lean object
+              await Report.findByIdAndUpdate(
+                report._id,
+                { 
+                  $set: { 
+                    'report_data.current_status': invoiceRequest.delivery_status,
+                    'report_data.cargo_details.delivery_status': invoiceRequest.delivery_status
+                  }
+                },
+                { new: true }
+              );
               console.log(`✅ Updated report ${report._id} with delivery_status (via invoice_number): ${invoiceRequest.delivery_status}`);
             }
           }
