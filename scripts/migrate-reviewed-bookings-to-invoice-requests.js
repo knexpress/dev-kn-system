@@ -214,38 +214,92 @@ async function convertBookingToInvoiceRequest(booking) {
     // Calculate number of boxes
     const numberOfBoxes = booking.number_of_boxes || verificationBoxes.length || items.length || 1;
     
-    // Capture booking snapshot for audit/debug
-    const bookingSnapshot = booking.toObject ? booking.toObject() : booking;
-    if (bookingSnapshot && bookingSnapshot.__v !== undefined) {
-      delete bookingSnapshot.__v;
+    // Capture booking snapshot for audit/debug (exclude large image fields to avoid MongoDB 16MB limit)
+    const bookingSnapshotTemp = booking.toObject ? booking.toObject() : { ...booking };
+    if (bookingSnapshotTemp && bookingSnapshotTemp.__v !== undefined) {
+      delete bookingSnapshotTemp.__v;
     }
-    if (bookingSnapshot && bookingSnapshot._id) {
-      bookingSnapshot._id = bookingSnapshot._id.toString();
+    if (bookingSnapshotTemp && bookingSnapshotTemp._id) {
+      bookingSnapshotTemp._id = bookingSnapshotTemp._id.toString();
     }
     
-    // Create booking_data with all booking details EXCEPT identityDocuments
+    // Remove large image fields from snapshot to prevent MongoDB size limit issues
+    const fieldsToExclude = [
+      'identityDocuments', 'images', 'selfie', 'customerImage', 'customerImages',
+      'eidFrontImage', 'eidBackImage', 'philippinesIdFront', 'philippinesIdBack',
+      'eid_front_image', 'eid_back_image', 'philippines_id_front', 'philippines_id_back',
+      'emiratesIdFront', 'emiratesIdBack', 'phIdFront', 'phIdBack'
+    ];
+    
+    const bookingSnapshot = { ...bookingSnapshotTemp };
+    fieldsToExclude.forEach(field => {
+      if (bookingSnapshot[field] !== undefined) {
+        delete bookingSnapshot[field];
+      }
+    });
+    
+    // Also remove from nested sender/receiver objects if they contain large image data
+    if (bookingSnapshot.sender) {
+      const cleanSender = { ...bookingSnapshot.sender };
+      fieldsToExclude.forEach(field => {
+        if (cleanSender[field] !== undefined) {
+          delete cleanSender[field];
+        }
+      });
+      bookingSnapshot.sender = cleanSender;
+    }
+    if (bookingSnapshot.receiver) {
+      const cleanReceiver = { ...bookingSnapshot.receiver };
+      fieldsToExclude.forEach(field => {
+        if (cleanReceiver[field] !== undefined) {
+          delete cleanReceiver[field];
+        }
+      });
+      bookingSnapshot.receiver = cleanReceiver;
+    }
+    
+    // Create booking_data with all booking details EXCEPT identityDocuments and large images
     const bookingData = { ...bookingSnapshot };
     
-    // Remove identityDocuments and related sensitive fields
-    if (bookingData.identityDocuments !== undefined) {
-      delete bookingData.identityDocuments;
-    }
-    if (bookingData.images !== undefined) {
-      delete bookingData.images;
-    }
-    if (bookingData.selfie !== undefined) {
-      delete bookingData.selfie;
-    }
-    
-    // Convert _id to string if present
-    if (bookingData._id) {
-      bookingData._id = bookingData._id.toString();
+    // Ensure sender and receiver objects are included (without large images)
+    if (bookingSnapshot.sender) {
+      bookingData.sender = bookingSnapshot.sender;
+    } else {
+      const cleanSender = { ...sender };
+      fieldsToExclude.forEach(field => {
+        if (cleanSender[field] !== undefined) {
+          delete cleanSender[field];
+        }
+      });
+      bookingData.sender = cleanSender;
     }
     
-    // Ensure sender and receiver objects are included
-    bookingData.sender = sender;
-    bookingData.receiver = receiver;
+    if (bookingSnapshot.receiver) {
+      bookingData.receiver = bookingSnapshot.receiver;
+    } else {
+      const cleanReceiver = { ...receiver };
+      fieldsToExclude.forEach(field => {
+        if (cleanReceiver[field] !== undefined) {
+          delete cleanReceiver[field];
+        }
+      });
+      bookingData.receiver = cleanReceiver;
+    }
+    
     bookingData.items = items;
+    
+    // Limit items to essential data (no large image fields)
+    if (bookingData.items && Array.isArray(bookingData.items)) {
+      bookingData.items = bookingData.items.map(item => {
+        const cleanItem = { ...item };
+        fieldsToExclude.forEach(field => {
+          if (cleanItem[field] !== undefined) {
+            delete cleanItem[field];
+          }
+        });
+        return cleanItem;
+      });
+    }
     
     // Extract insurance data with fallbacks
     const insuredRaw = booking.insured ?? booking.insurance ?? booking.isInsured ?? booking.is_insured 
@@ -258,6 +312,9 @@ async function convertBookingToInvoiceRequest(booking) {
       invoice_number: invoiceNumber,
       tracking_code: awbNumber,
       service_code: serviceCode || undefined,
+      
+      // Booking reference
+      booking_id: booking._id, // Reference to original booking
       
       // Required fields
       customer_name: customerName,
@@ -272,12 +329,34 @@ async function convertBookingToInvoiceRequest(booking) {
       receiver_phone: receiver.contactNo || receiver.phoneNumber || receiver.phone || booking.receiver_phone || booking.receiverPhone || '',
       receiver_company: receiver.company || booking.receiver_company || '',
       
-      // Customer images
-      customerImage: booking.customerImage || booking.customer_image || '',
-      customerImages: Array.isArray(booking.customerImages) ? booking.customerImages : (booking.customer_images || []),
+      // Identity documents METADATA ONLY (NO base64 images)
+      // Images are stored ONLY in Booking collection and fetched from there for PDF generation
+      // This prevents MongoDB 16MB document size limit issues
+      identityDocuments: (() => {
+        const bookingIdentityDocs = booking.identityDocuments || {};
+        const metadataOnly = {
+          // Store ONLY metadata fields (not base64 images)
+          eidFrontImageFirstName: bookingIdentityDocs.eidFrontImageFirstName || booking.eidFrontImageFirstName || null,
+          eidFrontImageLastName: bookingIdentityDocs.eidFrontImageLastName || booking.eidFrontImageLastName || null,
+          // DO NOT include base64 image fields: eidFrontImage, eidBackImage, philippinesIdFront, philippinesIdBack
+        };
+        // Remove null/undefined values
+        Object.keys(metadataOnly).forEach(key => {
+          if (metadataOnly[key] === null || metadataOnly[key] === undefined || metadataOnly[key] === '') {
+            delete metadataOnly[key];
+          }
+        });
+        return Object.keys(metadataOnly).length > 0 ? metadataOnly : {};
+      })(),
       
-      // Booking snapshot
+      // DO NOT store customer images in InvoiceRequest (they're in Booking collection)
+      // Images are fetched from Booking collection when needed for PDF generation
+      customerImage: '', // Empty - images are in Booking collection
+      customerImages: [], // Empty - images are in Booking collection
+      
+      // Booking snapshot (excludes large image fields to avoid MongoDB 16MB limit)
       booking_snapshot: bookingSnapshot,
+      // Booking data (excludes large image fields for EMPOST API and integrations)
       booking_data: bookingData,
       
       // Delivery options

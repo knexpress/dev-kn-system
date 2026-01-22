@@ -4,7 +4,7 @@ const { Invoice, ShipmentRequest, Client, Employee, DeliveryAssignment } = requi
 const { InvoiceRequest, Booking } = require('../models');
 const empostAPI = require('../services/empost-api');
 const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
-const { validateObjectIdParam } = require('../middleware/security');
+const { validateObjectIdParam, sanitizeRegex } = require('../middleware/security');
 // const { createNotificationsForAllUsers } = require('./notifications');
 
 const router = express.Router();
@@ -170,235 +170,148 @@ function forceGarbageCollection() {
   return false;
 }
 
-// Get all invoices with pagination
+/**
+ * Build search query for invoices
+ * Searches across multiple fields with case-insensitive partial matching
+ * Optimized for performance - uses exact match for ObjectId, regex for text fields
+ */
+function buildInvoiceSearchQuery(searchTerm) {
+  if (!searchTerm || !searchTerm.trim()) {
+    return null;
+  }
+
+  const trimmed = searchTerm.trim();
+  
+  // Check if search term is a valid MongoDB ObjectId (24 hex characters)
+  const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(trimmed);
+  
+  const searchConditions = [];
+  
+  if (isValidObjectId) {
+    // Use exact ObjectId match - much faster than regex
+    try {
+      searchConditions.push({ _id: new mongoose.Types.ObjectId(trimmed) });
+    } catch (e) {
+      // If ObjectId creation fails, fall through to text search
+    }
+  }
+
+  // Sanitize search term to prevent ReDoS
+  const sanitized = sanitizeRegex(trimmed);
+  if (!sanitized) {
+    return searchConditions.length > 0 ? { $or: searchConditions } : null;
+  }
+
+  // Create case-insensitive regex for text fields
+  // Use anchored regex (^) when possible for better index usage
+  const searchRegex = sanitized.length > 3 
+    ? new RegExp(`^${sanitized}`, 'i') // Anchored regex for better performance
+    : new RegExp(sanitized, 'i'); // Non-anchored for short terms
+
+  // Add text field searches - search in invoice fields
+  searchConditions.push(
+    { invoice_id: searchRegex },
+    { awb_number: searchRegex },
+    { batch_number: searchRegex },
+    { receiver_name: searchRegex },
+    { receiver_address: searchRegex },
+    { receiver_phone: searchRegex },
+    { customer_trn: searchRegex }
+  );
+
+  return {
+    $or: searchConditions
+  };
+}
+
+// Essential fields for invoice list view (lightweight)
+const INVOICE_LIST_FIELDS = '_id invoice_id awb_number batch_number receiver_name receiver_address receiver_phone service_code weight_kg weight_type volume_cbm amount delivery_charge pickup_charge insurance_charge tax_amount total_amount status issue_date due_date paid_at createdAt updatedAt client_id request_id created_by';
+
+// Get all invoices with pagination and search (OPTIMIZED for list view)
 router.get('/', async (req, res) => {
   try {
-    // Get pagination parameters
+    // Check if full details are needed (default: lightweight list view)
+    const fullDetails = req.query.full === 'true' || req.query.full === '1';
+    
+    // Get search parameter
+    const search = req.query.search || req.query.q || '';
+    
+    // Get pagination parameters (default: 50 per page)
     const page = parseInt(req.query.page) || 1;
-    const limit = Math.min(parseInt(req.query.limit) || 50, 200); // Max 200 per page
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200); // Default 50, max 200 per page
     const skip = (page - 1) * limit;
     
-    logMemoryUsage('(before invoice query)');
+    const startTime = Date.now();
     
     console.log('🔄 Fetching invoices from database...');
-    console.log(`📄 Pagination: page=${page}, limit=${limit}, skip=${skip}`);
+    if (search) {
+      console.log(`🔍 Search: "${search}" - Searching across all invoices, then paginating`);
+    } else {
+      console.log(`📄 Pagination: page=${page}, limit=${limit}, skip=${skip}`);
+    }
     
-    // Get total count first
-    const total = await Invoice.countDocuments();
+    // Build base query with field projection for lightweight list
+    let baseQuery = Invoice.find();
     
-    // Fetch invoices with pagination and use lean() to reduce memory
-    const invoices = await Invoice.find()
-      .populate('request_id', REQUEST_POPULATE_FIELDS)
-      .populate('client_id', 'company_name contact_name email phone')
-      .populate('created_by', 'full_name email department_id')
+    // Apply search filter if provided (searches across ALL invoices)
+    const searchQuery = buildInvoiceSearchQuery(search);
+    if (searchQuery) {
+      baseQuery = baseQuery.find(searchQuery);
+    }
+    
+    // Get total count (with search filter if applicable) - do this in parallel
+    const countPromise = baseQuery.clone().countDocuments().maxTimeMS(5000);
+    
+    // Build query with minimal populate for list view
+    let query = baseQuery
+      .select(INVOICE_LIST_FIELDS) // Only select essential fields
+      .populate('client_id', 'company_name contact_name') // Minimal client data
+      .populate('created_by', 'full_name') // Minimal creator data
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)
-      .lean(); // Use lean() to return plain objects instead of Mongoose documents
+      .maxTimeMS(30000)
+      .lean(); // Use lean() for better performance
     
-    logMemoryUsage('(after invoice query)');
+    // Execute query and count in parallel
+    const [invoices, total] = await Promise.all([
+      query,
+      countPromise
+    ]);
     
-    console.log('📊 Found invoices:', invoices.length, `(Total: ${total})`);
-    console.log('📋 Invoice details:', invoices.map(inv => ({
-      id: inv._id,
-      invoice_id: inv.invoice_id,
-      status: inv.status,
-      amount: inv.amount
-    })));
+    const queryTime = Date.now() - startTime;
+    console.log(`📊 Found ${invoices.length} invoices (Total: ${total}) in ${queryTime}ms`);
     
-    // Transform invoices and populate missing fields from InvoiceRequest
-    // Process in smaller batches to avoid memory issues
-    const BATCH_SIZE = 20;
-    const transformedInvoices = [];
+    // For lightweight list view, do minimal transformation
+    // Only convert Decimal128 to numbers, skip heavy InvoiceRequest lookups
+    const transformedInvoices = invoices.map((invoice) => {
+      const transformed = transformInvoice(invoice);
+      
+      // For list view, we don't need to populate from InvoiceRequest
+      // The invoice already has the essential fields
+      // Only include minimal client and creator info
+      return {
+        ...transformed,
+        client: invoice.client_id ? {
+          _id: invoice.client_id._id || invoice.client_id,
+          company_name: invoice.client_id.company_name,
+          contact_name: invoice.client_id.contact_name
+        } : null,
+        created_by_user: invoice.created_by ? {
+          _id: invoice.created_by._id || invoice.created_by,
+          full_name: invoice.created_by.full_name
+        } : null
+      };
+    });
     
-    for (let i = 0; i < invoices.length; i += BATCH_SIZE) {
-      const batch = invoices.slice(i, i + BATCH_SIZE);
-      const batchResults = await Promise.all(batch.map(async (invoice) => {
-        const transformed = transformInvoice(invoice);
-        const invoiceObj = invoice; // Already a plain object from lean()
-      
-      // Always try to populate fields from InvoiceRequest if request_id exists
-      // Note: request_id might be an InvoiceRequest ObjectId, not a ShipmentRequest
-      // Also check notes field as fallback (format: "Invoice for request <request_id>")
-      try {
-        // Get the actual request_id value (could be ObjectId or populated object)
-        let requestIdValue = null;
-        if (invoiceObj.request_id) {
-          if (typeof invoiceObj.request_id === 'object' && invoiceObj.request_id._id) {
-            requestIdValue = invoiceObj.request_id._id.toString();
-          } else {
-            requestIdValue = invoiceObj.request_id.toString();
-          }
-        }
-        
-        // Fallback: Extract request_id from notes field if request_id is null
-        // Notes format: "Invoice for request <24-char ObjectId>"
-        if (!requestIdValue && transformed.notes) {
-          // Match ObjectId pattern (24 hex characters) or any word characters
-          const notesMatch = transformed.notes.match(/Invoice for request ([a-fA-F0-9]{24}|\w+)/);
-          if (notesMatch && notesMatch[1]) {
-            requestIdValue = notesMatch[1];
-            console.log(`📝 Extracted request_id from notes: ${requestIdValue}`);
-          }
-        }
-        
-        // Try to find InvoiceRequest by the request_id
-        if (requestIdValue) {
-          const invoiceRequest = await InvoiceRequest.findById(requestIdValue);
-          if (invoiceRequest) {
-            console.log(`✅ Found InvoiceRequest ${requestIdValue} for invoice ${transformed.invoice_id || transformed._id}`);
-            
-            // Populate service_code (check root first, then verification)
-            if (!transformed.service_code && (invoiceRequest.service_code || invoiceRequest.verification?.service_code)) {
-              transformed.service_code = invoiceRequest.service_code || invoiceRequest.verification?.service_code;
-              console.log(`  ✅ Populated service_code: ${transformed.service_code}`);
-            }
-            
-            // Populate weight_kg (check multiple sources: weight_kg, weight, verification.chargeable_weight)
-            if ((transformed.weight_kg == null || transformed.weight_kg === 0 || transformed.weight_kg === '0') && 
-                (invoiceRequest.weight_kg || invoiceRequest.weight || invoiceRequest.verification?.chargeable_weight)) {
-              if (invoiceRequest.weight_kg) {
-                transformed.weight_kg = parseFloat(invoiceRequest.weight_kg.toString());
-              } else if (invoiceRequest.weight) {
-                transformed.weight_kg = parseFloat(invoiceRequest.weight.toString());
-              } else if (invoiceRequest.verification?.chargeable_weight) {
-                transformed.weight_kg = parseFloat(invoiceRequest.verification.chargeable_weight.toString());
-              }
-              console.log(`  ✅ Populated weight_kg: ${transformed.weight_kg}`);
-            }
-            
-            // Populate volume_cbm (check root first, then verification.total_vm)
-            if ((transformed.volume_cbm == null || transformed.volume_cbm === 0 || transformed.volume_cbm === '0') && 
-                (invoiceRequest.volume_cbm || invoiceRequest.verification?.total_vm)) {
-              if (invoiceRequest.volume_cbm) {
-                transformed.volume_cbm = parseFloat(invoiceRequest.volume_cbm.toString());
-              } else if (invoiceRequest.verification?.total_vm) {
-                transformed.volume_cbm = parseFloat(invoiceRequest.verification.total_vm.toString());
-              }
-              console.log(`  ✅ Populated volume_cbm: ${transformed.volume_cbm}`);
-            }
-            
-            // Populate receiver_name
-            if (!transformed.receiver_name && invoiceRequest.receiver_name) {
-              transformed.receiver_name = invoiceRequest.receiver_name;
-              console.log(`  ✅ Populated receiver_name: ${transformed.receiver_name}`);
-            }
-            
-            // Populate receiver_address (check multiple sources)
-            if (!transformed.receiver_address && 
-                (invoiceRequest.receiver_address || invoiceRequest.destination_place || invoiceRequest.verification?.receiver_address)) {
-              transformed.receiver_address = invoiceRequest.receiver_address || 
-                                            invoiceRequest.destination_place || 
-                                            invoiceRequest.verification?.receiver_address;
-              console.log(`  ✅ Populated receiver_address: ${transformed.receiver_address}`);
-            }
-            
-            // Populate receiver_phone (check root first, then verification)
-            if (!transformed.receiver_phone && 
-                (invoiceRequest.receiver_phone || invoiceRequest.verification?.receiver_phone)) {
-              transformed.receiver_phone = invoiceRequest.receiver_phone || invoiceRequest.verification?.receiver_phone;
-              console.log(`  ✅ Populated receiver_phone: ${transformed.receiver_phone}`);
-            }
-            
-            // Populate number_of_boxes
-            const detectedBoxes = invoiceRequest.verification?.number_of_boxes ||
-                                  invoiceRequest.number_of_boxes ||
-                                  invoiceRequest.shipment?.number_of_boxes ||
-                                  invoiceRequest.shipment?.boxes_count;
-            if (!transformed.number_of_boxes || transformed.number_of_boxes === 0) {
-              transformed.number_of_boxes = detectedBoxes || 1;
-              console.log(`  ✅ Populated number_of_boxes: ${transformed.number_of_boxes}`);
-            }
-            // Ensure request_id field in response contains full invoice request when missing
-            const invoiceRequestObj = invoiceRequest.toObject ? invoiceRequest.toObject() : invoiceRequest;
-            const existingRequestData =
-              transformed.request_id && typeof transformed.request_id === 'object'
-                ? transformed.request_id
-                : {};
-            const mergedVerification = {
-              ...(invoiceRequestObj.verification || {}),
-              ...(existingRequestData.verification || {})
-            };
-            if (!mergedVerification.number_of_boxes) {
-              mergedVerification.number_of_boxes = transformed.number_of_boxes;
-            }
-            transformed.request_id = {
-              ...invoiceRequestObj,
-              ...existingRequestData,
-              verification: mergedVerification,
-              number_of_boxes:
-                existingRequestData.number_of_boxes ||
-                invoiceRequestObj.number_of_boxes ||
-                invoiceRequestObj.shipment?.number_of_boxes ||
-                transformed.number_of_boxes
-            };
-            
-            // Also update the invoice's request_id in the database if it was null
-            if (!invoiceObj.request_id && invoiceRequest._id) {
-              try {
-                await Invoice.findByIdAndUpdate(transformed._id, { request_id: invoiceRequest._id });
-                console.log(`  ✅ Updated invoice request_id in database: ${invoiceRequest._id}`);
-                
-                // Re-fetch the updated invoice to get all details with the new request_id
-                const updatedInvoice = await Invoice.findById(transformed._id)
-                  .populate('request_id', REQUEST_POPULATE_FIELDS)
-                  .populate('client_id', 'company_name contact_name email phone')
-                  .populate('created_by', 'full_name email department_id')
-                  .lean();
-                
-                if (updatedInvoice) {
-                  // Re-transform with the updated invoice data to ensure all fields are included
-                  const reTransformed = transformInvoice(updatedInvoice);
-                  
-                  // Merge the populated fields we already set
-                  Object.assign(transformed, reTransformed);
-                  
-                  // Ensure request_id contains the full invoice request data
-                  if (updatedInvoice.request_id) {
-                    const updatedRequestObj = typeof updatedInvoice.request_id === 'object' 
-                      ? updatedInvoice.request_id 
-                      : invoiceRequestObj;
-                    transformed.request_id = {
-                      ...updatedRequestObj,
-                      ...invoiceRequestObj,
-                      verification: mergedVerification,
-                      number_of_boxes: transformed.number_of_boxes
-                    };
-                  }
-                  
-                  console.log(`  ✅ Re-fetched and updated invoice with all details`);
-                }
-              } catch (updateError) {
-                console.error(`  ⚠️ Failed to update invoice request_id:`, updateError.message);
-              }
-            }
-          } else {
-            console.log(`⚠️ No InvoiceRequest found for request_id: ${requestIdValue}`);
-          }
-        } else {
-          console.log(`⚠️ No request_id found for invoice ${transformed.invoice_id || transformed._id} (checked request_id field and notes)`);
-        }
-      } catch (error) {
-        console.error('⚠️ Error populating fields from InvoiceRequest:', error.message);
-        console.error('Error stack:', error.stack);
-      }
-      
-        return transformed;
-      }));
-      
-      transformedInvoices.push(...batchResults);
-      
-      // Memory cleanup after each batch
-      if (i % (BATCH_SIZE * 2) === 0) {
-        forceGarbageCollection();
-        logMemoryUsage(`(after batch ${Math.floor(i / BATCH_SIZE) + 1})`);
-      }
-    }
+    const totalTime = Date.now() - startTime;
+    console.log(`✅ Processed ${transformedInvoices.length} invoices in ${totalTime}ms`);
     
     // Final memory cleanup
     forceGarbageCollection();
     logMemoryUsage('(after all transformations)');
     
+    // Return response with pagination info
     res.json({
       success: true,
       data: transformedInvoices,
@@ -407,7 +320,8 @@ router.get('/', async (req, res) => {
         limit,
         total,
         pages: Math.ceil(total / limit)
-      }
+      },
+      search: search || null
     });
   } catch (error) {
     console.error('❌ Error fetching invoices:', error);

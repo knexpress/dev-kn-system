@@ -1446,6 +1446,34 @@ invoiceSchema.index({ status: 1 });
 invoiceSchema.index({ issue_date: -1 });
 invoiceSchema.index({ due_date: 1 });
 invoiceSchema.index({ created_by: 1 });
+invoiceSchema.index({ createdAt: -1 }); // Critical for sorting by creation date
+// Search indexes for faster search queries
+invoiceSchema.index({ invoice_id: 1 });
+invoiceSchema.index({ awb_number: 1 });
+invoiceSchema.index({ batch_number: 1 });
+invoiceSchema.index({ receiver_name: 1 });
+invoiceSchema.index({ receiver_phone: 1 });
+// Text index for full-text search across multiple fields
+invoiceSchema.index({ 
+  invoice_id: 'text', 
+  awb_number: 'text', 
+  batch_number: 'text',
+  receiver_name: 'text',
+  receiver_address: 'text',
+  receiver_phone: 'text',
+  customer_trn: 'text'
+}, { 
+  name: 'invoice_text_search',
+  weights: {
+    invoice_id: 10,      // Highest priority
+    awb_number: 10,      // Highest priority
+    batch_number: 8,     // High priority
+    receiver_name: 5,    // Medium priority
+    receiver_phone: 5,   // Medium priority
+    receiver_address: 3, // Lower priority
+    customer_trn: 3      // Lower priority
+  }
+});
 
 // Cash Flow indexes
 // transaction_id index is automatically created by unique: true

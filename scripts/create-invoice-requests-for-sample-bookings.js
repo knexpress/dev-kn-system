@@ -188,8 +188,8 @@ async function convertBookingToInvoiceRequest(booking, defaultEmployeeId) {
     // Calculate number of boxes
     const numberOfBoxes = booking.number_of_boxes || verificationBoxes.length || items.length || 1;
     
-    // Capture booking snapshot for audit/debug
-    const bookingSnapshot = booking.toObject ? booking.toObject() : booking;
+    // Capture booking snapshot for audit/debug (exclude large image fields to avoid MongoDB 16MB limit)
+    const bookingSnapshot = booking.toObject ? booking.toObject() : { ...booking };
     if (bookingSnapshot && bookingSnapshot.__v !== undefined) {
       delete bookingSnapshot.__v;
     }
@@ -197,29 +197,70 @@ async function convertBookingToInvoiceRequest(booking, defaultEmployeeId) {
       bookingSnapshot._id = bookingSnapshot._id.toString();
     }
     
-    // Create booking_data with all booking details EXCEPT identityDocuments
+    // Remove large image fields from snapshot to prevent MongoDB size limit issues
+    const fieldsToExclude = [
+      'identityDocuments', 'images', 'selfie', 'customerImage', 'customerImages',
+      'eidFrontImage', 'eidBackImage', 'philippinesIdFront', 'philippinesIdBack',
+      'eid_front_image', 'eid_back_image', 'philippines_id_front', 'philippines_id_back',
+      'emiratesIdFront', 'emiratesIdBack', 'phIdFront', 'phIdBack'
+    ];
+    
+    fieldsToExclude.forEach(field => {
+      if (bookingSnapshot[field] !== undefined) {
+        delete bookingSnapshot[field];
+      }
+    });
+    
+    // Also remove from nested sender/receiver objects if they contain large image data
+    if (bookingSnapshot.sender) {
+      fieldsToExclude.forEach(field => {
+        if (bookingSnapshot.sender[field] !== undefined) {
+          delete bookingSnapshot.sender[field];
+        }
+      });
+    }
+    if (bookingSnapshot.receiver) {
+      fieldsToExclude.forEach(field => {
+        if (bookingSnapshot.receiver[field] !== undefined) {
+          delete bookingSnapshot.receiver[field];
+        }
+      });
+    }
+    
+    // Create booking_data with all booking details EXCEPT identityDocuments and large images
     const bookingData = { ...bookingSnapshot };
     
-    // Remove identityDocuments and related sensitive fields
-    if (bookingData.identityDocuments !== undefined) {
-      delete bookingData.identityDocuments;
-    }
-    if (bookingData.images !== undefined) {
-      delete bookingData.images;
-    }
-    if (bookingData.selfie !== undefined) {
-      delete bookingData.selfie;
-    }
+    // Ensure sender and receiver objects are included (without large images)
+    const cleanSender = { ...sender };
+    fieldsToExclude.forEach(field => {
+      if (cleanSender[field] !== undefined) {
+        delete cleanSender[field];
+      }
+    });
     
-    // Convert _id to string if present
-    if (bookingData._id) {
-      bookingData._id = bookingData._id.toString();
-    }
+    const cleanReceiver = { ...receiver };
+    fieldsToExclude.forEach(field => {
+      if (cleanReceiver[field] !== undefined) {
+        delete cleanReceiver[field];
+      }
+    });
     
-    // Ensure sender and receiver objects are included
-    bookingData.sender = sender;
-    bookingData.receiver = receiver;
+    bookingData.sender = cleanSender;
+    bookingData.receiver = cleanReceiver;
     bookingData.items = items;
+    
+    // Limit items to essential data (no large image fields)
+    if (bookingData.items && Array.isArray(bookingData.items)) {
+      bookingData.items = bookingData.items.map(item => {
+        const cleanItem = { ...item };
+        fieldsToExclude.forEach(field => {
+          if (cleanItem[field] !== undefined) {
+            delete cleanItem[field];
+          }
+        });
+        return cleanItem;
+      });
+    }
     
     // Extract identity documents from booking
     const identityDocuments = booking.identityDocuments || {};
@@ -257,13 +298,14 @@ async function convertBookingToInvoiceRequest(booking, defaultEmployeeId) {
       receiver_phone: receiver.contactNo || receiver.phoneNumber || receiver.phone || booking.receiver_phone || booking.receiverPhone || '',
       receiver_company: receiver.company || booking.receiver_company || '',
       
-      // Identity documents (from booking)
+      // Identity documents (from booking) - stored separately, not in booking_snapshot
       identityDocuments: identityDocuments,
       customerImage: booking.customerImage || booking.customer_image || '',
       customerImages: Array.isArray(booking.customerImages) ? booking.customerImages : (booking.customer_images || []),
       
-      // Booking snapshot
+      // Booking snapshot (excludes large image fields to avoid MongoDB 16MB limit)
       booking_snapshot: bookingSnapshot,
+      // Booking data (excludes large image fields for EMPOST API and integrations)
       booking_data: bookingData,
       
       // Delivery options
@@ -336,21 +378,85 @@ async function createInvoiceRequestsForSampleBookings() {
       process.exit(1);
     }
 
-    // Find all reviewed bookings that don't have an invoice request yet
-    const reviewedBookings = await Booking.find({
+    // Find specific booking by AWB - only process AEAK183HDVM2IM9N2
+    const targetAWB = 'AEAK183HDVM2IM9N2';
+    console.log(`🔍 Searching for booking with AWB: ${targetAWB}\n`);
+    
+    // First, find the booking regardless of whether it has an InvoiceRequest
+    const allReviewedBookings = await Booking.find({
       review_status: 'reviewed',
       $or: [
-        { converted_to_invoice_request_id: { $exists: false } },
-        { converted_to_invoice_request_id: null }
+        { awb: targetAWB },
+        { tracking_code: targetAWB },
+        { awb_number: targetAWB }
       ]
     }).lean();
+    
+    // Additional filter: ensure we only get bookings with the exact AWB
+    const exactBookings = allReviewedBookings.filter(booking => {
+      const bookingAWB = booking.awb || booking.tracking_code || booking.awb_number;
+      return bookingAWB === targetAWB;
+    });
 
-    console.log(`📋 Found ${reviewedBookings.length} reviewed bookings without InvoiceRequests\n`);
-
-    if (reviewedBookings.length === 0) {
-      console.log('✅ No bookings to process. All reviewed bookings already have InvoiceRequests.');
+    if (exactBookings.length === 0) {
+      console.log(`❌ No reviewed booking found with AWB: ${targetAWB}`);
       await mongoose.disconnect();
       return;
+    }
+
+    // Filter to only process bookings that don't have an InvoiceRequest
+    const filteredBookings = exactBookings.filter(booking => {
+      return !booking.converted_to_invoice_request_id;
+    });
+
+    console.log(`📋 Found ${exactBookings.length} reviewed booking(s) with AWB ${targetAWB}`);
+    if (exactBookings.length > filteredBookings.length) {
+      const existingCount = exactBookings.length - filteredBookings.length;
+      console.log(`   ${existingCount} booking(s) already have InvoiceRequest(s)`);
+      console.log(`   ${filteredBookings.length} booking(s) need InvoiceRequest(s)\n`);
+    } else {
+      console.log(`   ${filteredBookings.length} booking(s) need InvoiceRequest(s)\n`);
+    }
+
+    if (filteredBookings.length === 0) {
+      console.log(`✅ All bookings with AWB ${targetAWB} already have InvoiceRequests.`);
+      // Check if InvoiceRequest exists but booking is not linked
+      for (const booking of exactBookings) {
+        if (booking.converted_to_invoice_request_id) {
+          const invoiceRequest = await InvoiceRequest.findById(booking.converted_to_invoice_request_id).lean();
+          if (invoiceRequest) {
+            console.log(`   ✅ Booking ${booking.referenceNumber || booking._id} is linked to InvoiceRequest: ${invoiceRequest.invoice_number || invoiceRequest._id}`);
+          } else {
+            console.log(`   ⚠️  Booking ${booking.referenceNumber || booking._id} references InvoiceRequest ${booking.converted_to_invoice_request_id} but it doesn't exist. Will create new one.`);
+            // Add to filteredBookings to create a new one
+            filteredBookings.push(booking);
+          }
+        } else {
+          // Check if InvoiceRequest exists by AWB but not linked
+          const invoiceRequest = await InvoiceRequest.findOne({
+            $or: [
+              { tracking_code: targetAWB },
+              { awb_number: targetAWB }
+            ]
+          }).lean();
+          if (invoiceRequest) {
+            console.log(`   ⚠️  InvoiceRequest exists (${invoiceRequest.invoice_number || invoiceRequest._id}) for AWB ${targetAWB} but booking is not linked. Linking now...`);
+            // Link the booking to existing InvoiceRequest
+            await Booking.updateOne(
+              { _id: booking._id },
+              { $set: { converted_to_invoice_request_id: invoiceRequest._id } }
+            );
+            console.log(`   ✅ Linked booking to existing InvoiceRequest\n`);
+            await mongoose.disconnect();
+            return;
+          }
+        }
+      }
+      
+      if (filteredBookings.length === 0) {
+        await mongoose.disconnect();
+        return;
+      }
     }
 
     const results = {
@@ -358,10 +464,10 @@ async function createInvoiceRequestsForSampleBookings() {
       failed: []
     };
 
-    // Process each booking
-    for (let i = 0; i < reviewedBookings.length; i++) {
-      const booking = reviewedBookings[i];
-      console.log(`[${i + 1}/${reviewedBookings.length}] Processing booking: ${booking.referenceNumber || booking._id}`);
+    // Process each booking (should only be one: AEAK183HDVM2IM9N2)
+    for (let i = 0; i < filteredBookings.length; i++) {
+      const booking = filteredBookings[i];
+      console.log(`[${i + 1}/${filteredBookings.length}] Processing booking: ${booking.referenceNumber || booking._id}`);
       console.log(`   AWB: ${booking.awb || 'N/A'}`);
       console.log(`   Service: ${booking.service_code || booking.service || 'N/A'}`);
 
@@ -461,5 +567,6 @@ if (require.main === module) {
 }
 
 module.exports = { createInvoiceRequestsForSampleBookings, convertBookingToInvoiceRequest };
+
 
 
