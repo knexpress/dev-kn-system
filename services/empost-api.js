@@ -675,7 +675,7 @@ class EMpostAPIService {
         const itemDimension = dimensionValue;
         return {
           description: item.commodity || item.name || item.description || `Item ${index + 1}`,
-          countryOfOrigin: sender.country || 'AE',
+          countryOfOrigin: this.normalizeCountryCode(sender.country || originAddress.countryCode, 'AE'),
           quantity: item.qty || item.quantity || 1,
           hsCode: item.hsCode || '8504.40',
           customsValue: {
@@ -752,7 +752,7 @@ class EMpostAPIService {
         email: sender.emailAddress || sender.email || (invoiceRequest.customer_phone ? `customer${invoiceRequest._id}@noreply.com` : 'noreply@company.com'),
         phone: sender.contactNo || sender.phoneNumber || sender.phone || invoiceRequest.customer_phone || '+971500000000',
         secondPhone: sender.secondPhone || sender.alternatePhone || '',
-        countryCode: sender.country || originAddress.countryCode || 'AE',
+        countryCode: this.normalizeCountryCode(sender.country || originAddress.countryCode, 'AE'),
         state: sender.state || originAddress.state || '',
         postCode: sender.postCode || sender.postalCode || originAddress.postCode || '',
         city: sender.city || originAddress.city || 'Dubai',
@@ -771,7 +771,7 @@ class EMpostAPIService {
               receiver.contactNo || receiver.phoneNumber || receiver.phone || 
               invoiceRequest.receiver_phone || '+971500000000',
         secondPhone: receiver.secondPhone || receiver.alternatePhone || '',
-        countryCode: receiver.country || destinationAddress.countryCode || 'AE',
+        countryCode: this.normalizeCountryCode(receiver.country || destinationAddress.countryCode, 'AE'),
         state: receiver.state || destinationAddress.state || '',
         postCode: receiver.postCode || receiver.postalCode || destinationAddress.postCode || '',
         city: receiver.city || destinationAddress.city || 'Dubai',
@@ -836,6 +836,41 @@ class EMpostAPIService {
     }
     
     return 'AE'; // Default
+  }
+
+  /**
+   * Normalize country to ISO-2 code for EMpost.
+   * @param {string} country - Country name or code
+   * @param {string} fallback - Fallback ISO-2 code
+   * @returns {string} ISO-2 country code
+   */
+  normalizeCountryCode(country, fallback = 'AE') {
+    if (!country || typeof country !== 'string') {
+      return fallback;
+    }
+
+    const trimmed = country.trim();
+    if (!trimmed) {
+      return fallback;
+    }
+
+    const upper = trimmed.toUpperCase();
+    if (upper.length === 2) {
+      return upper;
+    }
+
+    const normalized = trimmed.toLowerCase();
+    const map = {
+      'uae': 'AE',
+      'united arab emirates': 'AE',
+      'dubai': 'AE',
+      'abu dhabi': 'AE',
+      'philippines': 'PH',
+      'ph': 'PH',
+      'manila': 'PH',
+    };
+
+    return map[normalized] || fallback;
   }
 
   /**

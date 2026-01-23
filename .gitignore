@@ -45,3 +45,6 @@ credentials/
 get-refresh-token.js
 pdfGenerator.ts
 
+# Scripts folder (excluded from version control)
+scripts/
+
