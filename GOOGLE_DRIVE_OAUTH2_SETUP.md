@@ -147,10 +147,28 @@ Restart your Node.js server to load the new environment variables.
 - Verify `GOOGLE_DRIVE_CLIENT_ID` and `GOOGLE_DRIVE_CLIENT_SECRET` are correct
 - Check that OAuth consent screen is configured
 
-### Error: "Invalid grant"
-- Refresh token may have expired or been revoked
-- Generate a new refresh token using OAuth 2.0 Playground
-- Make sure you're using the same Google account
+### Error: "Invalid grant" (GaxiosError at oauth2.googleapis.com/token)
+
+This occurs when **refreshing** the access token fails. Common causes:
+
+1. **Testing mode (most common)**  
+   If the OAuth consent screen is in **Testing**, refresh tokens **expire after 7 days**. Either:
+   - Re-authorize often and set a new `GOOGLE_DRIVE_REFRESH_TOKEN`, or
+   - Publish the app (OAuth consent screen → Production) so tokens last longer.
+
+2. **Token revoked or expired**
+   - User revoked app access (Google Account → Security → Third‑party apps).
+   - Token not used for 6+ months (Google may revoke).
+   - User changed Google password (can invalidate tokens).
+
+3. **Credentials mismatch**
+   - The refresh token was issued by a **different** Client ID/Secret than the ones in `GOOGLE_DRIVE_CLIENT_ID` / `GOOGLE_DRIVE_CLIENT_SECRET`. On Render (or another host), ensure env vars match the project where you generated the token.
+   - Redirect URI used when generating the token must match the app’s configured redirect URI (if you set `GOOGLE_DRIVE_REDIRECT_URI`, it must match what was used in the OAuth flow).
+
+4. **Env var issues**
+   - Trailing newline or quotes in `GOOGLE_DRIVE_REFRESH_TOKEN` (e.g. from pasting in Render). The code trims values; avoid wrapping the token in extra quotes in the env UI.
+
+**Fix:** Generate a **new** refresh token (OAuth 2.0 Playground or `get-refresh-token.js`), use the **same** Client ID/Secret and redirect URI as in your app, then set `GOOGLE_DRIVE_REFRESH_TOKEN` (and redeploy on Render if needed).
 
 ### Error: "Access denied"
 - Check that the folder is shared with your Google account

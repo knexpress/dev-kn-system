@@ -1,13 +1,15 @@
 const { Invoice } = require('../models/unified-schema');
 const empostAPI = require('../services/empost-api');
+const { isEmpostDisabled } = require('./empost-disabled-check');
 
 const REQUEST_POPULATE_FIELDS = 'request_id awb_number customer route status shipment verification number_of_boxes origin_place destination_place receiver_name receiver_address receiver_phone';
 
 async function syncInvoiceWithEMPost({ invoiceId, requestId, reason }) {
-  // EMPOST API is disabled for testing
-  console.log('[EMPOST SYNC] EMPOST API is disabled. Skipping sync.');
-  return;
-  
+  if (isEmpostDisabled()) {
+    console.log('[EMPOST SYNC] EMPOST API is disabled. Skipping sync.');
+    return;
+  }
+
   try {
     let invoiceQuery;
 

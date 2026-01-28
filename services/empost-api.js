@@ -1,5 +1,6 @@
 const axios = require('axios');
 const https = require('https');
+const { isEmpostDisabled } = require('../utils/empost-disabled-check');
 
 /**
  * EMpost API Service
@@ -124,9 +125,9 @@ class EMpostAPIService {
    * @returns {Promise<Object>} EMpost shipment response
    */
   async createShipment(invoice) {
-    if (process.env.EMPOST_API_DISABLED === 'true') {
-    console.log('[EMPOST DISABLED] Skipping shipment creation in EMPOST');
-    return { data: { uhawb: 'N/A' } };
+    if (isEmpostDisabled()) {
+      console.log('[EMPOST DISABLED] Skipping shipment creation in EMPOST');
+      return { data: { uhawb: 'N/A' } };
     }
     
     try {
@@ -162,9 +163,9 @@ class EMpostAPIService {
    * @returns {Promise<Object>} EMpost shipment response
    */
   async createShipmentFromData(shipmentData) {
-    if (process.env.EMPOST_API_DISABLED === 'true') {
-    console.log('[EMPOST DISABLED] Skipping shipment creation from data in EMPOST');
-    return { data: { uhawb: 'N/A' } };
+    if (isEmpostDisabled()) {
+      console.log('[EMPOST DISABLED] Skipping shipment creation from data in EMPOST');
+      return { data: { uhawb: 'N/A' } };
     }
     
     try {
@@ -197,9 +198,9 @@ class EMpostAPIService {
    * @returns {Promise<Object>} EMpost shipment response
    */
   async createShipmentFromInvoiceRequest(invoiceRequest) {
-    if (process.env.EMPOST_API_DISABLED === 'true') {
-    console.log('[EMPOST DISABLED] Skipping shipment creation from InvoiceRequest in EMPOST');
-    return { data: { uhawb: 'N/A' } };
+    if (isEmpostDisabled()) {
+      console.log('[EMPOST DISABLED] Skipping shipment creation from InvoiceRequest in EMPOST');
+      return { data: { uhawb: 'N/A' } };
     }
     
     try {
@@ -237,9 +238,9 @@ class EMpostAPIService {
    * @returns {Promise<Object>} EMpost update response
    */
   async updateShipmentStatus(trackingNumber, status, additionalData = {}) {
-    if (process.env.EMPOST_API_DISABLED === 'true') {
-    console.log('[EMPOST DISABLED] Skipping shipment status update in EMPOST');
-    return { success: true, message: 'EMPOST API disabled' };
+    if (isEmpostDisabled()) {
+      console.log('[EMPOST DISABLED] Skipping shipment status update in EMPOST');
+      return { success: true, message: 'EMPOST API disabled' };
     }
     
     try {
@@ -298,9 +299,9 @@ class EMpostAPIService {
    * @returns {Promise<Object>} EMpost invoice response
    */
   async issueInvoice(invoice) {
-    if (process.env.EMPOST_API_DISABLED === 'true') {
-    console.log('[EMPOST DISABLED] Skipping invoice issuance in EMPOST');
-    return { success: true, message: 'EMPOST API disabled' };
+    if (isEmpostDisabled()) {
+      console.log('[EMPOST DISABLED] Skipping invoice issuance in EMPOST');
+      return { success: true, message: 'EMPOST API disabled' };
     }
     
     try {
@@ -885,8 +886,7 @@ class EMpostAPIService {
    * @returns {Promise<Object>} EMpost cancellation response
    */
   async cancelDelivery(assignmentData) {
-    // EMPOST API is disabled for testing
-    if (process.env.EMPOST_API_DISABLED === 'true') {
+    if (isEmpostDisabled()) {
       console.log('[EMPOST DISABLED] Skipping delivery cancellation in EMPOST');
       return { success: true, message: 'EMPOST API disabled', reference: 'MOCK-REF-' + Date.now() };
     }

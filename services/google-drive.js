@@ -51,11 +51,12 @@ class GoogleDriveService {
           }
         }
         
-        // Fall back to environment variables
-        clientId = clientId || process.env.GOOGLE_DRIVE_CLIENT_ID;
-        clientSecret = clientSecret || process.env.GOOGLE_DRIVE_CLIENT_SECRET;
-        refreshToken = refreshToken || process.env.GOOGLE_DRIVE_REFRESH_TOKEN;
-        const redirectUri = process.env.GOOGLE_DRIVE_REDIRECT_URI || 
+        // Fall back to environment variables (trim to avoid newline/space from env)
+        const trimEnv = (v) => (v && typeof v === 'string' ? v.trim() : v);
+        clientId = clientId || trimEnv(process.env.GOOGLE_DRIVE_CLIENT_ID);
+        clientSecret = clientSecret || trimEnv(process.env.GOOGLE_DRIVE_CLIENT_SECRET);
+        refreshToken = refreshToken || trimEnv(process.env.GOOGLE_DRIVE_REFRESH_TOKEN);
+        const redirectUri = trimEnv(process.env.GOOGLE_DRIVE_REDIRECT_URI) || 
           (fs.existsSync(oauth2CredentialsPath) ? 
             JSON.parse(fs.readFileSync(oauth2CredentialsPath, 'utf8')).web?.redirect_uris?.[0] : 
             'http://localhost:3000/oauth2callback');
@@ -233,6 +234,13 @@ class GoogleDriveService {
         createdTime: file.data.createdTime,
       };
     } catch (error) {
+      const isInvalidGrant = error?.response?.data?.error === 'invalid_grant';
+      if (isInvalidGrant) {
+        console.error('❌ Google OAuth "invalid_grant": refresh token expired or revoked.');
+        console.error('   → Regenerate a refresh token (see GOOGLE_DRIVE_OAUTH2_SETUP.md).');
+        console.error('   → If the app is in Testing mode, tokens expire in 7 days — re-authorize or publish the app.');
+        console.error('   → Ensure GOOGLE_DRIVE_CLIENT_ID/SECRET/REFRESH_TOKEN match the app that issued the token.');
+      }
       console.error(`❌ Error uploading PDF to Google Drive:`, error);
       throw error;
     }

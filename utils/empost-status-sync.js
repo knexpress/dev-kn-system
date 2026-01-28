@@ -1,4 +1,5 @@
 const empostAPI = require('../services/empost-api');
+const { isEmpostDisabled } = require('./empost-disabled-check');
 
 /**
  * Sync shipment status to EMPOST API
@@ -12,12 +13,13 @@ const empostAPI = require('../services/empost-api');
  * @returns {Promise<void>}
  */
 async function syncStatusToEMPost({ trackingNumber, status, additionalData = {}, silent = false }) {
-  // EMPOST API is disabled for testing
-  if (!silent) {
-    console.log('[EMPOST STATUS SYNC] EMPOST API is disabled. Skipping status sync.');
+  if (isEmpostDisabled()) {
+    if (!silent) {
+      console.log('[EMPOST STATUS SYNC] EMPOST API is disabled. Skipping status sync.');
+    }
+    return;
   }
-  return;
-  
+
   // Skip if no tracking number or status
   if (!trackingNumber || !status || trackingNumber === 'N/A') {
     if (!silent) {
