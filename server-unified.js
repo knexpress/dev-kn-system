@@ -38,13 +38,22 @@ app.use(helmet({
 
 // CORS configuration
 const allowedOrigins = [
-  process.env.FRONTEND_URL,
   'https://finance-system-frontend.vercel.app',
+  'https://productionknexpress.com',
+  'https://www.productionknexpress.com',
   'http://localhost:9002',
-  'http://localhost:3000'
-].filter(Boolean);
+  'http://localhost:3000',
+  ...(process.env.FRONTEND_URL || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean),
+  ...(process.env.FRONTEND_URLS || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+];
 
-app.use(cors({
+const corsOptions = {
   origin: function (origin, callback) {
     if (!origin || allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV !== 'production') {
       callback(null, true);
@@ -54,8 +63,11 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-csrf-token', 'X-CSRF-Token', 'X-Requested-With', 'Accept']
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
 // Request size validation
 app.use(validateRequestSize);

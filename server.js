@@ -73,12 +73,21 @@ app.use(sanitizeRequest);
 // CORS configuration - allow multiple origins
 const allowedOrigins = [
   'https://finance-system-frontend.vercel.app',
+  'https://productionknexpress.com',
+  'https://www.productionknexpress.com',
   'http://localhost:9002',
   'http://localhost:3000',
-  process.env.FRONTEND_URL
-].filter(Boolean); // Remove any undefined values
+  ...(process.env.FRONTEND_URL || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean),
+  ...(process.env.FRONTEND_URLS || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+];
 
-app.use(cors({
+const corsOptions = {
   origin: function (origin, callback) {
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
@@ -92,7 +101,10 @@ app.use(cors({
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-csrf-token', 'X-CSRF-Token', 'X-Requested-With', 'Accept']
-}));
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
 // Enhanced Rate Limiting - Stricter for DDoS protection
 const generalLimiter = rateLimit({
