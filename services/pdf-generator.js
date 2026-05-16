@@ -1,6 +1,99 @@
 const { jsPDF } = require('jspdf');
 const axios = require('axios');
 
+function formatUaePassDisplayValue(value) {
+  if (value === null || value === undefined) return 'N/A';
+  const s = String(value).trim();
+  return s === '' ? 'N/A' : s;
+}
+
+function pickUaePassUserInfoFromBooking(booking) {
+  if (!booking || typeof booking !== 'object') return undefined;
+  const sender =
+    booking.sender && typeof booking.sender === 'object' ? booking.sender : undefined;
+  const collections =
+    booking.collections && typeof booking.collections === 'object'
+      ? booking.collections
+      : undefined;
+  const raw =
+    booking.uaePassUserInfo ||
+    (sender && sender.uaePassUserInfo) ||
+    (collections && collections.uaePassUserInfo);
+  if (!raw || typeof raw !== 'object') return undefined;
+  const normalized = {
+    uuid: raw.uuid != null ? String(raw.uuid) : undefined,
+    email: raw.email != null ? String(raw.email) : undefined,
+    mobile: raw.mobile != null ? String(raw.mobile) : undefined,
+    fullnameEN: raw.fullnameEN != null ? String(raw.fullnameEN) : undefined,
+    nationalityEN: raw.nationalityEN != null ? String(raw.nationalityEN) : undefined,
+    userType: raw.userType != null ? String(raw.userType) : undefined,
+    spuuid:
+      raw.spuuid === null || raw.spuuid === undefined ? null : String(raw.spuuid),
+    eid_number: raw.eid_number != null ? String(raw.eid_number) : undefined,
+  };
+  const hasAny = Object.values(normalized).some(
+    (v) => v !== undefined && v !== null && String(v).trim() !== ''
+  );
+  return hasAny ? normalized : undefined;
+}
+
+function renderUaePassUserInfoSection(doc, info, margin, pageWidth, pageHeight, startY, addNewPage, options = {}) {
+  let yPos = startY;
+  const contentWidth = pageWidth - margin * 2;
+  const lineGap = 5;
+  const fields = [
+    { label: 'FULL NAME (EN)', value: formatUaePassDisplayValue(info.fullnameEN) },
+    { label: 'EMAIL', value: formatUaePassDisplayValue(info.email) },
+    { label: 'MOBILE', value: formatUaePassDisplayValue(info.mobile) },
+    { label: 'NATIONALITY', value: formatUaePassDisplayValue(info.nationalityEN) },
+    { label: 'EID NUMBER', value: formatUaePassDisplayValue(info.eid_number) },
+    { label: 'USER TYPE', value: formatUaePassDisplayValue(info.userType) },
+    { label: 'UUID', value: formatUaePassDisplayValue(info.uuid) },
+    { label: 'SP UUID', value: formatUaePassDisplayValue(info.spuuid) },
+  ];
+
+  let estimatedHeight = 12;
+  fields.forEach((f) => {
+    const lines = doc.splitTextToSize(f.value, contentWidth - 4);
+    estimatedHeight += 5 + Math.max(1, lines.length) * 4 + lineGap;
+  });
+
+  if (yPos + estimatedHeight > pageHeight - margin - 15) {
+    addNewPage();
+    yPos = margin + 10;
+  } else if (!options.skipLeadingGap) {
+    yPos += 5;
+  }
+
+  doc.setFontSize(10);
+  doc.setFont('helvetica', 'bold');
+  doc.setTextColor(0, 128, 0);
+  doc.text('UAE PASS — VERIFIED USER INFORMATION', margin, yPos);
+  yPos += 8;
+
+  doc.setTextColor(0, 0, 0);
+  fields.forEach(({ label, value }) => {
+    if (yPos > pageHeight - margin - 20) {
+      addNewPage();
+      yPos = margin + 10;
+    }
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(7);
+    doc.text(label, margin, yPos);
+    yPos += 5;
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(9);
+    const valueLines = doc.splitTextToSize(value, contentWidth);
+    valueLines.forEach((line) => {
+      doc.text(line, margin, yPos);
+      yPos += 4;
+    });
+    yPos += lineGap;
+  });
+
+  return yPos + 4;
+}
+
 /**
  * Generate PDF for booking data
  * Adapted from pdfGenerator.ts for Node.js backend
@@ -702,6 +795,57 @@ async function generateBookingPDF(data) {
     }
   }
 
+  // ============================================
+  // DISCLAIMER (last page) + UAE Pass details below
+  // ============================================
+  addNewPage();
+  const disclaimerPageNumber = doc.getNumberOfPages();
+  let disclaimerYPos = margin + 20;
+
+  doc.setPage(disclaimerPageNumber);
+
+  doc.setFontSize(14);
+  doc.setFont('helvetica', 'bold');
+  doc.setTextColor(255, 0, 0);
+  doc.text('DISCLAIMER', margin, disclaimerYPos);
+  disclaimerYPos += 12;
+
+  doc.setFontSize(11);
+  doc.setFont('helvetica', 'bold');
+  doc.setTextColor(255, 0, 0);
+  const disclaimerText =
+    'We hereby declare that all requirements provided by them are for documentation purposes only and shall be treated as strictly confidential.';
+  const disclaimerLines = doc.splitTextToSize(disclaimerText, pageWidth - margin * 2);
+
+  const lineHeight = 7;
+  const disclaimerBlockHeight = disclaimerLines.length * (lineHeight + 2) + 4;
+
+  doc.setFillColor(255, 200, 200);
+  doc.rect(margin, disclaimerYPos - 6, pageWidth - margin * 2, disclaimerBlockHeight, 'F');
+
+  disclaimerLines.forEach((line) => {
+    doc.text(line, margin + 2, disclaimerYPos);
+    disclaimerYPos += lineHeight;
+  });
+
+  if (data.uaePassUserInfo) {
+    disclaimerYPos += 14;
+    doc.setPage(disclaimerPageNumber);
+    renderUaePassUserInfoSection(
+      doc,
+      data.uaePassUserInfo,
+      margin,
+      pageWidth,
+      pageHeight,
+      disclaimerYPos,
+      () => {
+        addNewPage();
+        doc.setPage(doc.getNumberOfPages());
+      },
+      { skipLeadingGap: true }
+    );
+  }
+
   // Add footer to all pages
   const totalPages = doc.getNumberOfPages();
   for (let i = 1; i <= totalPages; i++) {
@@ -718,5 +862,5 @@ async function generateBookingPDF(data) {
   return doc.output('arraybuffer');
 }
 
-module.exports = { generateBookingPDF };
+module.exports = { generateBookingPDF, pickUaePassUserInfoFromBooking };
 

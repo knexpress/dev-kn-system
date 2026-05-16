@@ -8,6 +8,7 @@
     "dev": "nodemon --exec \"node --max-old-space-size=4096\" server.js",
     "build": "echo \"no build step\"",
     "seed": "node --max-old-space-size=4096 scripts/seed.js",
+    "seed:manager": "node scripts/seed-manager-user.js",
     "setup": "node setup-env.js",
     "test": "node -e \"require('dotenv').config(); const mongoose = require('mongoose'); mongoose.connect(process.env.MONGODB_URI).then(() => { console.log('✅ Backend test passed!'); process.exit(0); }).catch(err => { console.error('❌ Backend test failed:', err.message); process.exit(1); });\""
   },
