@@ -814,6 +814,11 @@ router.post('/', async (req, res) => {
         salesBookingData.tracking_code = awbValue;
       }
 
+      // Invoice Requests "New Booking" — must be manually reviewed (never auto-approved)
+      if (bookingData.skip_auto_review === true) {
+        salesBookingData.skip_auto_review = true;
+      }
+
       // Create booking
       const booking = new Booking(salesBookingData);
       await booking.save();
@@ -2760,13 +2765,15 @@ router.post('/auto-review/batch', auth, async (req, res) => {
     }
 
     const maxLimit = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 100);
-    let query = buildStatusQuery('not_reviewed');
+    const autoReviewEligibleFilter = { skip_auto_review: { $ne: true } };
+    let query = { ...buildStatusQuery('not_reviewed'), ...autoReviewEligibleFilter };
 
     if (Array.isArray(booking_ids) && booking_ids.length > 0) {
       const validIds = booking_ids.filter((id) => mongoose.Types.ObjectId.isValid(id));
       query = {
         _id: { $in: validIds.map((id) => new mongoose.Types.ObjectId(id)) },
         ...buildStatusQuery('not_reviewed'),
+        ...autoReviewEligibleFilter,
       };
     }
 
@@ -2993,7 +3000,7 @@ async function generateAndUploadBookingPDF(booking, invoiceRequest) {
     
     if (!fullBooking) {
       console.error(`❌ Booking not found: ${bookingId}`);
-      return;
+      return { success: false, error: 'Booking not found' };
     }
     
     // Extract booking data for PDF
@@ -3223,12 +3230,13 @@ async function generateAndUploadBookingPDF(booking, invoiceRequest) {
       console.log(`   📁 Folder: ${uploadResult.folderName}`);
       console.log(`   📄 File: ${uploadResult.fileName}`);
       console.log(`   🔗 View: ${uploadResult.webViewLink}`);
-    } else {
-      console.error(`❌ PDF upload failed: ${uploadResult.error}`);
+      return uploadResult;
     }
+    console.error(`❌ PDF upload failed: ${uploadResult.error}`);
+    return { success: false, error: uploadResult.error };
   } catch (error) {
     console.error('❌ Error in generateAndUploadBookingPDF:', error);
-    // Don't throw - this is a background process
+    return { success: false, error: error.message };
   }
 }
 
@@ -3241,4 +3249,5 @@ function getBookingReviewDeps() {
 }
 
 module.exports = router;
+module.exports.generateAndUploadBookingPDF = generateAndUploadBookingPDF;
 

@@ -9,6 +9,8 @@
     "build": "echo \"no build step\"",
     "seed": "node --max-old-space-size=4096 scripts/seed.js",
     "seed:manager": "node scripts/seed-manager-user.js",
+    "seed:sales": "node scripts/seed-sales-user.js",
+    "pdfs:to-drive": "node scripts/batch-pdfs-to-drive.js",
     "setup": "node setup-env.js",
     "test": "node -e \"require('dotenv').config(); const mongoose = require('mongoose'); mongoose.connect(process.env.MONGODB_URI).then(() => { console.log('✅ Backend test passed!'); process.exit(0); }).catch(err => { console.error('❌ Backend test failed:', err.message); process.exit(1); });\""
   },

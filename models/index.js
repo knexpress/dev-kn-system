@@ -1068,6 +1068,12 @@ const bookingSchema = new mongoose.Schema({
     ref: 'InvoiceRequest',
     required: false,
   },
+
+  // When true, booking is excluded from auto-review batch (Invoice Requests sales form)
+  skip_auto_review: {
+    type: Boolean,
+    default: false,
+  },
   
   // Cargo Status Management
   shipment_status: {
