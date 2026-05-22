@@ -1168,6 +1168,39 @@ bookingSchema.index({ 'sender.name': 'text', 'receiver.name': 'text', 'customer_
 
 const Booking = mongoose.models.Booking || mongoose.model('Booking', bookingSchema);
 
+// Singleton system settings (admin-controlled)
+const systemSettingsSchema = new mongoose.Schema({
+  key: {
+    type: String,
+    required: true,
+    unique: true,
+    default: 'global',
+  },
+  booking_auto_review_enabled: {
+    type: Boolean,
+    default: false,
+  },
+  booking_auto_review_reviewer_employee_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Employee',
+    required: false,
+  },
+  booking_auto_review_updated_by: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: false,
+  },
+  booking_auto_review_updated_at: {
+    type: Date,
+    required: false,
+  },
+}, {
+  timestamps: true,
+});
+
+const SystemSettings =
+  mongoose.models.SystemSettings || mongoose.model('SystemSettings', systemSettingsSchema);
+
 // Audit Report Schema for tracking cancellations and deletions
 const auditReportSchema = new mongoose.Schema({
   report_type: {
@@ -1245,6 +1278,7 @@ module.exports = {
   Collections,
   PerformanceMetrics,
   Booking,
+  SystemSettings,
   ChatRoom,
   ChatMessage,
   AuditReport

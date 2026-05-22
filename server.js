@@ -40,6 +40,7 @@ const qrPaymentSessionRoutes = require('./routes/qr-payment-sessions');
 const paymentRemittanceRoutes = require('./routes/payment-remittances');
 const csvUploadRoutes = require('./routes/csv-upload');
 const bookingsRoutes = require('./routes/bookings');
+const systemSettingsRoutes = require('./routes/system-settings');
 const chatRoutes = require('./routes/chat');
 const activityRoutes = require('./routes/activity');
 const errorMonitoringRoutes = require('./routes/errors');
@@ -252,6 +253,7 @@ app.use('/api/csv-upload', csvUploadRoutes);
 
 // Bookings routes
 app.use('/api/bookings', bookingsRoutes);
+app.use('/api/system-settings', systemSettingsRoutes);
 
 // Inter-Department Chat routes
 app.use('/api/chat', chatRoutes);

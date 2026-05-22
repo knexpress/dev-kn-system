@@ -8,6 +8,7 @@ const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/i
 const { syncClientFromBooking } = require('../utils/client-sync');
 const auth = require('../middleware/auth');
 const { performBookingReview } = require('../services/booking-review-approve');
+const { tryAutoReviewNewBookingAfterCreate } = require('../services/booking-auto-review-on-create');
 const { validateObjectIdParam, sanitizeRegex } = require('../middleware/security');
 const { generateBookingPDF, pickUaePassUserInfoFromBooking } = require('../services/pdf-generator');
 const googleDriveService = require('../services/google-drive');
@@ -828,9 +829,15 @@ router.post('/', async (req, res) => {
         console.error('[CLIENT_SYNC] Background client sync failed:', err);
       });
 
+      const reviewDeps = getBookingReviewDeps();
+      await tryAutoReviewNewBookingAfterCreate(booking, reviewDeps, {
+        reviewedByEmployeeId: booking.created_by_employee_id,
+      });
+      const salesBookingOut = await Booking.findById(booking._id);
+
       res.status(201).json({
         success: true,
-        data: booking,
+        data: salesBookingOut || booking,
         message: 'Sales booking created successfully'
       });
     } else {
@@ -889,9 +896,15 @@ router.post('/', async (req, res) => {
         console.error('[CLIENT_SYNC] Background client sync failed:', err);
       });
 
+      const reviewDepsRegular = getBookingReviewDeps();
+      await tryAutoReviewNewBookingAfterCreate(booking, reviewDepsRegular, {
+        reviewedByEmployeeId: booking.created_by_employee_id,
+      });
+      const regularBookingOut = await Booking.findById(booking._id);
+
       res.status(201).json({
         success: true,
-        data: booking,
+        data: regularBookingOut || booking,
         message: 'Booking created successfully'
       });
     }
@@ -3250,4 +3263,5 @@ function getBookingReviewDeps() {
 
 module.exports = router;
 module.exports.generateAndUploadBookingPDF = generateAndUploadBookingPDF;
+module.exports.getBookingReviewDeps = getBookingReviewDeps;
 
