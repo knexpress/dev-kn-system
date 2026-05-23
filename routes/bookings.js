@@ -1186,7 +1186,7 @@ function buildPartyNameSearchQuery(nameInput) {
   return nameFields(fullPattern);
 }
 
-// Search reviewed/approved bookings for booking-forms (Sales / Operations PDF download)
+// Search bookings for booking-forms (Sales / Operations PDF download — all review statuses)
 router.post('/search-approved-forms', auth, async (req, res) => {
   try {
     const { awb, name } = req.body;
@@ -1200,7 +1200,6 @@ router.post('/search-approved-forms', auth, async (req, res) => {
       });
     }
 
-    const approvedFilter = buildStatusQuery('reviewed');
     let searchClause = null;
 
     if (awbTrim) {
@@ -1227,7 +1226,7 @@ router.post('/search-approved-forms', auth, async (req, res) => {
       }
     }
 
-    const query = { $and: [approvedFilter, searchClause] };
+    const query = searchClause;
     const listProjection =
       'awb awb_number tracking_code referenceNumber review_status createdAt service service_code sender receiver shipmentType insured declaredAmount';
 
@@ -1263,10 +1262,10 @@ router.post('/search-approved-forms', auth, async (req, res) => {
 
     res.json({ success: true, data });
   } catch (error) {
-    console.error('Error searching approved booking forms:', error);
+    console.error('Error searching booking forms:', error);
     res.status(500).json({
       success: false,
-      error: 'Failed to search approved bookings',
+      error: 'Failed to search bookings',
       details: error.message,
     });
   }
