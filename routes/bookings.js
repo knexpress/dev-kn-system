@@ -1147,6 +1147,131 @@ router.put('/:id', validateObjectIdParam('id'), async (req, res) => {
   }
 });
 
+/**
+ * Build $or query matching sender/receiver/root name fields (single token or "first last").
+ */
+function buildPartyNameSearchQuery(nameInput) {
+  const trimmed = String(nameInput || '').trim();
+  if (!trimmed) return null;
+
+  const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const safeNamePattern = /^[a-zA-Z\s'-]+$/;
+  if (!safeNamePattern.test(trimmed)) return null;
+
+  const parts = trimmed.split(/\s+/).filter(Boolean);
+  const nameFields = (regex) => ({
+    $or: [
+      { 'sender.firstName': regex },
+      { 'sender.lastName': regex },
+      { 'sender.name': regex },
+      { 'sender.fullName': regex },
+      { 'receiver.firstName': regex },
+      { 'receiver.lastName': regex },
+      { 'receiver.name': regex },
+      { 'receiver.fullName': regex },
+      { customer_name: regex },
+      { customerName: regex },
+      { name: regex },
+    ],
+  });
+
+  if (parts.length === 1) {
+    const r = new RegExp(escapeRegex(parts[0]), 'i');
+    return nameFields(r);
+  }
+
+  const first = escapeRegex(parts[0]);
+  const last = escapeRegex(parts.slice(1).join(' '));
+  const fullPattern = new RegExp(`${first}.*${last}|${last}.*${first}`, 'i');
+  return nameFields(fullPattern);
+}
+
+// Search reviewed/approved bookings for booking-forms (Sales / Operations PDF download)
+router.post('/search-approved-forms', auth, async (req, res) => {
+  try {
+    const { awb, name } = req.body;
+    const awbTrim = awb && String(awb).trim();
+    const nameTrim = name && String(name).trim();
+
+    if (!awbTrim && !nameTrim) {
+      return res.status(400).json({
+        success: false,
+        error: 'Provide AWB or sender/receiver name to search',
+      });
+    }
+
+    const approvedFilter = buildStatusQuery('reviewed');
+    let searchClause = null;
+
+    if (awbTrim) {
+      const sanitizedAwb = sanitizeAwb(awbTrim);
+      if (!sanitizedAwb) {
+        return res.status(400).json({ success: false, error: 'Invalid AWB format' });
+      }
+      const escapedAwb = sanitizeRegex(sanitizedAwb);
+      searchClause = {
+        $or: [
+          { awb: { $regex: escapedAwb, $options: 'i' } },
+          { tracking_code: { $regex: escapedAwb, $options: 'i' } },
+          { awb_number: { $regex: escapedAwb, $options: 'i' } },
+          { referenceNumber: { $regex: escapedAwb, $options: 'i' } },
+        ],
+      };
+    } else {
+      searchClause = buildPartyNameSearchQuery(nameTrim);
+      if (!searchClause) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid name search',
+        });
+      }
+    }
+
+    const query = { $and: [approvedFilter, searchClause] };
+    const listProjection =
+      'awb awb_number tracking_code referenceNumber review_status createdAt service service_code sender receiver shipmentType insured declaredAmount';
+
+    const bookings = await Booking.find(query)
+      .select(listProjection)
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .lean();
+
+    const data = bookings.map((b) => {
+      const awbVal =
+        b.tracking_code || b.awb_number || b.awb || b.referenceNumber || null;
+      const senderName =
+        b.sender?.fullName ||
+        b.sender?.name ||
+        [b.sender?.firstName, b.sender?.lastName].filter(Boolean).join(' ') ||
+        null;
+      const receiverName =
+        b.receiver?.fullName ||
+        b.receiver?.name ||
+        [b.receiver?.firstName, b.receiver?.lastName].filter(Boolean).join(' ') ||
+        null;
+      return {
+        _id: b._id,
+        awb: awbVal,
+        review_status: b.review_status,
+        createdAt: b.createdAt,
+        service: b.service || b.service_code,
+        sender_name: senderName,
+        receiver_name: receiverName,
+      };
+    });
+
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('Error searching approved booking forms:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to search approved bookings',
+      details: error.message,
+    });
+  }
+});
+
 // Search bookings by customer first name and last name
 // Returns full booking objects with AWB information for invoice request filtering
 router.post('/search-awb-by-name', auth, async (req, res) => {
