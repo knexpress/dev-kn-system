@@ -50,7 +50,13 @@ router.put('/booking-auto-review', auth, requireSettingsManager, async (req, res
       });
     }
 
-    const doc = await setBookingAutoReviewEnabled(enabled, req.user.id);
+    const reviewerEmployeeId =
+      req.user.employee?._id ?? req.user.employee ?? null;
+    const doc = await setBookingAutoReviewEnabled(
+      enabled,
+      req.user.id,
+      reviewerEmployeeId
+    );
     res.json({
       success: true,
       data: {

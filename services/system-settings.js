@@ -16,13 +16,13 @@ async function isBookingAutoReviewEnabled() {
   return doc.booking_auto_review_enabled === true;
 }
 
-async function setBookingAutoReviewEnabled(enabled, userId) {
-  const doc = await getOrCreateSettings();
-  doc.booking_auto_review_enabled = enabled === true;
-  doc.booking_auto_review_updated_by = userId || null;
-  doc.booking_auto_review_updated_at = new Date();
-  await doc.save();
-  return doc;
+function toValidObjectIdString(value) {
+  if (value == null) return null;
+  const str =
+    typeof value === 'object' && value._id != null
+      ? value._id.toString()
+      : String(value);
+  return mongoose.Types.ObjectId.isValid(str) ? str : null;
 }
 
 function isPendingReviewStatus(reviewStatus) {
@@ -40,21 +40,17 @@ function isPendingReviewStatus(reviewStatus) {
  * Resolve employee id used as reviewed_by_employee_id for system auto-approve.
  */
 async function resolveAutoReviewReviewerId(booking, explicitId) {
-  if (explicitId) {
-    return mongoose.Types.ObjectId.isValid(explicitId)
-      ? explicitId.toString()
-      : null;
-  }
+  const fromExplicit = toValidObjectIdString(explicitId);
+  if (fromExplicit) return fromExplicit;
 
-  if (booking?.created_by_employee_id) {
-    const id = booking.created_by_employee_id;
-    return typeof id === 'object' && id._id ? id._id.toString() : String(id);
-  }
+  const fromBooking = toValidObjectIdString(booking?.created_by_employee_id);
+  if (fromBooking) return fromBooking;
 
   const settings = await getOrCreateSettings();
-  if (settings.booking_auto_review_reviewer_employee_id) {
-    return settings.booking_auto_review_reviewer_employee_id.toString();
-  }
+  const fromSettings = toValidObjectIdString(
+    settings.booking_auto_review_reviewer_employee_id
+  );
+  if (fromSettings) return fromSettings;
 
   const adminUser = await User.findOne({
     role: { $in: ['ADMIN', 'SUPERADMIN'] },
@@ -64,11 +60,56 @@ async function resolveAutoReviewReviewerId(booking, explicitId) {
     .select('employee_id')
     .lean();
 
-  if (adminUser?.employee_id) {
-    return adminUser.employee_id.toString();
+  const fromAdmin = toValidObjectIdString(adminUser?.employee_id);
+  if (fromAdmin) return fromAdmin;
+
+  const anyUserWithEmployee = await User.findOne({
+    isActive: { $ne: false },
+    employee_id: { $exists: true, $ne: null },
+  })
+    .select('employee_id')
+    .lean();
+
+  return toValidObjectIdString(anyUserWithEmployee?.employee_id);
+}
+
+async function setBookingAutoReviewEnabled(enabled, userId, reviewerEmployeeId) {
+  const doc = await getOrCreateSettings();
+  doc.booking_auto_review_enabled = enabled === true;
+  doc.booking_auto_review_updated_by = userId || null;
+  doc.booking_auto_review_updated_at = new Date();
+
+  const reviewerId = toValidObjectIdString(reviewerEmployeeId);
+  if (enabled && reviewerId) {
+    doc.booking_auto_review_reviewer_employee_id = reviewerId;
   }
 
-  return null;
+  if (enabled && !toValidObjectIdString(doc.booking_auto_review_reviewer_employee_id)) {
+    const fallback = await resolveAutoReviewReviewerId(null, reviewerId);
+    if (fallback) {
+      doc.booking_auto_review_reviewer_employee_id = fallback;
+    }
+  }
+
+  await doc.save();
+
+  try {
+    const { refreshBookingAutoReviewWorker, stopBookingAutoReviewWorker } = require('./booking-auto-review-worker');
+    const { getBookingReviewDeps } = require('../routes/bookings');
+    if (enabled) {
+      setImmediate(() => {
+        refreshBookingAutoReviewWorker(getBookingReviewDeps).catch((err) => {
+          console.error('[auto-review-worker] Refresh after settings update failed:', err.message);
+        });
+      });
+    } else {
+      stopBookingAutoReviewWorker();
+    }
+  } catch (err) {
+    console.warn('[auto-review-worker] Could not refresh worker:', err.message);
+  }
+
+  return doc;
 }
 
 async function getPublicSystemSettings() {
@@ -86,4 +127,5 @@ module.exports = {
   isPendingReviewStatus,
   resolveAutoReviewReviewerId,
   getPublicSystemSettings,
+  toValidObjectIdString,
 };

@@ -214,9 +214,15 @@ if (/^mongodb\+srv:\/\//i.test(MONGODB_URI) && process.env.MONGO_USE_SYSTEM_DNS 
 }
 
 mongoose.connect(MONGODB_URI)
-.then(() => {
+.then(async () => {
   console.log('✅ Connected to MongoDB');
-  
+  try {
+    const { getBookingReviewDeps } = require('./routes/bookings');
+    const { refreshBookingAutoReviewWorker } = require('./services/booking-auto-review-worker');
+    await refreshBookingAutoReviewWorker(getBookingReviewDeps);
+  } catch (err) {
+    console.warn('[auto-review-worker] Startup init skipped:', err.message);
+  }
 })
 .catch((error) => {
   console.error('❌ MongoDB connection error:', error);
