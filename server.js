@@ -8,7 +8,6 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { sanitizeRequest, validateRequestSize, limitQueryComplexity } = require('./middleware/security');
-const { initializeWebSocketServer } = require('./services/websocket-server');
 const {
   storeBackendError,
   attachConsoleErrorCapture,
@@ -22,9 +21,7 @@ const employeeRoutes = require('./routes/employees');
 const clientRoutes = require('./routes/clients');
 const requestRoutes = require('./routes/requests');
 const ticketRoutes = require('./routes/tickets');
-const internalRequestRoutes = require('./routes/internal-requests');
 const reportRoutes = require('./routes/reports');
-const cashTrackerRoutes = require('./routes/cashTracker');
 const invoiceRequestRoutes = require('./routes/invoiceRequests');
 const collectionsRoutes = require('./routes/collections');
 const { router: notificationRoutes } = require('./routes/notifications');
@@ -41,7 +38,6 @@ const paymentRemittanceRoutes = require('./routes/payment-remittances');
 const csvUploadRoutes = require('./routes/csv-upload');
 const bookingsRoutes = require('./routes/bookings');
 const systemSettingsRoutes = require('./routes/system-settings');
-const chatRoutes = require('./routes/chat');
 const activityRoutes = require('./routes/activity');
 const errorMonitoringRoutes = require('./routes/errors');
 
@@ -259,9 +255,7 @@ app.use('/api/employees', employeeRoutes);
 app.use('/api/clients', clientRoutes);
 app.use('/api/requests', requestRoutes);
 app.use('/api/tickets', ticketRoutes);
-app.use('/api/internal-requests', internalRequestRoutes);
 app.use('/api/reports', reportRoutes);
-app.use('/api/cash-tracker', cashTrackerRoutes);
 app.use('/api/invoice-requests', invoiceRequestRoutes);
 app.use('/api/collections', collectionsRoutes);
 app.use('/api/notifications', notificationRoutes);
@@ -283,12 +277,8 @@ app.use('/api/csv-upload', csvUploadRoutes);
 app.use('/api/bookings', bookingsRoutes);
 app.use('/api/system-settings', systemSettingsRoutes);
 app.use('/api/empost', require('./routes/empost-pending'));
-
-// Inter-Department Chat routes
-app.use('/api/chat', chatRoutes);
-
-// Serve uploaded chat files
-app.use('/uploads/chat', express.static(path.join(__dirname, 'uploads/chat')));
+app.use('/api/accounting', require('./routes/accounting'));
+app.use('/uploads/accounting', express.static(path.join(__dirname, 'uploads/accounting')));
 
 // Activity tracking routes
 app.use('/api/activity', activityRoutes);
@@ -391,14 +381,9 @@ app.use('*', (req, res) => {
 // Create HTTP server
 const server = http.createServer(app);
 
-// Initialize WebSocket server
-initializeWebSocketServer(server);
-console.log('✅ WebSocket server initialized');
-
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
-  console.log(`🔌 WebSocket endpoint: ws://localhost:${PORT}/api/chat/ws`);
 });
 
 module.exports = app;

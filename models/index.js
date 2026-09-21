@@ -275,178 +275,7 @@ const reportSchema = new mongoose.Schema({
   timestamps: true,
 });
 
-// Cash Tracker Schema
-const cashTrackerSchema = new mongoose.Schema({
-  _id: {
-    type: String,
-    required: true,
-  },
-  category: {
-    type: String,
-    required: true,
-    enum: ['RECEIVABLES', 'PAYABLES', 'PAYROLL', 'CAPITAL_EXPENDITURE', 'INVESTMENT', 'FINANCING', 'OPERATIONAL_EXPENSE', 'TAX', 'OWNER_DRAW'],
-  },
-  amount: {
-    type: mongoose.Schema.Types.Decimal128,
-    required: true,
-  },
-  direction: {
-    type: String,
-    required: true,
-    enum: ['IN', 'OUT'],
-  },
-  payment_method: {
-    type: String,
-    required: true,
-    enum: ['CASH', 'CREDIT_CARD', 'BANK_TRANSFER', 'CHEQUE', 'DIGITAL_WALLET'],
-  },
-  notes: {
-    type: String,
-  },
-  entity_id: {
-    type: mongoose.Schema.Types.ObjectId,
-  },
-  entity_type: {
-    type: String,
-    required: true,
-    enum: ['clients', 'suppliers', 'employees', 'assets', 'investors', 'N/A'],
-  },
-}, {
-  timestamps: true,
-});
 
-cashTrackerSchema.index({ entity_id: 1, entity_type: 1 });
-cashTrackerSchema.index({ createdAt: 1 });
-
-// ========================================
-// INTER-DEPARTMENT CHAT SYSTEM
-// ========================================
-
-// Chat Room Schema (Supports both department-based and user-to-user chats)
-const chatRoomSchema = new mongoose.Schema({
-  name: {
-    type: String,
-    required: false, // Optional for user-to-user chats
-  },
-  description: {
-    type: String,
-    required: false,
-  },
-  room_type: {
-    type: String,
-    enum: ['department', 'direct'],
-    default: 'direct',
-  },
-  department_ids: [{
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Department',
-    required: false,
-  }],
-  participants: [{
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Employee',
-    required: false,
-  }],
-  // For direct chats, store both user IDs for easy lookup
-  user_ids: [{
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    required: false,
-  }],
-  is_active: {
-    type: Boolean,
-    default: true,
-  },
-  created_by: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Employee',
-    required: false,
-  },
-}, {
-  timestamps: true,
-});
-
-chatRoomSchema.index({ name: 1 });
-chatRoomSchema.index({ department_ids: 1 });
-chatRoomSchema.index({ participants: 1 });
-chatRoomSchema.index({ user_ids: 1 });
-chatRoomSchema.index({ room_type: 1 });
-chatRoomSchema.index({ is_active: 1 });
-// Ensure unique direct chat rooms between two users (compound index with uniqueness)
-chatRoomSchema.index({ room_type: 1, user_ids: 1 }, { 
-  unique: true, 
-  sparse: true,
-  partialFilterExpression: { room_type: 'direct', user_ids: { $size: 2 } }
-});
-
-// Inter-Department Chat Message Schema
-const interDepartmentChatMessageSchema = new mongoose.Schema({
-  room_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'ChatRoom',
-    required: true,
-  },
-  sender_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Employee',
-    required: true,
-  },
-  sender_department_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Department',
-    required: true,
-  },
-  message: {
-    type: String,
-    required: true,
-  },
-  message_type: {
-    type: String,
-    enum: ['text', 'file', 'image', 'system'],
-    default: 'text',
-  },
-  // File upload fields
-  file_url: {
-    type: String,
-    required: false,
-  },
-  file_name: {
-    type: String,
-    required: false,
-  },
-  file_size: {
-    type: Number,
-    required: false,
-  },
-  is_read: {
-    type: Boolean,
-    default: false,
-  },
-  read_by: [{
-    employee_id: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'Employee',
-    },
-    read_at: {
-      type: Date,
-      default: Date.now,
-    },
-  }],
-  reply_to: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'InterDepartmentChatMessage',
-    required: false,
-  },
-}, {
-  timestamps: true,
-});
-
-interDepartmentChatMessageSchema.index({ room_id: 1, createdAt: -1 });
-interDepartmentChatMessageSchema.index({ sender_id: 1 });
-interDepartmentChatMessageSchema.index({ sender_department_id: 1 });
-interDepartmentChatMessageSchema.index({ is_read: 1 });
-// Text search index for message search functionality
-interDepartmentChatMessageSchema.index({ message: 'text' });
 
 // Invoice Request Schema
 const invoiceRequestSchema = new mongoose.Schema({
@@ -971,7 +800,6 @@ const Client = mongoose.models.Client || mongoose.model('Client', clientSchema);
 const Request = mongoose.models.Request || mongoose.model('Request', requestSchema);
 const Ticket = mongoose.models.Ticket || mongoose.model('Ticket', ticketSchema);
 const Report = mongoose.models.Report || mongoose.model('Report', reportSchema);
-const CashTracker = mongoose.models.CashTracker || mongoose.model('CashTracker', cashTrackerSchema);
 const InvoiceRequest = mongoose.models.InvoiceRequest || mongoose.model('InvoiceRequest', invoiceRequestSchema);
 const Collections = mongoose.models.Collections || mongoose.model('Collections', collectionsSchema);
 
@@ -1057,9 +885,6 @@ performanceMetricsSchema.index({ period_start: 1, period_end: 1 });
 
 const PerformanceMetrics = mongoose.models.PerformanceMetrics || mongoose.model('PerformanceMetrics', performanceMetricsSchema);
 
-// Chat Models
-const ChatRoom = mongoose.models.ChatRoom || mongoose.model('ChatRoom', chatRoomSchema);
-const ChatMessage = mongoose.models.ChatMessage || mongoose.model('ChatMessage', interDepartmentChatMessageSchema);
 
 // Booking Schema - Flexible schema to work with existing Bookings collection
 // Adding review_status field with default 'not reviewed'
@@ -1348,13 +1173,10 @@ module.exports = {
   Request,
   Ticket,
   Report,
-  CashTracker,
   InvoiceRequest,
   Collections,
   PerformanceMetrics,
   Booking,
   SystemSettings,
-  ChatRoom,
-  ChatMessage,
   AuditReport
 };

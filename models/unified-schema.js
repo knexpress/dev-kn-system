@@ -496,64 +496,6 @@ const shipmentRequestSchema = new mongoose.Schema({
 // SUPPORTING ENTITIES
 // ========================================
 
-// Internal Request/Ticket Schema
-const internalRequestSchema = new mongoose.Schema({
-  ticket_id: {
-    type: String,
-    required: true,
-    unique: true,
-  },
-  title: {
-    type: String,
-    required: true,
-  },
-  description: {
-    type: String,
-    required: true,
-  },
-  category: {
-    type: String,
-    required: true,
-    enum: ['TECHNICAL', 'OPERATIONAL', 'FINANCIAL', 'HR', 'GENERAL'],
-  },
-  priority: {
-    type: String,
-    required: true,
-    enum: ['LOW', 'MEDIUM', 'HIGH', 'URGENT'],
-    default: 'MEDIUM',
-  },
-  status: {
-    type: String,
-    required: true,
-    enum: ['OPEN', 'IN_PROGRESS', 'RESOLVED', 'CLOSED'],
-    default: 'OPEN',
-  },
-  reported_by: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Employee',
-    required: true,
-  },
-  assigned_to: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Employee',
-    required: false,
-  },
-  department_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Department',
-    required: true,
-  },
-  resolved_at: {
-    type: Date,
-    required: false,
-  },
-  resolution_notes: {
-    type: String,
-    required: false,
-  },
-}, {
-  timestamps: true,
-});
 
 // Invoice Schema
 const invoiceSchema = new mongoose.Schema({
@@ -780,62 +722,6 @@ const invoiceSchema = new mongoose.Schema({
   timestamps: true,
 });
 
-// Cash Flow Transaction Schema
-const cashFlowTransactionSchema = new mongoose.Schema({
-  transaction_id: {
-    type: String,
-    required: false, // Will be auto-generated in pre-save hook
-    unique: true,
-  },
-  category: {
-    type: String,
-    required: true,
-    enum: ['RECEIVABLES', 'PAYABLES', 'PAYROLL', 'CAPITAL_EXPENDITURE', 'INVESTMENT', 'FINANCING', 'OPERATIONAL_EXPENSE', 'TAX', 'OWNER_DRAW'],
-  },
-  amount: {
-    type: mongoose.Schema.Types.Decimal128,
-    required: true,
-  },
-  direction: {
-    type: String,
-    required: true,
-    enum: ['IN', 'OUT'],
-  },
-  payment_method: {
-    type: String,
-    required: true,
-    enum: ['CASH', 'CREDIT_CARD', 'BANK_TRANSFER', 'CHEQUE', 'DIGITAL_WALLET'],
-  },
-  description: {
-    type: String,
-    required: true,
-  },
-  entity_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    required: false,
-  },
-  entity_type: {
-    type: String,
-    required: true,
-    enum: ['shipment_request', 'internal_request', 'invoice', 'employee', 'supplier', 'N/A'],
-  },
-  reference_number: {
-    type: String,
-    required: false,
-  },
-  transaction_date: {
-    type: Date,
-    required: true,
-    default: Date.now,
-  },
-  created_by: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Employee',
-    required: false,
-  },
-}, {
-  timestamps: true,
-});
 
 // Notification Tracking Schema - REMOVED
 // const notificationTrackingSchema = new mongoose.Schema({
@@ -1337,25 +1223,6 @@ driverSchema.pre('save', async function(next) {
   next();
 });
 
-// Cash Flow Transaction ID generation
-cashFlowTransactionSchema.pre('save', async function(next) {
-  try {
-    if (!this.transaction_id) {
-      const CashFlowTransactionModel = this.constructor;
-      const count = await CashFlowTransactionModel.countDocuments();
-      this.transaction_id = `CFT-${String(count + 1).padStart(6, '0')}`;
-      console.log('Generated transaction_id:', this.transaction_id);
-    }
-    next();
-  } catch (error) {
-    console.error('Error generating transaction_id:', error);
-    if (!this.transaction_id) {
-      this.transaction_id = `CFT-${Date.now().toString().slice(-6)}`;
-      console.log('Fallback transaction_id:', this.transaction_id);
-    }
-    next(error);
-  }
-});
 
 // Delivery Assignment ID generation
 deliveryAssignmentSchema.pre('save', async function(next) {
@@ -1453,13 +1320,6 @@ shipmentRequestSchema.index({ 'route.destination.country': 1 });
 shipmentRequestSchema.index({ 'customer.name': 1 });
 shipmentRequestSchema.index({ createdAt: -1 });
 
-// Internal Request indexes
-// ticket_id index is automatically created by unique: true
-internalRequestSchema.index({ status: 1 });
-internalRequestSchema.index({ priority: 1 });
-internalRequestSchema.index({ department_id: 1 });
-internalRequestSchema.index({ reported_by: 1 });
-internalRequestSchema.index({ assigned_to: 1 });
 
 // Invoice indexes
 // invoice_id index is automatically created by unique: true
@@ -1500,9 +1360,6 @@ invoiceSchema.index({
 
 // Cash Flow indexes
 // transaction_id index is automatically created by unique: true
-cashFlowTransactionSchema.index({ category: 1 });
-cashFlowTransactionSchema.index({ direction: 1 });
-cashFlowTransactionSchema.index({ transaction_date: -1 });
 
 // Notification indexes - REMOVED
 // notificationTrackingSchema.index({ user_id: 1, is_viewed: 1 });
@@ -1601,9 +1458,7 @@ const Employee = mongoose.models.Employee || mongoose.model('Employee', employee
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 const Client = mongoose.models.Client || mongoose.model('Client', clientSchema);
 const ShipmentRequest = mongoose.models.ShipmentRequest || mongoose.model('ShipmentRequest', shipmentRequestSchema);
-const InternalRequest = mongoose.models.InternalRequest || mongoose.model('InternalRequest', internalRequestSchema);
 const Invoice = mongoose.models.Invoice || mongoose.model('Invoice', invoiceSchema);
-const CashFlowTransaction = mongoose.models.CashFlowTransaction || mongoose.model('CashFlowTransaction', cashFlowTransactionSchema);
 // const NotificationTracking = mongoose.models.NotificationTracking || mongoose.model('NotificationTracking', notificationTrackingSchema);
 const PerformanceMetrics = mongoose.models.PerformanceMetrics || mongoose.model('PerformanceMetrics', performanceMetricsSchema);
 
@@ -1620,9 +1475,7 @@ module.exports = {
   User,
   Client,
   ShipmentRequest,
-  InternalRequest,
   Invoice,
-  CashFlowTransaction,
   // NotificationTracking,
   PerformanceMetrics,
   Driver,

@@ -96,6 +96,90 @@ class EMpostAPIService {
   }
 
   /**
+   * Truncate a string field to EmPost max length.
+   * @param {string} value
+   * @param {number} maxLength
+   * @param {string} fallback
+   * @returns {string}
+   */
+  truncateField(value, maxLength, fallback = '') {
+    if (value == null) return fallback;
+    const normalized = String(value).replace(/\s+/g, ' ').trim();
+    if (!normalized) return fallback;
+    if (normalized.length <= maxLength) return normalized;
+    return normalized.slice(0, maxLength).trim();
+  }
+
+  /**
+   * Decode common HTML entities that sometimes appear in verification addresses.
+   * @param {string} value
+   * @returns {string}
+   */
+  decodeHtmlEntities(value) {
+    if (!value || typeof value !== 'string') return value || '';
+    return value
+      .replace(/&amp;/g, '&')
+      .replace(/&#x27;/gi, "'")
+      .replace(/&#39;/g, "'")
+      .replace(/&apos;/g, "'")
+      .replace(/&quot;/g, '"')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>');
+  }
+
+  /**
+   * EmPost rejects receiver.city / sender.city over 100 characters.
+   * Prefer an explicit short city; otherwise extract "... City" or truncate.
+   * @param {string} cityCandidate
+   * @param {string} fullAddress
+   * @param {string} fallback
+   * @returns {string}
+   */
+  normalizeCity(cityCandidate, fullAddress = '', fallback = 'Dubai') {
+    const raw = this.decodeHtmlEntities(
+      (cityCandidate && String(cityCandidate).trim()) ||
+      (fullAddress && String(fullAddress).trim()) ||
+      ''
+    );
+
+    if (!raw) return fallback;
+
+    // Prefer a short "... City" token (e.g. "Cabanatuan City") — use last match
+    const cityMatches = [...raw.matchAll(/\b([A-Za-z]+\s+City)\b/gi)];
+    if (cityMatches.length) {
+      const last = cityMatches[cityMatches.length - 1][1];
+      return this.truncateField(last, 100, fallback);
+    }
+
+    // If candidate is already short enough, use it
+    if (cityCandidate && String(cityCandidate).trim().length <= 100) {
+      return String(cityCandidate).replace(/\s+/g, ' ').trim() || fallback;
+    }
+
+    // Last comma segment if short
+    const parts = raw.split(',').map((p) => p.trim()).filter(Boolean);
+    if (parts.length >= 2) {
+      const maybeCity = parts[parts.length - 2];
+      if (maybeCity && maybeCity.length <= 100) {
+        return maybeCity;
+      }
+      const last = parts[parts.length - 1];
+      if (last && last.length <= 100 && !/^land\s*mark/i.test(last)) {
+        return last;
+      }
+    }
+
+    // Take last 3-4 words from a long single-line address as a rough city
+    const words = raw.split(/\s+/).filter(Boolean);
+    if (words.length > 4) {
+      const tail = words.slice(-3).join(' ');
+      if (tail.length <= 100) return tail;
+    }
+
+    return this.truncateField(raw, 100, fallback);
+  }
+
+  /**
    * Authenticate and get JWT token
    * @returns {Promise<string>} Access token
    */
@@ -635,10 +719,10 @@ class EMpostAPIService {
         countryCode: clientAddress.countryCode || 'AE',
         state: clientAddress.state || '',
         postCode: clientAddress.postCode || '',
-        city: clientAddress.city || 'Dubai',
-        line1: clientAddress.line1 || client.address || 'N/A',
-        line2: clientAddress.line2 || '',
-        line3: clientAddress.line3 || '',
+        city: this.normalizeCity(clientAddress.city, client.address || clientAddress.line1, 'Dubai'),
+        line1: this.truncateField(clientAddress.line1 || client.address || 'N/A', 250, 'N/A'),
+        line2: this.truncateField(clientAddress.line2 || '', 250, ''),
+        line3: this.truncateField(clientAddress.line3 || '', 250, ''),
       },
       receiver: {
         name: invoice.receiver_name || 'N/A',
@@ -647,10 +731,10 @@ class EMpostAPIService {
         countryCode: receiverAddress.countryCode || 'AE',
         state: receiverAddress.state || '',
         postCode: receiverAddress.postCode || '',
-        city: receiverAddress.city || 'Dubai',
-        line1: receiverAddress.line1 || invoice.receiver_address || 'N/A',
-        line2: receiverAddress.line2 || '',
-        line3: receiverAddress.line3 || '',
+        city: this.normalizeCity(receiverAddress.city, invoice.receiver_address || receiverAddress.line1, 'Dubai'),
+        line1: this.truncateField(receiverAddress.line1 || invoice.receiver_address || 'N/A', 250, 'N/A'),
+        line2: this.truncateField(receiverAddress.line2 || '', 250, ''),
+        line3: this.truncateField(receiverAddress.line3 || '', 250, ''),
       },
       details: {
         weight: {
@@ -758,7 +842,8 @@ class EMpostAPIService {
    * @returns {Object} Parsed address components
    */
   parseAddress(address) {
-    if (!address || address === 'N/A') {
+    const cleaned = this.decodeHtmlEntities(address);
+    if (!cleaned || cleaned === 'N/A') {
       return {
         line1: '',
         line2: '',
@@ -771,13 +856,13 @@ class EMpostAPIService {
     }
     
     // Simple address parsing - can be enhanced
-    const parts = address.split(',').map(p => p.trim());
+    const parts = cleaned.split(',').map(p => p.trim()).filter(Boolean);
     
     return {
-      line1: parts[0] || '',
-      line2: parts[1] || '',
-      line3: parts[2] || '',
-      city: parts[parts.length - 2] || 'Dubai',
+      line1: this.truncateField(parts[0] || cleaned, 250, ''),
+      line2: this.truncateField(parts[1] || '', 250, ''),
+      line3: this.truncateField(parts[2] || '', 250, ''),
+      city: this.normalizeCity(parts.length >= 2 ? parts[parts.length - 2] : '', cleaned, 'Dubai'),
       state: '',
       postCode: '',
       countryCode: 'AE', // Default to UAE
@@ -973,10 +1058,18 @@ class EMpostAPIService {
         countryCode: this.normalizeCountryCode(sender.country || originAddress.countryCode, 'AE'),
         state: sender.state || originAddress.state || '',
         postCode: sender.postCode || sender.postalCode || originAddress.postCode || '',
-        city: sender.city || originAddress.city || 'Dubai',
-        line1: sender.addressLine1 || sender.completeAddress || sender.address || originAddress.line1 || invoiceRequest.origin_place || 'N/A',
-        line2: sender.addressLine2 || originAddress.line2 || '',
-        line3: sender.addressLine3 || originAddress.line3 || '',
+        city: this.normalizeCity(
+          sender.city || originAddress.city,
+          sender.completeAddress || sender.addressLine1 || originAddress.line1 || invoiceRequest.origin_place,
+          'Dubai'
+        ),
+        line1: this.truncateField(
+          sender.addressLine1 || sender.completeAddress || sender.address || originAddress.line1 || invoiceRequest.origin_place || 'N/A',
+          250,
+          'N/A'
+        ),
+        line2: this.truncateField(sender.addressLine2 || originAddress.line2 || '', 250, ''),
+        line3: this.truncateField(sender.addressLine3 || originAddress.line3 || '', 250, ''),
       },
       receiver: {
         // Use verification receiver_name if available (operations may have updated it)
@@ -992,13 +1085,33 @@ class EMpostAPIService {
         countryCode: this.normalizeCountryCode(receiver.country || destinationAddress.countryCode, 'AE'),
         state: receiver.state || destinationAddress.state || '',
         postCode: receiver.postCode || receiver.postalCode || destinationAddress.postCode || '',
-        city: receiver.city || destinationAddress.city || 'Dubai',
+        city: this.normalizeCity(
+          receiver.city || destinationAddress.city,
+          invoiceRequest.verification?.receiver_address ||
+            receiver.completeAddress ||
+            receiver.addressLine1 ||
+            invoiceRequest.receiver_address ||
+            invoiceRequest.destination_place ||
+            destinationAddress.line1,
+          'Dubai'
+        ),
         // Priority: verification.receiver_address > booking receiver > invoice request
-        line1: invoiceRequest.verification?.receiver_address || 
-               receiver.addressLine1 || receiver.completeAddress || receiver.address || 
-               destinationAddress.line1 || invoiceRequest.receiver_address || invoiceRequest.destination_place || 'N/A',
-        line2: receiver.addressLine2 || destinationAddress.line2 || '',
-        line3: receiver.addressLine3 || destinationAddress.line3 || '',
+        line1: this.truncateField(
+          this.decodeHtmlEntities(
+            invoiceRequest.verification?.receiver_address ||
+              receiver.addressLine1 ||
+              receiver.completeAddress ||
+              receiver.address ||
+              destinationAddress.line1 ||
+              invoiceRequest.receiver_address ||
+              invoiceRequest.destination_place ||
+              'N/A'
+          ),
+          250,
+          'N/A'
+        ),
+        line2: this.truncateField(receiver.addressLine2 || destinationAddress.line2 || '', 250, ''),
+        line3: this.truncateField(receiver.addressLine3 || destinationAddress.line3 || '', 250, ''),
       },
       details: {
         weight: {

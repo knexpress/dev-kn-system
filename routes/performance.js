@@ -8,7 +8,6 @@ const {
   Collections, 
   User, 
   Employee,
-  CashTracker,
   PerformanceMetrics,
   Department
 } = require('../models');
@@ -195,7 +194,7 @@ async function calculateOperationsMetrics(startDate, endDate) {
 // Finance Department Metrics
 async function calculateFinanceMetrics(startDate, endDate) {
   try {
-    const { Invoice, CashFlowTransaction } = require('../models/unified-schema');
+    const { Invoice } = require('../models/unified-schema');
     
     // Get invoices from database
     const invoices = await Invoice.find({
@@ -219,27 +218,6 @@ async function calculateFinanceMetrics(startDate, endDate) {
       inv.status === 'UNPAID'
     ).length;
 
-    // Get cash flow transactions for this month
-    const cashFlowTransactions = await CashFlowTransaction.find({
-      transaction_date: { $gte: startDate, $lte: endDate },
-      direction: 'IN'
-    });
-
-    // Calculate net cash flow (income - expenses)
-    let totalIncome = 0;
-    let totalExpenses = 0;
-    
-    for (const transaction of cashFlowTransactions) {
-      const amount = parseFloat(transaction.amount?.toString() || '0');
-      if (transaction.direction === 'IN') {
-        totalIncome += amount;
-      } else {
-        totalExpenses += amount;
-      }
-    }
-    
-    const netCashFlow = totalIncome - totalExpenses;
-
     // Calculate invoice processing time (average time from creation to collection)
     let totalProcessingTime = 0;
     let validProcessingTimes = 0;
@@ -254,27 +232,25 @@ async function calculateFinanceMetrics(startDate, endDate) {
 
     const invoiceProcessingTime = validProcessingTimes > 0 ? totalProcessingTime / validProcessingTimes : 0;
 
-    // Calculate budget utilization (mock - would come from budget data)
-    const budgetUtilization = Math.round((netCashFlow / 100000) * 100); // Assuming 100k monthly budget
+    // Budget utilization based on collected revenue vs assumed monthly budget
+    const budgetUtilization = Math.round((totalRevenue / 100000) * 100);
 
     console.log('💰 Finance metrics calculated:', {
       totalRevenue,
       collectionsRate,
       outstandingInvoices,
-      netCashFlow,
       invoiceProcessingTime,
       budgetUtilization
     });
 
     return {
       collectionsRate: Math.max(0, Math.min(100, Math.round(collectionsRate * 100) / 100)),
-      cashFlow: Math.round(netCashFlow * 100) / 100,
       invoiceProcessingTime: Math.round(invoiceProcessingTime * 100) / 100,
       budgetUtilization: Math.max(0, Math.min(100, budgetUtilization)),
     };
   } catch (error) {
     console.error('Error calculating finance metrics:', error);
-    return { collectionsRate: 0, cashFlow: 0, invoiceProcessingTime: 0, budgetUtilization: 0 };
+    return { collectionsRate: 0, invoiceProcessingTime: 0, budgetUtilization: 0 };
   }
 }
 
