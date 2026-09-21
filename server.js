@@ -283,6 +283,7 @@ app.use('/uploads/accounting', express.static(path.join(__dirname, 'uploads/acco
 // Activity tracking routes
 app.use('/api/activity', activityRoutes);
 app.use('/api/errors', errorMonitoringRoutes);
+app.use('/api/motivation', require('./routes/motivation'));
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
