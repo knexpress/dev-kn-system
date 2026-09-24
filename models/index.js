@@ -1165,6 +1165,246 @@ auditReportSchema.index({ createdAt: -1 });
 
 const AuditReport = mongoose.models.AuditReport || mongoose.model('AuditReport', auditReportSchema);
 
+// Standalone client quotation. No refs to invoices, bookings, users, or Empost.
+const manualQuotationSchema = new mongoose.Schema({
+  quotation_number: {
+    type: String,
+    required: true,
+    unique: true,
+  },
+  customer_name: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  customer_phone: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  customer_address: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  route: {
+    type: String,
+    required: true,
+    enum: ['PH_TO_UAE', 'UAE_TO_PH'],
+  },
+  actual_weight_kg: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  volumetric_weight_kg: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  chargeable_weight_kg: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  weight_type: {
+    type: String,
+    required: true,
+    enum: ['ACTUAL', 'VOLUMETRIC'],
+  },
+  items: [{
+    name: { type: String, required: true, trim: true },
+    quantity: { type: Number, required: true, min: 1 },
+  }],
+  rate_per_kg: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  rate_bracket: {
+    type: String,
+    required: false,
+  },
+  shipping_amount: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  pickup_location: {
+    type: String,
+    required: true,
+    enum: ['INSIDE_DUBAI', 'OUTSIDE_DUBAI'],
+  },
+  pickup_charge: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  pickup_vat: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  delivery_charge: {
+    type: Number,
+    required: true,
+    min: 0,
+    default: 0,
+  },
+  insurance_charge: {
+    type: Number,
+    required: true,
+    min: 0,
+    default: 0,
+  },
+  total_amount: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  currency: {
+    type: String,
+    default: 'AED',
+  },
+  notes: {
+    type: String,
+    required: false,
+    default: '',
+  },
+}, {
+  timestamps: true,
+});
+
+manualQuotationSchema.index({ createdAt: -1 });
+manualQuotationSchema.index({ customer_name: 1 });
+manualQuotationSchema.index({ customer_phone: 1 });
+
+const ManualQuotation = mongoose.models.ManualQuotation || mongoose.model('ManualQuotation', manualQuotationSchema);
+
+// Chat room / inter-department messages (from origin)
+const chatRoomSchema = new mongoose.Schema({
+  name: {
+    type: String,
+    required: false,
+  },
+  description: {
+    type: String,
+    required: false,
+  },
+  room_type: {
+    type: String,
+    enum: ['department', 'direct'],
+    default: 'direct',
+  },
+  department_ids: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Department',
+    required: false,
+  }],
+  participants: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Employee',
+    required: false,
+  }],
+  user_ids: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: false,
+  }],
+  is_active: {
+    type: Boolean,
+    default: true,
+  },
+  created_by: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Employee',
+    required: false,
+  },
+}, {
+  timestamps: true,
+});
+
+chatRoomSchema.index({ name: 1 });
+chatRoomSchema.index({ department_ids: 1 });
+chatRoomSchema.index({ participants: 1 });
+chatRoomSchema.index({ user_ids: 1 });
+chatRoomSchema.index({ room_type: 1 });
+chatRoomSchema.index({ is_active: 1 });
+chatRoomSchema.index({ room_type: 1, user_ids: 1 }, {
+  unique: true,
+  sparse: true,
+  partialFilterExpression: { room_type: 'direct', user_ids: { $size: 2 } },
+});
+
+const interDepartmentChatMessageSchema = new mongoose.Schema({
+  room_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'ChatRoom',
+    required: true,
+  },
+  sender_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Employee',
+    required: true,
+  },
+  sender_department_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Department',
+    required: true,
+  },
+  message: {
+    type: String,
+    required: true,
+  },
+  message_type: {
+    type: String,
+    enum: ['text', 'file', 'image', 'system'],
+    default: 'text',
+  },
+  file_url: {
+    type: String,
+    required: false,
+  },
+  file_name: {
+    type: String,
+    required: false,
+  },
+  file_size: {
+    type: Number,
+    required: false,
+  },
+  is_read: {
+    type: Boolean,
+    default: false,
+  },
+  read_by: [{
+    employee_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Employee',
+    },
+    read_at: {
+      type: Date,
+      default: Date.now,
+    },
+  }],
+  reply_to: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'InterDepartmentChatMessage',
+    required: false,
+  },
+}, {
+  timestamps: true,
+});
+
+interDepartmentChatMessageSchema.index({ room_id: 1, createdAt: -1 });
+interDepartmentChatMessageSchema.index({ sender_id: 1 });
+interDepartmentChatMessageSchema.index({ sender_department_id: 1 });
+interDepartmentChatMessageSchema.index({ is_read: 1 });
+interDepartmentChatMessageSchema.index({ message: 'text' });
+
+const ChatRoom = mongoose.models.ChatRoom || mongoose.model('ChatRoom', chatRoomSchema);
+const ChatMessage = mongoose.models.ChatMessage || mongoose.model('ChatMessage', interDepartmentChatMessageSchema);
+
 module.exports = {
   Department,
   Employee,
@@ -1178,5 +1418,8 @@ module.exports = {
   PerformanceMetrics,
   Booking,
   SystemSettings,
-  AuditReport
+  ChatRoom,
+  ChatMessage,
+  AuditReport,
+  ManualQuotation,
 };

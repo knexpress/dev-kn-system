@@ -29,6 +29,7 @@ const performanceRoutes = require('./routes/performance');
 const invoiceRoutes = require('./routes/invoices');
 const invoiceUnifiedRoutes = require('./routes/invoices-unified');
 const priceBracketsRoutes = require('./routes/price-brackets');
+const quotationRoutes = require('./routes/quotations');
 
 // QR Payment Collection System routes
 const driverRoutes = require('./routes/drivers');
@@ -263,6 +264,7 @@ app.use('/api/performance', performanceRoutes);
 app.use('/api/invoices', invoiceRoutes);
 app.use('/api/invoices-unified', invoiceUnifiedRoutes);
 app.use('/api/price-brackets', priceBracketsRoutes);
+app.use('/api/quotations', quotationRoutes);
 
 // QR Payment Collection System routes
 app.use('/api/drivers', driverRoutes);
