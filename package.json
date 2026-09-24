@@ -10,6 +10,7 @@
     "seed": "node --max-old-space-size=4096 scripts/seed.js",
     "seed:manager": "node scripts/seed-manager-user.js",
     "seed:sales": "node scripts/seed-sales-user.js",
+    "seed:finance": "node scripts/seed-finance-user.js",
     "seed:invoices": "node scripts/seed-invoices.js",
     "pdfs:to-drive": "node scripts/batch-pdfs-to-drive.js",
     "pdfs:reupload-missing": "node scripts/reupload-missing-drive-pdfs.js",
