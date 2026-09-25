@@ -437,8 +437,9 @@ async function performBookingReview(bookingId, reviewed_by_employee_id, deps = {
         return option || undefined;
       })(),
       
-      // Insurance information (from booking)
-      insured: normalizeBoolean(insuredRaw) ?? false,
+      // Insurance information (from booking). Manual bookings may include a declared value
+      // without the older insured flag; keep the amount so Finance can see it.
+      insured: (normalizeBoolean(insuredRaw) ?? false) || (parseFloat(declaredAmountRaw) > 0),
       declaredAmount: toDecimal128(declaredAmountRaw),
       
       // Status (same as sales - defaults to DRAFT or can be SUBMITTED)
@@ -463,6 +464,8 @@ async function performBookingReview(bookingId, reviewed_by_employee_id, deps = {
         agents_name: sender.agentName || '',
         sender_details_complete: !!(sender.fullName && sender.contactNo),
         receiver_details_complete: !!(receiver.fullName && receiver.contactNo),
+        declared_value: toDecimal128(declaredAmountRaw),
+        insured: (normalizeBoolean(insuredRaw) ?? false) || (parseFloat(declaredAmountRaw) > 0),
       },
     };
 

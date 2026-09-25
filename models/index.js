@@ -1172,6 +1172,21 @@ const manualQuotationSchema = new mongoose.Schema({
     required: true,
     unique: true,
   },
+  sender_name: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  sender_phone: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  sender_address: {
+    type: String,
+    required: true,
+    trim: true,
+  },
   customer_name: {
     type: String,
     required: true,
@@ -1213,6 +1228,7 @@ const manualQuotationSchema = new mongoose.Schema({
     enum: ['ACTUAL', 'VOLUMETRIC'],
   },
   items: [{
+    box_number: { type: String, required: false, trim: true },
     name: { type: String, required: true, trim: true },
     quantity: { type: Number, required: true, min: 1 },
   }],
@@ -1233,7 +1249,7 @@ const manualQuotationSchema = new mongoose.Schema({
   pickup_location: {
     type: String,
     required: true,
-    enum: ['INSIDE_DUBAI', 'OUTSIDE_DUBAI'],
+    enum: ['INSIDE_DUBAI', 'OUTSIDE_DUBAI', 'DROP_OFF'],
   },
   pickup_charge: {
     type: Number,
