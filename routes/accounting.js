@@ -19,7 +19,10 @@ const {
   SalesCustomer,
   SalesInvoice,
   Vat201Return,
+  EInvoice,
 } = require('../models/accounting');
+const crypto = require('crypto');
+const einvoicing = require('../services/einvoicing');
 
 const router = express.Router();
 
@@ -3930,7 +3933,15 @@ router.post('/sales/invoices/:id/approve', auth, async (req, res) => {
     invoice.invoice_journal_no = journal.entry_no;
     await invoice.save();
 
-    res.json({ success: true, data: { invoice, journal } });
+    let einvoice = null;
+    try {
+      const { doc } = await generateEInvoiceForSalesInvoice(invoice, actor);
+      einvoice = { _id: doc._id, einvoice_no: doc.einvoice_no, status: doc.status };
+    } catch (einvoiceError) {
+      console.error('E-invoice auto-generation failed:', einvoiceError);
+    }
+
+    res.json({ success: true, data: { invoice, journal, einvoice } });
   } catch (error) {
     console.error('Error approving sales invoice:', error);
     res.status(500).json({ success: false, error: 'Failed to approve invoice' });
@@ -4684,6 +4695,367 @@ router.post('/vat201/returns/:id/settle', auth, async (req, res) => {
   } catch (error) {
     console.error('Error settling VAT201:', error);
     res.status(500).json({ success: false, error: 'Failed to settle VAT201' });
+  }
+});
+
+// ─── E-Invoicing (UAE PINT AE via Accredited Service Provider) ───────────────
+
+const E_INVOICE_ELIGIBLE_SALES_STATUSES = ['APPROVED', 'PARTIALLY_PAID', 'PAID'];
+const E_INVOICE_EDITABLE = ['DRAFT', 'INVALID', 'VALIDATED', 'REJECTED'];
+
+async function nextEInvoiceNo(date) {
+  const year = new Date(date || Date.now()).getFullYear() || new Date().getFullYear();
+  const prefix = `EINV-${year}-`;
+  const latest = await EInvoice.findOne({ einvoice_no: new RegExp(`^${prefix}`) })
+    .sort({ einvoice_no: -1 })
+    .select('einvoice_no')
+    .lean();
+  let nextNum = 1;
+  if (latest?.einvoice_no) {
+    const n = parseInt(String(latest.einvoice_no).split('-').pop(), 10);
+    if (Number.isFinite(n)) nextNum = n + 1;
+  }
+  return `${prefix}${String(nextNum).padStart(6, '0')}`;
+}
+
+function pushEInvoiceHistory(doc, status, actor, note) {
+  doc.status_history.push({
+    status,
+    at: new Date(),
+    by_name: actor?.created_by_name,
+    by_email: actor?.created_by_email,
+    note,
+  });
+}
+
+async function refreshEInvoiceSnapshot(doc, invoice, actor, note) {
+  const customer = invoice.customer_id
+    ? await SalesCustomer.findById(invoice.customer_id).lean()
+    : null;
+  const snap = einvoicing.buildSnapshot(invoice, customer);
+  Object.assign(doc, snap);
+
+  const plain = { ...doc.toObject(), ...snap };
+  const { errors, warnings } = einvoicing.validateSnapshot(plain, invoice);
+  doc.xml = einvoicing.buildUblXml(plain);
+  doc.xml_sha256 = einvoicing.sha256(doc.xml);
+  doc.is_valid = errors.length === 0;
+  doc.validation_errors = errors;
+  doc.validation_warnings = warnings;
+  doc.validated_at = new Date();
+  doc.status = errors.length ? 'INVALID' : 'VALIDATED';
+  pushEInvoiceHistory(
+    doc,
+    doc.status,
+    actor,
+    errors.length ? `${note} — ${errors.length} error(s)` : note
+  );
+}
+
+async function generateEInvoiceForSalesInvoice(invoice, actor) {
+  const existing = await EInvoice.findOne({
+    sales_invoice_id: invoice._id,
+    status: { $ne: 'CANCELLED' },
+  });
+  if (existing) return { doc: existing, created: false };
+
+  const doc = new EInvoice({
+    einvoice_no: await nextEInvoiceNo(invoice.invoice_date),
+    uuid: crypto.randomUUID(),
+    document_type: 'TAX_INVOICE',
+    sales_invoice_id: invoice._id,
+    sales_invoice_no: invoice.invoice_no,
+    issue_date: invoice.invoice_date,
+    ...actor,
+  });
+  await refreshEInvoiceSnapshot(doc, invoice, actor, 'Generated from approved sales invoice');
+  await doc.save();
+  return { doc, created: true };
+}
+
+async function eligibleSalesInvoicesForEInvoice() {
+  const taken = await EInvoice.find({ status: { $ne: 'CANCELLED' } }).distinct('sales_invoice_id');
+  return SalesInvoice.find({
+    status: { $in: E_INVOICE_ELIGIBLE_SALES_STATUSES },
+    _id: { $nin: taken },
+  })
+    .sort({ invoice_date: -1 })
+    .select('invoice_no invoice_date customer_name customer_vat_trn customer_is_vat_registered total_amount vat_amount status currency')
+    .lean();
+}
+
+router.get('/einvoicing/overview', auth, async (req, res) => {
+  try {
+    const [byStatus, eligible, recent] = await Promise.all([
+      EInvoice.aggregate([
+        { $group: { _id: '$status', count: { $sum: 1 }, total: { $sum: '$total_amount' }, vat: { $sum: '$vat_amount' } } },
+      ]),
+      eligibleSalesInvoicesForEInvoice(),
+      EInvoice.find({}).sort({ createdAt: -1 }).limit(8).select('-xml').lean(),
+    ]);
+
+    const counts = Object.fromEntries(byStatus.map((s) => [s._id, s.count]));
+    const exchanged = byStatus
+      .filter((s) => ['SUBMITTED', 'DELIVERED', 'ACCEPTED'].includes(s._id))
+      .reduce((acc, s) => ({ total: acc.total + s.total, vat: acc.vat + s.vat, count: acc.count + s.count }), {
+        total: 0,
+        vat: 0,
+        count: 0,
+      });
+    const asp = einvoicing.aspConfig();
+
+    res.json({
+      success: true,
+      data: {
+        counts,
+        eligible_count: eligible.length,
+        exchanged: {
+          count: exchanged.count,
+          total: Number(exchanged.total.toFixed(2)),
+          vat: Number(exchanged.vat.toFixed(2)),
+        },
+        asp: { configured: asp.configured, mode: asp.mode, provider: asp.provider },
+        seller: einvoicing.sellerProfile(),
+        recent,
+        connections: {
+          sales: '/dashboard/accounting/sales',
+          vat201: '/dashboard/accounting/vat201',
+        },
+      },
+    });
+  } catch (error) {
+    console.error('Error loading e-invoicing overview:', error);
+    res.status(500).json({ success: false, error: 'Failed to load e-invoicing overview' });
+  }
+});
+
+router.get('/einvoicing/eligible', auth, async (req, res) => {
+  try {
+    res.json({ success: true, data: await eligibleSalesInvoicesForEInvoice() });
+  } catch (error) {
+    console.error('Error listing e-invoice eligible sales invoices:', error);
+    res.status(500).json({ success: false, error: 'Failed to list eligible invoices' });
+  }
+});
+
+router.get('/einvoicing/documents', auth, async (req, res) => {
+  try {
+    const filter = {};
+    if (req.query.status) filter.status = String(req.query.status).toUpperCase();
+    const q = String(req.query.q || '').trim();
+    if (q) {
+      const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      filter.$or = [{ einvoice_no: rx }, { sales_invoice_no: rx }, { 'buyer.name': rx }, { 'buyer.trn': rx }];
+    }
+    const rows = await EInvoice.find(filter).sort({ createdAt: -1 }).limit(500).select('-xml').lean();
+    res.json({ success: true, data: rows });
+  } catch (error) {
+    console.error('Error listing e-invoices:', error);
+    res.status(500).json({ success: false, error: 'Failed to list e-invoices' });
+  }
+});
+
+router.get('/einvoicing/documents/:id', auth, async (req, res) => {
+  try {
+    const row = await EInvoice.findById(req.params.id).lean();
+    if (!row) return res.status(404).json({ success: false, error: 'E-invoice not found' });
+    res.json({ success: true, data: row });
+  } catch (error) {
+    console.error('Error fetching e-invoice:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch e-invoice' });
+  }
+});
+
+router.get('/einvoicing/documents/:id/xml', auth, async (req, res) => {
+  try {
+    const row = await EInvoice.findById(req.params.id).select('einvoice_no xml').lean();
+    if (!row?.xml) return res.status(404).json({ success: false, error: 'E-invoice XML not found' });
+    res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${row.einvoice_no}.xml"`);
+    res.send(row.xml);
+  } catch (error) {
+    console.error('Error downloading e-invoice XML:', error);
+    res.status(500).json({ success: false, error: 'Failed to download XML' });
+  }
+});
+
+router.post('/einvoicing/documents', auth, async (req, res) => {
+  try {
+    const invoice = await SalesInvoice.findById(req.body?.sales_invoice_id);
+    if (!invoice) return res.status(404).json({ success: false, error: 'Sales invoice not found' });
+    if (!E_INVOICE_ELIGIBLE_SALES_STATUSES.includes(invoice.status)) {
+      return res.status(400).json({
+        success: false,
+        error: `Sales invoice is ${invoice.status}; approve it in Sales first`,
+      });
+    }
+    const { doc, created } = await generateEInvoiceForSalesInvoice(invoice, actorFromReq(req));
+    res.status(created ? 201 : 200).json({ success: true, data: doc, created });
+  } catch (error) {
+    console.error('Error generating e-invoice:', error);
+    res.status(500).json({ success: false, error: 'Failed to generate e-invoice' });
+  }
+});
+
+router.post('/einvoicing/generate-all', auth, async (req, res) => {
+  try {
+    const actor = actorFromReq(req);
+    const eligible = await eligibleSalesInvoicesForEInvoice();
+    const results = { created: 0, valid: 0, invalid: 0 };
+    for (const row of eligible) {
+      const invoice = await SalesInvoice.findById(row._id);
+      if (!invoice) continue;
+      const { doc, created } = await generateEInvoiceForSalesInvoice(invoice, actor);
+      if (!created) continue;
+      results.created += 1;
+      if (doc.status === 'VALIDATED') results.valid += 1;
+      else results.invalid += 1;
+    }
+    res.json({ success: true, data: results });
+  } catch (error) {
+    console.error('Error bulk-generating e-invoices:', error);
+    res.status(500).json({ success: false, error: 'Failed to generate e-invoices' });
+  }
+});
+
+router.post('/einvoicing/documents/:id/revalidate', auth, async (req, res) => {
+  try {
+    const doc = await EInvoice.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, error: 'E-invoice not found' });
+    if (!E_INVOICE_EDITABLE.includes(doc.status)) {
+      return res.status(400).json({
+        success: false,
+        error: `E-invoice is ${doc.status}; it can no longer be changed`,
+      });
+    }
+    const invoice = await SalesInvoice.findById(doc.sales_invoice_id);
+    if (!invoice) return res.status(404).json({ success: false, error: 'Source sales invoice not found' });
+    await refreshEInvoiceSnapshot(doc, invoice, actorFromReq(req), 'Revalidated against latest sales data');
+    await doc.save();
+    res.json({ success: true, data: doc });
+  } catch (error) {
+    console.error('Error revalidating e-invoice:', error);
+    res.status(500).json({ success: false, error: 'Failed to revalidate e-invoice' });
+  }
+});
+
+router.post('/einvoicing/documents/:id/submit', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only Finance Manager / Admin can submit e-invoices',
+      });
+    }
+    const doc = await EInvoice.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, error: 'E-invoice not found' });
+    if (doc.status !== 'VALIDATED') {
+      return res.status(400).json({
+        success: false,
+        error: `Only VALIDATED e-invoices can be submitted (current: ${doc.status})`,
+      });
+    }
+    if (doc.transaction_type !== 'B2B') {
+      return res.status(400).json({
+        success: false,
+        error: 'B2C invoices are outside the UAE e-invoice exchange scope and are kept for records only',
+      });
+    }
+
+    const actor = actorFromReq(req);
+    const asp = einvoicing.aspConfig();
+    if (asp.configured) {
+      try {
+        const result = await einvoicing.submitToAsp(doc);
+        doc.asp_reference = result.reference || undefined;
+        doc.asp_response = result.response;
+      } catch (aspError) {
+        doc.asp_response = aspError.response || { error: aspError.message };
+        pushEInvoiceHistory(doc, 'VALIDATED', actor, `ASP submission failed: ${aspError.message}`);
+        await doc.save();
+        return res.status(502).json({ success: false, error: `ASP submission failed: ${aspError.message}` });
+      }
+    } else {
+      doc.asp_reference = `SANDBOX-${doc.uuid.slice(0, 8).toUpperCase()}`;
+      doc.asp_response = { mode: 'SANDBOX', note: 'No ASP configured; not transmitted to FTA' };
+    }
+
+    doc.transmission_mode = asp.mode;
+    doc.status = 'SUBMITTED';
+    doc.submitted_at = new Date();
+    doc.submitted_by_name = actor.created_by_name;
+    pushEInvoiceHistory(
+      doc,
+      'SUBMITTED',
+      actor,
+      asp.configured ? `Sent to ${asp.provider}` : 'Recorded in sandbox (no ASP configured)'
+    );
+    await doc.save();
+    res.json({ success: true, data: doc });
+  } catch (error) {
+    console.error('Error submitting e-invoice:', error);
+    res.status(500).json({ success: false, error: 'Failed to submit e-invoice' });
+  }
+});
+
+router.post('/einvoicing/documents/:id/status', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only Finance Manager / Admin can record ASP responses',
+      });
+    }
+    const next = String(req.body?.status || '').toUpperCase();
+    if (!['DELIVERED', 'ACCEPTED', 'REJECTED'].includes(next)) {
+      return res.status(400).json({ success: false, error: 'Status must be DELIVERED, ACCEPTED or REJECTED' });
+    }
+    const doc = await EInvoice.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, error: 'E-invoice not found' });
+    if (!['SUBMITTED', 'DELIVERED'].includes(doc.status)) {
+      return res.status(400).json({
+        success: false,
+        error: `Responses can only be recorded for submitted e-invoices (current: ${doc.status})`,
+      });
+    }
+    const note = String(req.body?.note || '').trim();
+    if (next === 'REJECTED' && !note) {
+      return res.status(400).json({ success: false, error: 'A rejection reason is required' });
+    }
+    if (req.body?.asp_reference) doc.asp_reference = String(req.body.asp_reference).trim();
+    doc.status = next;
+    pushEInvoiceHistory(doc, next, actorFromReq(req), note || undefined);
+    await doc.save();
+    res.json({ success: true, data: doc });
+  } catch (error) {
+    console.error('Error updating e-invoice status:', error);
+    res.status(500).json({ success: false, error: 'Failed to update e-invoice status' });
+  }
+});
+
+router.post('/einvoicing/documents/:id/cancel', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only Finance Manager / Admin can cancel e-invoices',
+      });
+    }
+    const doc = await EInvoice.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, error: 'E-invoice not found' });
+    if (!E_INVOICE_EDITABLE.includes(doc.status)) {
+      return res.status(400).json({
+        success: false,
+        error: `E-invoice is ${doc.status}; issue a credit note instead of cancelling`,
+      });
+    }
+    doc.status = 'CANCELLED';
+    pushEInvoiceHistory(doc, 'CANCELLED', actorFromReq(req), String(req.body?.note || '').trim() || undefined);
+    await doc.save();
+    res.json({ success: true, data: doc });
+  } catch (error) {
+    console.error('Error cancelling e-invoice:', error);
+    res.status(500).json({ success: false, error: 'Failed to cancel e-invoice' });
   }
 });
 

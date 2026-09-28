@@ -799,6 +799,82 @@ vat201ReturnSchema.index({ status: 1, period_end: -1 });
 const Vat201Return =
   mongoose.models.Vat201Return || mongoose.model('Vat201Return', vat201ReturnSchema);
 
+const E_INVOICE_STATUSES = [
+  'DRAFT',
+  'INVALID',
+  'VALIDATED',
+  'SUBMITTED',
+  'DELIVERED',
+  'ACCEPTED',
+  'REJECTED',
+  'CANCELLED',
+];
+
+const eInvoiceHistorySchema = new mongoose.Schema(
+  {
+    status: { type: String, enum: E_INVOICE_STATUSES, required: true },
+    at: { type: Date, default: Date.now },
+    by_name: { type: String, required: false },
+    by_email: { type: String, required: false },
+    note: { type: String, required: false },
+  },
+  { _id: false }
+);
+
+const eInvoiceSchema = new mongoose.Schema(
+  {
+    einvoice_no: { type: String, required: true, unique: true },
+    uuid: { type: String, required: true, unique: true },
+    document_type: {
+      type: String,
+      enum: ['TAX_INVOICE', 'CREDIT_NOTE'],
+      default: 'TAX_INVOICE',
+    },
+    transaction_type: { type: String, enum: ['B2B', 'B2C'], default: 'B2B' },
+    sales_invoice_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'SalesInvoice',
+      required: true,
+    },
+    sales_invoice_no: { type: String, required: true },
+    issue_date: { type: Date, required: true },
+    due_date: { type: Date, required: false },
+    currency: { type: String, default: 'AED' },
+    seller: { type: mongoose.Schema.Types.Mixed, default: {} },
+    buyer: { type: mongoose.Schema.Types.Mixed, default: {} },
+    lines: { type: [mongoose.Schema.Types.Mixed], default: [] },
+    subtotal: { type: Number, default: 0 },
+    vat_amount: { type: Number, default: 0 },
+    total_amount: { type: Number, default: 0 },
+    xml: { type: String, required: false },
+    xml_sha256: { type: String, required: false },
+    is_valid: { type: Boolean, default: false },
+    validation_errors: { type: [String], default: [] },
+    validation_warnings: { type: [String], default: [] },
+    validated_at: { type: Date, required: false },
+    status: { type: String, enum: E_INVOICE_STATUSES, default: 'DRAFT' },
+    transmission_mode: { type: String, enum: ['ASP', 'SANDBOX'], required: false },
+    asp_reference: { type: String, required: false },
+    asp_response: { type: mongoose.Schema.Types.Mixed, required: false },
+    submitted_at: { type: Date, required: false },
+    submitted_by_name: { type: String, required: false },
+    status_history: { type: [eInvoiceHistorySchema], default: [] },
+    created_by_name: { type: String, required: false },
+    created_by_email: { type: String, required: false },
+    created_by_user_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: false,
+    },
+  },
+  { timestamps: true }
+);
+
+eInvoiceSchema.index({ status: 1, issue_date: -1 });
+eInvoiceSchema.index({ sales_invoice_id: 1 });
+
+const EInvoice = mongoose.models.EInvoice || mongoose.model('EInvoice', eInvoiceSchema);
+
 module.exports = {
   Account,
   JournalEntry,
@@ -815,4 +891,5 @@ module.exports = {
   SalesCustomer,
   SalesInvoice,
   Vat201Return,
+  EInvoice,
 };
