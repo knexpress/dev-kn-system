@@ -718,6 +718,26 @@ const invoiceSchema = new mongoose.Schema({
     type: String,
     required: false,
   },
+  // Finance GL link: Dr AR / Cr Revenue / Cr VAT Output posted when the invoice is generated
+  gl_sync: {
+    status: {
+      type: String,
+      enum: ['POSTED', 'REVERSED', 'FAILED', 'SKIPPED'],
+      required: false,
+    },
+    journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
+    journal_no: { type: String, required: false },
+    posted_total: { type: Number, required: false },
+    posted_tax: { type: Number, required: false },
+    reversal_journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
+    reversal_journal_no: { type: String, required: false },
+    collection_journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
+    collection_journal_no: { type: String, required: false },
+    receipt_journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
+    receipt_journal_no: { type: String, required: false },
+    last_error: { type: String, required: false },
+    last_attempt_at: { type: Date, required: false },
+  },
 }, {
   timestamps: true,
 });

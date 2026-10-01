@@ -212,7 +212,7 @@ const supplierPaymentSchema = new mongoose.Schema(
     debit_account_name: { type: String, required: false },
     status: {
       type: String,
-      enum: ['PENDING_APPROVAL', 'APPROVED', 'REJECTED', 'CANCELLED'],
+      enum: ['PENDING_APPROVAL', 'APPROVED', 'REJECTED', 'CANCELLED', 'REVERSED'],
       default: 'PENDING_APPROVAL',
     },
     requested_by_name: { type: String, required: false },
@@ -253,6 +253,12 @@ supplierPaymentSchema.add({
     required: false,
   },
   purchase_order_no: { type: String, required: false },
+  reversed_at: { type: Date, required: false },
+  reversed_by_name: { type: String, required: false },
+  reversed_by_email: { type: String, required: false },
+  reversal_reason: { type: String, required: false },
+  reversal_journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
+  reversal_journal_no: { type: String, required: false },
 });
 
 const purchaseOrderLineSchema = new mongoose.Schema(
@@ -272,8 +278,21 @@ const purchaseOrderSchema = new mongoose.Schema(
     po_no: { type: String, required: true, unique: true },
     po_date: { type: Date, required: true },
     expected_date: { type: Date, required: false },
+    supplier_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Supplier', required: false },
     supplier_name: { type: String, required: true, trim: true },
     supplier_reference: { type: String, required: false, trim: true },
+    // Snapshot of the supplier at entry time, so later edits to the supplier don't rewrite history
+    supplier_trn: { type: String, required: false, trim: true },
+    supplier_phone: { type: String, required: false, trim: true },
+    supplier_email: { type: String, required: false, trim: true },
+    supplier_address: { type: String, required: false, trim: true },
+    supplier_bank_name: { type: String, required: false, trim: true },
+    supplier_iban: { type: String, required: false, trim: true },
+    supplier_invoice_no: { type: String, required: false, trim: true },
+    supplier_invoice_date: { type: Date, required: false },
+    due_date: { type: Date, required: false },
+    // false: approval books the whole invoice (AP + stock) at once; true: AP posts per goods receipt
+    receive_later: { type: Boolean, default: false },
     currency: { type: String, default: 'AED' },
     status: {
       type: String,
@@ -331,13 +350,52 @@ const purchaseOrderSchema = new mongoose.Schema(
     },
     journal_entry_no: { type: String, required: false },
     payment_ids: [{ type: mongoose.Schema.Types.ObjectId, ref: 'SupplierPayment' }],
+    // AP recognised so far from goods receipts (gross incl. VAT) and the VAT part of it
+    received_value_posted: { type: Number, required: false },
+    received_tax_posted: { type: Number, required: false },
+    receipt_journals: [
+      {
+        journal_entry_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry' },
+        journal_entry_no: { type: String },
+        amount: { type: Number },
+        posted_at: { type: Date },
+      },
+    ],
+    cancelled_at: { type: Date, required: false },
+    cancellation_reason: { type: String, required: false },
   },
   { timestamps: true }
 );
 
 purchaseOrderSchema.index({ status: 1, po_date: -1 });
 purchaseOrderSchema.index({ supplier_name: 1 });
+purchaseOrderSchema.index({ supplier_id: 1, supplier_invoice_no: 1 });
 purchaseOrderSchema.index({ createdAt: -1 });
+
+const supplierSchema = new mongoose.Schema(
+  {
+    code: { type: String, required: true, unique: true },
+    name: { type: String, required: true, trim: true },
+    trn: { type: String, required: false, trim: true },
+    contact_person: { type: String, required: false, trim: true },
+    phone: { type: String, required: false, trim: true },
+    email: { type: String, required: false, trim: true, lowercase: true },
+    address: { type: String, required: false, trim: true },
+    bank_name: { type: String, required: false, trim: true },
+    iban: { type: String, required: false, trim: true, uppercase: true },
+    account_number: { type: String, required: false, trim: true },
+    payment_terms_days: { type: Number, default: 30, min: 0 },
+    notes: { type: String, required: false, trim: true },
+    is_active: { type: Boolean, default: true },
+    created_by_name: { type: String, required: false },
+    created_by_email: { type: String, required: false },
+  },
+  { timestamps: true }
+);
+
+supplierSchema.index({ name: 1 });
+
+const Supplier = mongoose.models.Supplier || mongoose.model('Supplier', supplierSchema);
 
 const BankCashAccount =
   mongoose.models.BankCashAccount || mongoose.model('BankCashAccount', bankCashAccountSchema);
@@ -883,6 +941,7 @@ module.exports = {
   BankCashAccount,
   SupplierPayment,
   PurchaseOrder,
+  Supplier,
   PettyCashVoucher,
   PettyCashReplenishment,
   Budget,

@@ -11,6 +11,7 @@ const {
   BankCashAccount,
   SupplierPayment,
   PurchaseOrder,
+  Supplier,
   PettyCashVoucher,
   PettyCashReplenishment,
   Budget,
@@ -23,6 +24,7 @@ const {
 } = require('../models/accounting');
 const crypto = require('crypto');
 const einvoicing = require('../services/einvoicing');
+const { nextJournalEntryNo, postInvoiceJournal, syncInvoiceReceipts } = require('../services/invoice-gl');
 
 const router = express.Router();
 
@@ -77,22 +79,6 @@ function parseLines(rawLines) {
     }
   }
   return [];
-}
-
-async function nextJournalEntryNo(entryDate) {
-  const year = new Date(entryDate).getFullYear() || new Date().getFullYear();
-  const prefix = `JE-${year}-`;
-  const latest = await JournalEntry.findOne({ entry_no: new RegExp(`^${prefix}`) })
-    .sort({ entry_no: -1 })
-    .select('entry_no')
-    .lean();
-  let nextNum = 1;
-  if (latest?.entry_no) {
-    const parts = String(latest.entry_no).split('-');
-    const n = parseInt(parts[parts.length - 1], 10);
-    if (Number.isFinite(n)) nextNum = n + 1;
-  }
-  return `${prefix}${String(nextNum).padStart(4, '0')}`;
 }
 
 async function loadPostableAccount(code) {
@@ -1301,10 +1287,38 @@ router.post('/bank-cash/payments', auth, async (req, res) => {
       purchase_order_id = '',
     } = req.body || {};
 
-    const supplierName = String(supplier_name || '').trim();
-    const payAmount = toNum(amount);
-    const debitCode = String(debit_account_code || '2000').trim();
+    let supplierName = String(supplier_name || '').trim();
+    const payAmount = Number(toNum(amount).toFixed(2));
+    let debitCode = String(debit_account_code || '2000').trim();
     const payDate = payment_date ? new Date(payment_date) : new Date();
+
+    let linkedPo = null;
+    if (purchase_order_id) {
+      linkedPo = await PurchaseOrder.findById(purchase_order_id);
+      if (!linkedPo) {
+        return res.status(400).json({ success: false, error: 'Purchase order not found' });
+      }
+      if (!['APPROVED', 'PARTIALLY_RECEIVED', 'RECEIVED'].includes(linkedPo.status)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Payments can only be created for approved or received purchase orders',
+        });
+      }
+      const pendingOnPo = await pendingPaymentsTotal(linkedPo._id);
+      const available = Number(
+        (toNum(linkedPo.total_amount) - toNum(linkedPo.amount_paid) - pendingOnPo).toFixed(2)
+      );
+      if (payAmount > available + 0.009) {
+        return res.status(400).json({
+          success: false,
+          error: `Amount exceeds what is left to pay on ${linkedPo.po_no}: AED ${Math.max(0, available).toFixed(2)}${
+            pendingOnPo > 0 ? ` (AED ${pendingOnPo.toFixed(2)} already awaiting clearance)` : ''
+          }`,
+        });
+      }
+      supplierName = linkedPo.supplier_name;
+      debitCode = linkedPo.credit_account_code || '2000';
+    }
 
     if (!supplierName) {
       return res.status(400).json({ success: false, error: 'Supplier name is required' });
@@ -1340,20 +1354,6 @@ router.post('/bank-cash/payments', auth, async (req, res) => {
     const actor = actorFromReq(req);
     const payment_no = await nextSupplierPaymentNo(payDate);
     const entry_no = await nextJournalEntryNo(payDate);
-
-    let linkedPo = null;
-    if (purchase_order_id) {
-      linkedPo = await PurchaseOrder.findById(purchase_order_id);
-      if (!linkedPo) {
-        return res.status(400).json({ success: false, error: 'Purchase order not found' });
-      }
-      if (!['APPROVED', 'PARTIALLY_RECEIVED', 'RECEIVED'].includes(linkedPo.status)) {
-        return res.status(400).json({
-          success: false,
-          error: 'Payments can only be created for approved or received purchase orders',
-        });
-      }
-    }
 
     const journal = await JournalEntry.create({
       entry_no,
@@ -1394,7 +1394,8 @@ router.post('/bank-cash/payments', auth, async (req, res) => {
       payment_no,
       payment_date: payDate,
       supplier_name: supplierName,
-      supplier_reference: String(supplier_reference || '').trim() || linkedPo?.po_no || '',
+      supplier_reference:
+        String(supplier_reference || '').trim() || linkedPo?.supplier_invoice_no || linkedPo?.po_no || '',
       description: String(description || '').trim(),
       amount: payAmount,
       currency: String(currency || 'AED').trim() || 'AED',
@@ -1433,6 +1434,9 @@ router.post('/bank-cash/payments', auth, async (req, res) => {
 
 router.post('/bank-cash/payments/:id/approve', auth, async (req, res) => {
   try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({ success: false, error: 'Only Finance Manager / Admin can clear supplier payments' });
+    }
     const payment = await SupplierPayment.findById(req.params.id);
     if (!payment) {
       return res.status(404).json({ success: false, error: 'Payment not found' });
@@ -1565,6 +1569,9 @@ router.post('/bank-cash/payments/:id/approve', auth, async (req, res) => {
 
 router.post('/bank-cash/payments/:id/reject', auth, async (req, res) => {
   try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({ success: false, error: 'Only Finance Manager / Admin can reject supplier payments' });
+    }
     const payment = await SupplierPayment.findById(req.params.id);
     if (!payment) {
       return res.status(404).json({ success: false, error: 'Payment not found' });
@@ -1607,6 +1614,358 @@ router.post('/bank-cash/payments/:id/reject', auth, async (req, res) => {
   }
 });
 
+// Undo a cleared payment (bounced cheque, wrong supplier): reversing JE, cash back, PO reopened.
+router.post('/bank-cash/payments/:id/reverse', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({ success: false, error: 'Only Finance Manager / Admin can reverse supplier payments' });
+    }
+    const payment = await SupplierPayment.findById(req.params.id);
+    if (!payment) return res.status(404).json({ success: false, error: 'Payment not found' });
+    if (payment.status !== 'APPROVED') {
+      return res.status(400).json({ success: false, error: `Only cleared payments can be reversed (this one is ${payment.status})` });
+    }
+    const original = payment.journal_entry_id ? await JournalEntry.findById(payment.journal_entry_id).lean() : null;
+    if (!original || original.status !== 'POSTED') {
+      return res.status(400).json({ success: false, error: 'The payment journal is not posted, so there is nothing to reverse' });
+    }
+
+    const reason = String(req.body?.reason || '').trim();
+    const actor = actorFromReq(req);
+    const amount = toNum(payment.amount);
+    const reversalDate = new Date();
+    const entry_no = await nextJournalEntryNo(reversalDate);
+    const reversal = await JournalEntry.create({
+      entry_no,
+      entry_date: reversalDate,
+      memo: `Reversal of ${original.entry_no} — supplier payment ${payment.payment_no} (${payment.supplier_name})${reason ? ` — ${reason}` : ''}`,
+      source: 'ADJUSTMENT',
+      status: 'POSTED',
+      lines: original.lines.map((l) => ({
+        account_id: l.account_id,
+        account_code: l.account_code,
+        account_name: l.account_name,
+        description: `Reverse: ${l.description || ''}`.trim(),
+        debit: l.credit,
+        credit: l.debit,
+      })),
+      total_debit: original.total_credit,
+      total_credit: original.total_debit,
+      posted_at: new Date(),
+      source_reference: payment.purchase_order_no || payment.payment_no,
+      source_label: 'Supplier payment reversal',
+      ...actor,
+    });
+
+    const wallet = await BankCashAccount.findById(payment.bank_cash_account_id);
+    if (wallet) {
+      wallet.current_balance = Number((toNum(wallet.current_balance) + amount).toFixed(2));
+      await wallet.save();
+    }
+
+    let po = null;
+    if (payment.purchase_order_id) {
+      po = await PurchaseOrder.findById(payment.purchase_order_id);
+      if (po) {
+        po.amount_paid = Math.max(0, Number((toNum(po.amount_paid) - amount).toFixed(2)));
+        if (po.status === 'CLOSED') po.status = 'RECEIVED';
+        await po.save();
+      }
+    }
+
+    payment.status = 'REVERSED';
+    payment.reversed_at = new Date();
+    payment.reversed_by_name = actor.created_by_name;
+    payment.reversed_by_email = actor.created_by_email;
+    payment.reversal_reason = reason;
+    payment.reversal_journal_id = reversal._id;
+    payment.reversal_journal_no = reversal.entry_no;
+    await payment.save();
+
+    res.json({ success: true, data: { payment, journal: reversal, bank_cash_account: wallet, purchase_order: po } });
+  } catch (error) {
+    console.error('Error reversing supplier payment:', error);
+    res.status(500).json({ success: false, error: 'Failed to reverse supplier payment' });
+  }
+});
+
+// Payables: what each supplier has billed (goods received → AP), been paid, and is still owed.
+router.get('/payables/summary', auth, async (req, res) => {
+  try {
+    const [orders, payments, apAccount] = await Promise.all([
+      PurchaseOrder.find({ status: { $nin: ['DRAFT', 'PENDING_APPROVAL', 'REJECTED', 'CANCELLED'] } })
+        .sort({ po_date: -1 })
+        .lean(),
+      SupplierPayment.find({ status: { $in: ['PENDING_APPROVAL', 'APPROVED'] } }).lean(),
+      Account.findOne({ code: '2000' }).lean(),
+    ]);
+
+    const pendingByPo = new Map();
+    payments
+      .filter((p) => p.status === 'PENDING_APPROVAL' && p.purchase_order_id)
+      .forEach((p) => {
+        const key = String(p.purchase_order_id);
+        pendingByPo.set(key, (pendingByPo.get(key) || 0) + toNum(p.amount));
+      });
+
+    const bySupplier = new Map();
+    const supplierRow = (name) => {
+      const key = String(name || 'Unknown').trim().toLowerCase();
+      if (!bySupplier.has(key)) {
+        bySupplier.set(key, {
+          supplier_name: String(name || 'Unknown').trim(),
+          ordered: 0,
+          billed: 0,
+          paid: 0,
+          pending: 0,
+          open_pos: 0,
+        });
+      }
+      return bySupplier.get(key);
+    };
+
+    const purchase_orders = orders.map((po) => {
+      const billed = poBilledValue(po);
+      const paid = toNum(po.amount_paid);
+      const pending = pendingByPo.get(String(po._id)) || 0;
+      const row = supplierRow(po.supplier_name);
+      row.ordered += toNum(po.total_amount);
+      row.billed += billed;
+      if (po.status !== 'CLOSED') row.open_pos += 1;
+      return {
+        _id: po._id,
+        po_no: po.po_no,
+        po_date: po.po_date,
+        supplier_id: po.supplier_id,
+        supplier_name: po.supplier_name,
+        supplier_trn: po.supplier_trn,
+        supplier_phone: po.supplier_phone,
+        supplier_email: po.supplier_email,
+        supplier_address: po.supplier_address,
+        supplier_bank_name: po.supplier_bank_name,
+        supplier_iban: po.supplier_iban,
+        supplier_invoice_no: po.supplier_invoice_no || po.supplier_reference,
+        supplier_invoice_date: po.supplier_invoice_date || po.po_date,
+        due_date: po.due_date,
+        receive_later: Boolean(po.receive_later),
+        subtotal: toNum(po.subtotal),
+        tax_amount: toNum(po.tax_amount),
+        lines: (po.lines || []).map((l) => ({
+          description: l.description,
+          sku: l.sku,
+          quantity: toNum(l.quantity),
+          received_qty: toNum(l.received_qty),
+          unit_cost: toNum(l.unit_cost),
+          line_total: toNum(l.line_total),
+        })),
+        journal_entry_no: po.journal_entry_no,
+        receipt_journal_nos: (po.receipt_journals || []).map((j) => j.journal_entry_no),
+        status: po.status,
+        total_amount: toNum(po.total_amount),
+        billed,
+        paid,
+        pending,
+        owed_now: Number((billed - paid).toFixed(2)),
+        left_to_pay: Number(Math.max(0, toNum(po.total_amount) - paid - pending).toFixed(2)),
+      };
+    });
+
+    payments.forEach((p) => {
+      const row = supplierRow(p.supplier_name);
+      if (p.status === 'APPROVED') {
+        row.paid += toNum(p.amount);
+      } else {
+        row.pending += toNum(p.amount);
+      }
+    });
+
+    const suppliers = [...bySupplier.values()]
+      .map((s) => ({
+        ...s,
+        ordered: Number(s.ordered.toFixed(2)),
+        billed: Number(s.billed.toFixed(2)),
+        paid: Number(s.paid.toFixed(2)),
+        pending: Number(s.pending.toFixed(2)),
+        outstanding: Number((s.billed - s.paid).toFixed(2)),
+      }))
+      .sort((a, b) => b.outstanding - a.outstanding);
+
+    let ap_gl_balance = 0;
+    if (apAccount) {
+      const [agg] = await JournalEntry.aggregate([
+        { $match: { status: 'POSTED', 'lines.account_code': '2000' } },
+        { $unwind: '$lines' },
+        { $match: { 'lines.account_code': '2000' } },
+        { $group: { _id: null, bal: { $sum: { $subtract: ['$lines.credit', '$lines.debit'] } } } },
+      ]);
+      ap_gl_balance = Number((agg?.bal || 0).toFixed(2));
+    }
+
+    const totals = suppliers.reduce(
+      (t, s) => ({
+        ordered: t.ordered + s.ordered,
+        billed: t.billed + s.billed,
+        paid: t.paid + s.paid,
+        pending: t.pending + s.pending,
+        outstanding: t.outstanding + s.outstanding,
+      }),
+      { ordered: 0, billed: 0, paid: 0, pending: 0, outstanding: 0 }
+    );
+    Object.keys(totals).forEach((k) => (totals[k] = Number(totals[k].toFixed(2))));
+
+    res.json({ success: true, data: { totals: { ...totals, ap_gl_balance }, suppliers, purchase_orders } });
+  } catch (error) {
+    console.error('Error loading payables summary:', error);
+    res.status(500).json({ success: false, error: 'Failed to load payables summary' });
+  }
+});
+
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const SUPPLIER_FIELDS = [
+  'name',
+  'trn',
+  'contact_person',
+  'phone',
+  'email',
+  'address',
+  'bank_name',
+  'iban',
+  'account_number',
+  'notes',
+];
+
+function pickSupplierFields(raw = {}) {
+  const out = {};
+  SUPPLIER_FIELDS.forEach((key) => {
+    if (raw[key] !== undefined) out[key] = String(raw[key] ?? '').trim();
+  });
+  if (raw.payment_terms_days !== undefined) {
+    out.payment_terms_days = Math.max(0, Math.round(toNum(raw.payment_terms_days)));
+  }
+  return out;
+}
+
+async function nextSupplierCode() {
+  const latest = await Supplier.findOne({ code: /^SUP-\d+$/ }).sort({ code: -1 }).lean();
+  const n = latest ? parseInt(latest.code.slice(4), 10) + 1 : 1;
+  return `SUP-${String(n).padStart(4, '0')}`;
+}
+
+async function createSupplierRecord(raw, actor) {
+  const fields = pickSupplierFields(raw);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await Supplier.create({
+        ...fields,
+        code: await nextSupplierCode(),
+        created_by_name: actor.created_by_name,
+        created_by_email: actor.created_by_email,
+      });
+    } catch (error) {
+      if (error?.code !== 11000 || attempt === 2) throw error;
+    }
+  }
+  return null;
+}
+
+function supplierSnapshot(supplier) {
+  return {
+    supplier_id: supplier._id,
+    supplier_name: supplier.name,
+    supplier_trn: supplier.trn || undefined,
+    supplier_phone: supplier.phone || undefined,
+    supplier_email: supplier.email || undefined,
+    supplier_address: supplier.address || undefined,
+    supplier_bank_name: supplier.bank_name || undefined,
+    supplier_iban: supplier.iban || undefined,
+  };
+}
+
+// supplier_id → saved supplier; supplier {...} → new supplier saved to the list (reusing a
+// same-name/TRN match); bare supplier_name → free-text supplier for older callers.
+async function resolvePoSupplier(body, actor) {
+  if (body.supplier_id) {
+    const supplier = await Supplier.findById(body.supplier_id);
+    if (!supplier || supplier.is_active === false) return { error: 'Supplier not found or inactive' };
+    return { supplier, snapshot: supplierSnapshot(supplier) };
+  }
+  if (body.supplier && typeof body.supplier === 'object') {
+    const fields = pickSupplierFields(body.supplier);
+    if (!fields.name) return { error: 'Supplier name is required' };
+    const existing = await Supplier.findOne({
+      $or: [
+        { name: new RegExp(`^${escapeRegex(fields.name)}$`, 'i') },
+        ...(fields.trn ? [{ trn: fields.trn }] : []),
+      ],
+      is_active: { $ne: false },
+    });
+    const supplier = existing || (await createSupplierRecord(fields, actor));
+    return { supplier, snapshot: supplierSnapshot(supplier) };
+  }
+  const name = String(body.supplier_name || '').trim();
+  if (!name) return { error: 'Supplier is required' };
+  return { supplier: null, snapshot: { supplier_name: name } };
+}
+
+router.get('/suppliers', auth, async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    const filter = req.query.include_inactive === 'true' ? {} : { is_active: { $ne: false } };
+    if (q) {
+      const rx = new RegExp(escapeRegex(q), 'i');
+      filter.$or = [{ name: rx }, { code: rx }, { trn: rx }, { email: rx }, { phone: rx }];
+    }
+    const suppliers = await Supplier.find(filter).sort({ name: 1 }).lean();
+    res.json({ success: true, data: suppliers });
+  } catch (error) {
+    console.error('Error fetching suppliers:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch suppliers' });
+  }
+});
+
+router.post('/suppliers', auth, async (req, res) => {
+  try {
+    const fields = pickSupplierFields(req.body || {});
+    if (!fields.name) return res.status(400).json({ success: false, error: 'Supplier name is required' });
+    const clash = await Supplier.findOne({
+      $or: [
+        { name: new RegExp(`^${escapeRegex(fields.name)}$`, 'i') },
+        ...(fields.trn ? [{ trn: fields.trn }] : []),
+      ],
+    }).lean();
+    if (clash) {
+      return res.status(400).json({
+        success: false,
+        error: `${clash.name} (${clash.code}) already exists${fields.trn && clash.trn === fields.trn ? ' with this TRN' : ''}`,
+      });
+    }
+    const supplier = await createSupplierRecord(fields, actorFromReq(req));
+    res.status(201).json({ success: true, data: supplier });
+  } catch (error) {
+    console.error('Error creating supplier:', error);
+    res.status(500).json({ success: false, error: 'Failed to create supplier' });
+  }
+});
+
+router.put('/suppliers/:id', auth, async (req, res) => {
+  try {
+    const supplier = await Supplier.findById(req.params.id);
+    if (!supplier) return res.status(404).json({ success: false, error: 'Supplier not found' });
+    const fields = pickSupplierFields(req.body || {});
+    if (fields.name === '') return res.status(400).json({ success: false, error: 'Supplier name is required' });
+    Object.assign(supplier, fields);
+    if (req.body?.is_active !== undefined) supplier.is_active = Boolean(req.body.is_active);
+    await supplier.save();
+    res.json({ success: true, data: supplier });
+  } catch (error) {
+    console.error('Error updating supplier:', error);
+    res.status(500).json({ success: false, error: 'Failed to update supplier' });
+  }
+});
+
 async function nextPurchaseOrderNo(poDate) {
   const year = new Date(poDate).getFullYear() || new Date().getFullYear();
   const prefix = `PO-${year}-`;
@@ -1621,6 +1980,22 @@ async function nextPurchaseOrderNo(poDate) {
     if (Number.isFinite(n)) nextNum = n + 1;
   }
   return `${prefix}${String(nextNum).padStart(4, '0')}`;
+}
+
+async function pendingPaymentsTotal(purchaseOrderId) {
+  const pending = await SupplierPayment.find({
+    purchase_order_id: purchaseOrderId,
+    status: 'PENDING_APPROVAL',
+  })
+    .select('amount')
+    .lean();
+  return Number(pending.reduce((s, p) => s + toNum(p.amount), 0).toFixed(2));
+}
+
+// POs fully received before receipt tracking existed posted their whole accrual at once.
+function poBilledValue(po) {
+  if (po.received_value_posted != null) return toNum(po.received_value_posted);
+  return ['RECEIVED', 'CLOSED'].includes(po.status) ? toNum(po.total_amount) : 0;
 }
 
 function buildPoLines(rawLines) {
@@ -1732,7 +2107,6 @@ router.post('/purchase-orders', auth, async (req, res) => {
     const {
       po_date,
       expected_date,
-      supplier_name,
       supplier_reference = '',
       currency = 'AED',
       tax_amount = 0,
@@ -1741,18 +2115,49 @@ router.post('/purchase-orders', auth, async (req, res) => {
       credit_account_code = '2000',
       submit = false,
       lines: rawLines,
+      supplier_invoice_no = '',
+      supplier_invoice_date,
+      due_date,
+      receive_later = false,
     } = req.body || {};
 
-    const supplierName = String(supplier_name || '').trim();
     const lines = buildPoLines(rawLines);
-    const poDate = po_date ? new Date(po_date) : new Date();
+    const invoiceNo = String(supplier_invoice_no || '').trim();
+    const poDate = supplier_invoice_date
+      ? new Date(supplier_invoice_date)
+      : po_date
+        ? new Date(po_date)
+        : new Date();
 
-    if (!supplierName) {
-      return res.status(400).json({ success: false, error: 'Supplier name is required' });
+    const resolved = await resolvePoSupplier(req.body || {}, actorFromReq(req));
+    if (resolved.error) {
+      return res.status(400).json({ success: false, error: resolved.error });
     }
+    const { supplier, snapshot } = resolved;
+    const supplierName = snapshot.supplier_name;
+
     if (!lines.length) {
       return res.status(400).json({ success: false, error: 'At least one line item is required' });
     }
+
+    if (invoiceNo) {
+      const duplicate = await PurchaseOrder.findOne({
+        ...(supplier ? { supplier_id: supplier._id } : { supplier_name: supplierName }),
+        supplier_invoice_no: new RegExp(`^${escapeRegex(invoiceNo)}$`, 'i'),
+        status: { $nin: ['REJECTED', 'CANCELLED'] },
+      }).lean();
+      if (duplicate) {
+        return res.status(400).json({
+          success: false,
+          error: `Invoice ${invoiceNo} from ${supplierName} is already entered as ${duplicate.po_no}`,
+        });
+      }
+    }
+
+    const termsDays = toNum(supplier?.payment_terms_days ?? 30);
+    const dueDate = due_date
+      ? new Date(due_date)
+      : new Date(poDate.getTime() + termsDays * 24 * 60 * 60 * 1000);
 
     const debitCode = String(debit_account_code || '1200').trim();
     const creditCode = String(credit_account_code || '2000').trim();
@@ -1776,8 +2181,12 @@ router.post('/purchase-orders', auth, async (req, res) => {
       po_no,
       po_date: poDate,
       expected_date: expected_date ? new Date(expected_date) : undefined,
-      supplier_name: supplierName,
-      supplier_reference: String(supplier_reference || '').trim(),
+      ...snapshot,
+      supplier_reference: String(supplier_reference || '').trim() || invoiceNo,
+      supplier_invoice_no: invoiceNo || undefined,
+      supplier_invoice_date: supplier_invoice_date ? new Date(supplier_invoice_date) : undefined,
+      due_date: dueDate,
+      receive_later: Boolean(receive_later),
       currency: String(currency || 'AED').trim() || 'AED',
       status: shouldSubmit ? 'PENDING_APPROVAL' : 'DRAFT',
       lines,
@@ -1817,6 +2226,9 @@ router.post('/purchase-orders/:id/submit', auth, async (req, res) => {
 
 router.post('/purchase-orders/:id/approve', auth, async (req, res) => {
   try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({ success: false, error: 'Only Finance Manager / Admin can approve purchase invoices' });
+    }
     const po = await PurchaseOrder.findById(req.params.id);
     if (!po) return res.status(404).json({ success: false, error: 'Purchase order not found' });
     if (!['DRAFT', 'PENDING_APPROVAL'].includes(po.status)) {
@@ -1914,7 +2326,21 @@ router.post('/purchase-orders/:id/approve', auth, async (req, res) => {
     po.journal_entry_no = journal.entry_no;
     await po.save();
 
-    res.json({ success: true, data: { purchase_order: po, journal } });
+    if (!po.receive_later) {
+      const booked = await receiveIntoPo(po, [], actor);
+      if (booked.error) {
+        return res.status(400).json({
+          success: false,
+          error: `Approved, but posting to accounts failed: ${booked.error}`,
+        });
+      }
+      return res.json({
+        success: true,
+        data: { purchase_order: po, journal: booked.journal || journal, posted: true },
+      });
+    }
+
+    res.json({ success: true, data: { purchase_order: po, journal, posted: false } });
   } catch (error) {
     console.error('Error approving purchase order:', error);
     res.status(500).json({ success: false, error: 'Failed to approve purchase order' });
@@ -1923,6 +2349,9 @@ router.post('/purchase-orders/:id/approve', auth, async (req, res) => {
 
 router.post('/purchase-orders/:id/reject', auth, async (req, res) => {
   try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({ success: false, error: 'Only Finance Manager / Admin can reject purchase invoices' });
+    }
     const po = await PurchaseOrder.findById(req.params.id);
     if (!po) return res.status(404).json({ success: false, error: 'Purchase order not found' });
     if (!['DRAFT', 'PENDING_APPROVAL'].includes(po.status)) {
@@ -1946,6 +2375,42 @@ router.post('/purchase-orders/:id/reject', auth, async (req, res) => {
   }
 });
 
+router.post('/purchase-orders/:id/cancel', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({ success: false, error: 'Only Finance Manager / Admin can cancel purchase orders' });
+    }
+    const po = await PurchaseOrder.findById(req.params.id);
+    if (!po) return res.status(404).json({ success: false, error: 'Purchase order not found' });
+    if (po.status !== 'APPROVED') {
+      return res.status(400).json({ success: false, error: `PO is ${po.status}; only approved POs with nothing received can be cancelled` });
+    }
+    if (po.lines.some((l) => toNum(l.received_qty) > 0)) {
+      return res.status(400).json({ success: false, error: 'Goods have already been received on this PO' });
+    }
+    if (toNum(po.amount_paid) > 0 || (await pendingPaymentsTotal(po._id)) > 0) {
+      return res.status(400).json({ success: false, error: 'Reverse or reject the payments on this PO first' });
+    }
+
+    if (po.journal_entry_id) {
+      const draft = await JournalEntry.findById(po.journal_entry_id);
+      if (draft && draft.status === 'DRAFT') {
+        draft.status = 'VOID';
+        draft.memo = `${draft.memo || ''} (voided — PO cancelled)`.trim();
+        await draft.save();
+      }
+    }
+    po.status = 'CANCELLED';
+    po.cancelled_at = new Date();
+    po.cancellation_reason = String(req.body?.reason || '').trim();
+    await po.save();
+    res.json({ success: true, data: po });
+  } catch (error) {
+    console.error('Error cancelling purchase order:', error);
+    res.status(500).json({ success: false, error: 'Failed to cancel purchase order' });
+  }
+});
+
 router.post('/purchase-orders/:id/receive', auth, async (req, res) => {
   try {
     const po = await PurchaseOrder.findById(req.params.id);
@@ -1958,96 +2423,15 @@ router.post('/purchase-orders/:id/receive', auth, async (req, res) => {
     }
 
     const receipts = Array.isArray(req.body?.receipts) ? req.body.receipts : [];
-    const actor = actorFromReq(req);
-    const inventoryTxns = [];
-    const receivePlan = [];
-
-    if (!receipts.length) {
-      for (const line of po.lines) {
-        const remaining = Math.max(0, toNum(line.quantity) - toNum(line.received_qty));
-        if (remaining > 0) {
-          receivePlan.push({ line, qty: remaining });
-        }
-      }
-    } else {
-      for (const raw of receipts) {
-        const lineId = String(raw.line_id || raw._id || '');
-        const qty = toNum(raw.quantity);
-        if (!(qty > 0)) continue;
-        const line = po.lines.id(lineId) || po.lines.find((l) => String(l._id) === lineId);
-        if (!line) continue;
-        const remaining = Math.max(0, toNum(line.quantity) - toNum(line.received_qty));
-        const applyQty = Math.min(qty, remaining);
-        if (applyQty > 0) receivePlan.push({ line, qty: applyQty });
-      }
-    }
-
-    if (!receivePlan.length) {
-      return res.status(400).json({ success: false, error: 'Nothing left to receive on this PO' });
-    }
-
-    for (const { line, qty } of receivePlan) {
-      line.received_qty = toNum(line.received_qty) + qty;
-
-      if (!line.sku) continue;
-      const item = await InventoryItem.findOne({ sku: line.sku, is_active: true });
-      if (!item) continue;
-
-      const unitCost = toNum(line.unit_cost);
-      const totalCost = Number((qty * unitCost).toFixed(2));
-      const prevQty = toNum(item.qty_on_hand);
-      const prevAvg = toNum(item.avg_cost);
-      const newQty = prevQty + qty;
-      item.avg_cost =
-        newQty > 0 ? Number(((prevQty * prevAvg + totalCost) / newQty).toFixed(6)) : unitCost;
-      item.qty_on_hand = newQty;
-      await item.save();
-
-      const txn = await InventoryTransaction.create({
-        txn_date: new Date(),
-        type: 'RECEIPT',
-        item_id: item._id,
-        sku: item.sku,
-        item_name: item.name,
-        qty,
-        unit_cost: unitCost,
-        total_cost: totalCost,
-        notes: `PO ${po.po_no} goods receipt`,
-        ...actor,
-      });
-      inventoryTxns.push(txn);
-    }
-
-    const allReceived = po.lines.every(
-      (l) => toNum(l.received_qty) + 0.0001 >= toNum(l.quantity)
-    );
-    const anyReceived = po.lines.some((l) => toNum(l.received_qty) > 0);
-    po.status = allReceived ? 'RECEIVED' : anyReceived ? 'PARTIALLY_RECEIVED' : po.status;
-    if (allReceived) po.received_at = new Date();
-
-    let journal = po.journal_entry_id ? await JournalEntry.findById(po.journal_entry_id) : null;
-
-    if (allReceived && journal && journal.status === 'DRAFT') {
-      journal.status = 'POSTED';
-      journal.posted_at = new Date();
-      journal.memo = `Purchase order ${po.po_no} — ${po.supplier_name} (received)`;
-      journal.source_label = 'Purchase order goods receipt';
-      await journal.save();
-      for (const txn of inventoryTxns) {
-        txn.journal_entry_id = journal._id;
-        txn.journal_entry_no = journal.entry_no;
-        await txn.save();
-      }
-    }
-
-    await po.save();
+    const result = await receiveIntoPo(po, receipts, actorFromReq(req));
+    if (result.error) return res.status(400).json({ success: false, error: result.error });
 
     res.json({
       success: true,
       data: {
         purchase_order: po,
-        journal,
-        inventory_transactions: inventoryTxns,
+        journal: result.journal,
+        inventory_transactions: result.inventoryTxns,
       },
     });
   } catch (error) {
@@ -2055,6 +2439,189 @@ router.post('/purchase-orders/:id/receive', auth, async (req, res) => {
     res.status(500).json({ success: false, error: 'Failed to receive purchase order' });
   }
 });
+
+// Applies a goods receipt (empty receipts = everything outstanding): stock in, AP posted for the
+// newly received value. Mutates and saves the PO; returns { error } when nothing can be posted.
+async function receiveIntoPo(po, receipts, actor) {
+  await ensurePoAccounts(actor);
+  const [debitAccount, creditAccount, vatInput] = await Promise.all([
+    loadPostableAccount(po.debit_account_code || '1200'),
+    loadPostableAccount(po.credit_account_code || '2000'),
+    loadPostableAccount('1310'),
+  ]);
+  if (!debitAccount || !creditAccount || (toNum(po.tax_amount) > 0 && !vatInput)) {
+    return { error: 'Linked GL accounts are not postable' };
+  }
+
+  const inventoryTxns = [];
+  const receivePlan = [];
+
+  if (!receipts.length) {
+    for (const line of po.lines) {
+      const remaining = Math.max(0, toNum(line.quantity) - toNum(line.received_qty));
+      if (remaining > 0) {
+        receivePlan.push({ line, qty: remaining });
+      }
+    }
+  } else {
+    for (const raw of receipts) {
+      const lineId = String(raw.line_id || raw._id || '');
+      const qty = toNum(raw.quantity);
+      if (!(qty > 0)) continue;
+      const line = po.lines.id(lineId) || po.lines.find((l) => String(l._id) === lineId);
+      if (!line) continue;
+      const remaining = Math.max(0, toNum(line.quantity) - toNum(line.received_qty));
+      const applyQty = Math.min(qty, remaining);
+      if (applyQty > 0) receivePlan.push({ line, qty: applyQty });
+    }
+  }
+
+  if (!receivePlan.length) {
+    return { error: 'Nothing left to receive on this PO' };
+  }
+
+  for (const { line, qty } of receivePlan) {
+    line.received_qty = toNum(line.received_qty) + qty;
+
+    if (!line.sku) continue;
+    const item = await InventoryItem.findOne({ sku: line.sku, is_active: true });
+    if (!item) continue;
+
+    const unitCost = toNum(line.unit_cost);
+    const totalCost = Number((qty * unitCost).toFixed(2));
+    const prevQty = toNum(item.qty_on_hand);
+    const prevAvg = toNum(item.avg_cost);
+    const newQty = prevQty + qty;
+    item.avg_cost =
+      newQty > 0 ? Number(((prevQty * prevAvg + totalCost) / newQty).toFixed(6)) : unitCost;
+    item.qty_on_hand = newQty;
+    await item.save();
+
+    const txn = await InventoryTransaction.create({
+      txn_date: new Date(),
+      type: 'RECEIPT',
+      item_id: item._id,
+      sku: item.sku,
+      item_name: item.name,
+      qty,
+      unit_cost: unitCost,
+      total_cost: totalCost,
+      notes: `PO ${po.po_no} goods receipt`,
+      ...actor,
+    });
+    inventoryTxns.push(txn);
+  }
+
+  const allReceived = po.lines.every(
+    (l) => toNum(l.received_qty) + 0.0001 >= toNum(l.quantity)
+  );
+  const anyReceived = po.lines.some((l) => toNum(l.received_qty) > 0);
+  po.status = allReceived ? 'RECEIVED' : anyReceived ? 'PARTIALLY_RECEIVED' : po.status;
+  if (allReceived) po.received_at = new Date();
+
+  const draft = po.journal_entry_id ? await JournalEntry.findById(po.journal_entry_id) : null;
+  const total = toNum(po.total_amount);
+  const tax = Math.max(0, toNum(po.tax_amount));
+  const subtotal = toNum(po.subtotal) || Number((total - tax).toFixed(2));
+  const postedGross = toNum(po.received_value_posted);
+  const postedTax = toNum(po.received_tax_posted);
+  let journal = null;
+
+  if (allReceived && postedGross === 0 && draft && draft.status === 'DRAFT') {
+    draft.status = 'POSTED';
+    draft.posted_at = new Date();
+    draft.memo = `Purchase order ${po.po_no} — ${po.supplier_name} (received)`;
+    draft.source_label = 'Purchase order goods receipt';
+    await draft.save();
+    journal = draft;
+    po.received_value_posted = total;
+    po.received_tax_posted = tax;
+  } else {
+    const receivedNet = Number(
+      po.lines
+        .reduce((s, l) => s + Math.min(toNum(l.received_qty), toNum(l.quantity)) * toNum(l.unit_cost), 0)
+        .toFixed(2)
+    );
+    const targetTax = allReceived
+      ? tax
+      : Number((subtotal > 0 ? (tax * receivedNet) / subtotal : 0).toFixed(2));
+    const targetGross = allReceived ? total : Number((receivedNet + targetTax).toFixed(2));
+    const deltaGross = Number((targetGross - postedGross).toFixed(2));
+    const deltaTax = Number(Math.max(0, targetTax - postedTax).toFixed(2));
+    const deltaNet = Number((deltaGross - deltaTax).toFixed(2));
+
+    if (deltaGross > 0.009) {
+      const lines = [
+        {
+          account_id: debitAccount._id,
+          account_code: debitAccount.code,
+          account_name: debitAccount.name,
+          description: `Goods received PO ${po.po_no} — ${po.supplier_name}`,
+          debit: deltaNet,
+          credit: 0,
+        },
+      ];
+      if (deltaTax > 0) {
+        lines.push({
+          account_id: vatInput._id,
+          account_code: vatInput.code,
+          account_name: vatInput.name,
+          description: `VAT input PO ${po.po_no}`,
+          debit: deltaTax,
+          credit: 0,
+        });
+      }
+      lines.push({
+        account_id: creditAccount._id,
+        account_code: creditAccount.code,
+        account_name: creditAccount.name,
+        description: `AP for PO ${po.po_no}`,
+        debit: 0,
+        credit: deltaGross,
+      });
+      const receiptDate = new Date();
+      journal = await JournalEntry.create({
+        entry_no: await nextJournalEntryNo(receiptDate),
+        entry_date: receiptDate,
+        memo: `Goods receipt ${po.po_no} — ${po.supplier_name}${allReceived ? ' (final)' : ' (partial)'}`,
+        source: 'INVENTORY',
+        status: 'POSTED',
+        lines,
+        total_debit: deltaGross,
+        total_credit: deltaGross,
+        posted_at: new Date(),
+        source_reference: po.po_no,
+        source_label: 'Purchase order goods receipt',
+        ...actor,
+      });
+      po.received_value_posted = targetGross;
+      po.received_tax_posted = Number((postedTax + deltaTax).toFixed(2));
+      po.receipt_journals = [
+        ...(po.receipt_journals || []),
+        { journal_entry_id: journal._id, journal_entry_no: journal.entry_no, amount: deltaGross, posted_at: new Date() },
+      ];
+    }
+
+    if (draft && draft.status === 'DRAFT') {
+      draft.status = 'VOID';
+      draft.memo = `${draft.memo || ''} (replaced by goods receipt postings)`.trim();
+      await draft.save();
+    }
+  }
+
+  if (journal) {
+    for (const txn of inventoryTxns) {
+      txn.journal_entry_id = journal._id;
+      txn.journal_entry_no = journal.entry_no;
+      await txn.save();
+    }
+  }
+
+  if (allReceived && toNum(po.amount_paid) + 0.009 >= total) po.status = 'CLOSED';
+
+  await po.save();
+  return { journal, inventoryTxns };
+}
 
 function isFinanceManager(req) {
   const role = String(req.user?.role || '').toUpperCase();
@@ -3419,6 +3986,84 @@ router.post('/fixed-assets/:id/dispose', auth, async (req, res) => {
   } catch (error) {
     console.error('Error disposing fixed asset:', error);
     res.status(500).json({ success: false, error: 'Failed to dispose fixed asset' });
+  }
+});
+
+// ─── Finance invoices (operations) → GL ──────────────────────────────────────
+
+router.get('/finance-invoices/gl-status', auth, async (req, res) => {
+  try {
+    const { Invoice } = require('../models/unified-schema');
+    const [counts, failed] = await Promise.all([
+      Invoice.aggregate([{ $group: { _id: '$gl_sync.status', count: { $sum: 1 } } }]),
+      Invoice.find({ 'gl_sync.status': 'FAILED' })
+        .select('invoice_id awb_number total_amount issue_date gl_sync')
+        .sort({ issue_date: -1 })
+        .limit(50)
+        .lean(),
+    ]);
+    const summary = Object.fromEntries(counts.map((c) => [c._id || 'NOT_POSTED', c.count]));
+    res.json({
+      success: true,
+      data: {
+        summary,
+        failed: failed.map((f) => ({ ...f, total_amount: toNum(f.total_amount?.toString()) })),
+      },
+    });
+  } catch (error) {
+    console.error('Error loading finance invoice GL status:', error);
+    res.status(500).json({ success: false, error: 'Failed to load GL status' });
+  }
+});
+
+router.post('/finance-invoices/:id/post-journal', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({ success: false, error: 'Only Finance Manager / Admin can post invoice journals' });
+    }
+    const { Invoice } = require('../models/unified-schema');
+    const invoice = await Invoice.findById(req.params.id);
+    if (!invoice) return res.status(404).json({ success: false, error: 'Invoice not found' });
+    const gl = await postInvoiceJournal(invoice, { actorId: req.user?.id });
+    const receipts = gl.status === 'POSTED' ? await syncInvoiceReceipts(invoice, { actorId: req.user?.id }) : null;
+    const status = gl.status === 'FAILED' ? 400 : 200;
+    res.status(status).json({ success: gl.status !== 'FAILED', data: { ...gl, receipts }, error: gl.error });
+  } catch (error) {
+    console.error('Error posting finance invoice journal:', error);
+    res.status(500).json({ success: false, error: 'Failed to post invoice journal' });
+  }
+});
+
+// Retries FAILED postings; pass `since` to also post never-posted invoices issued on/after that date.
+router.post('/finance-invoices/post-pending', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({ success: false, error: 'Only Finance Manager / Admin can post invoice journals' });
+    }
+    const { Invoice } = require('../models/unified-schema');
+    const limit = Math.min(Math.max(parseInt(req.body?.limit, 10) || 200, 1), 1000);
+    const since = req.body?.since ? new Date(req.body.since) : null;
+    const or = [{ 'gl_sync.status': 'FAILED' }];
+    if (since && !Number.isNaN(since.getTime())) {
+      or.push({ 'gl_sync.status': { $exists: false }, issue_date: { $gte: since } });
+    }
+    const invoices = await Invoice.find({ status: { $ne: 'CANCELLED' }, $or: or })
+      .sort({ issue_date: 1 })
+      .limit(limit);
+
+    const results = { posted: [], skipped: 0, failed: [] };
+    for (const invoice of invoices) {
+      const gl = await postInvoiceJournal(invoice, { actorId: req.user?.id });
+      if (gl.status === 'POSTED') {
+        await syncInvoiceReceipts(invoice, { actorId: req.user?.id });
+        results.posted.push({ invoice_id: invoice.invoice_id, journal_no: gl.journal_no });
+      } else if (gl.status === 'FAILED') results.failed.push({ invoice_id: invoice.invoice_id, error: gl.error });
+      else results.skipped += 1;
+    }
+    res.json({ success: true, data: { scanned: invoices.length, ...results } });
+  } catch (error) {
+    console.error('Error posting pending finance invoice journals:', error);
+    res.status(500).json({ success: false, error: 'Failed to post pending invoice journals' });
   }
 });
 

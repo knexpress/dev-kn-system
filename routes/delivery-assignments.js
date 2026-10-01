@@ -970,11 +970,18 @@ router.post('/qr/:qrCode/payment', async (req, res) => {
         ? assignment.invoice_id._id.toString() 
         : assignment.invoice_id.toString();
       
-      await Invoice.findByIdAndUpdate(
+      const collectedInvoice = await Invoice.findByIdAndUpdate(
         invoiceId,
-        { status: 'COLLECTED_BY_DRIVER' }
+        { status: 'COLLECTED_BY_DRIVER' },
+        { new: true }
       );
       console.log('✅ Invoice status updated to COLLECTED_BY_DRIVER for invoice:', invoiceId);
+      if (collectedInvoice) {
+        const { syncInvoiceReceipts } = require('../services/invoice-gl');
+        await syncInvoiceReceipts(collectedInvoice, {
+          reason: `QR payment${payment_method ? ` via ${payment_method}` : ''}`,
+        });
+      }
     } else {
       console.warn('⚠️ No invoice_id found in assignment, cannot update invoice status');
     }

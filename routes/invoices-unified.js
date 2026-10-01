@@ -7,6 +7,12 @@ const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 const { validateObjectIdParam, sanitizeRegex } = require('../middleware/security');
 const { reinitiateDeliveryAssignmentForInvoice } = require('../utils/reinitiate-delivery-assignment');
 const { generateUniqueInvoiceID } = require('../utils/id-generators');
+const {
+  postInvoiceJournal,
+  reverseInvoiceJournal,
+  syncInvoiceReceipts,
+  syncInvoiceLedger,
+} = require('../services/invoice-gl');
 // const { createNotificationsForAllUsers } = require('./notifications');
 
 const router = express.Router();
@@ -1607,6 +1613,15 @@ router.post('/', async (req, res) => {
       .populate('client_id', 'company_name contact_name email phone address city country')
       .populate('created_by', 'full_name email department_id');
 
+    const gl = await postInvoiceJournal(invoice, {
+      actorId: created_by,
+      customerName: populatedInvoice?.client_id?.company_name,
+    });
+    populatedInvoice.gl_sync = invoice.gl_sync;
+    if (gl.status === 'POSTED') {
+      console.log(`✅ Finance JE ${gl.journal_no} posted for invoice ${invoice.invoice_id}`);
+    }
+
     // Integrate with EMPOST API (non-blocking — failures go to superadmin pending widget)
     try {
       const empostAPI = require('../services/empost-api');
@@ -1818,6 +1833,7 @@ router.post('/', async (req, res) => {
       success: true,
       data: transformInvoice(populatedInvoice),
       message: 'Invoice created successfully',
+      gl,
       ...(invoiceIdReassignedFrom
         ? {
             invoice_id_reassigned_from: invoiceIdReassignedFrom,
@@ -1858,6 +1874,11 @@ router.put('/:id/status', async (req, res) => {
     }
 
     await invoice.save();
+
+    const gl =
+      status === 'CANCELLED'
+        ? await reverseInvoiceJournal(invoice, { actorId: req.user?.id, reason: 'invoice cancelled' })
+        : await syncInvoiceReceipts(invoice, { actorId: req.user?.id });
 
     // Sync invoice status to EMPOST if it maps to a delivery status
     const { syncStatusToEMPost, getTrackingNumberFromInvoice, mapInvoiceStatusToDeliveryStatus } = require('../utils/empost-status-sync');
@@ -1911,7 +1932,8 @@ router.put('/:id/status', async (req, res) => {
     res.json({
       success: true,
       data: transformInvoice(populatedInvoice),
-      message: 'Invoice status updated successfully'
+      message: 'Invoice status updated successfully',
+      gl,
     });
   } catch (error) {
     console.error('Error updating invoice:', error);
@@ -1938,6 +1960,7 @@ router.patch('/:id/remit', async (req, res) => {
     // Update status to REMITTED
     invoice.status = 'REMITTED';
     await invoice.save();
+    const gl = await syncInvoiceReceipts(invoice, { actorId: req.user?.id });
 
     // Sync REMITTED status to EMPOST (maps to DELIVERED)
     const { syncStatusToEMPost, getTrackingNumberFromInvoice } = require('../utils/empost-status-sync');
@@ -1978,7 +2001,8 @@ router.patch('/:id/remit', async (req, res) => {
     res.json({
       success: true,
       data: transformInvoice(populatedInvoice),
-      message: 'Invoice marked as remitted successfully'
+      message: 'Invoice marked as remitted successfully',
+      gl,
     });
   } catch (error) {
     console.error('Error updating invoice status:', error);
@@ -1995,6 +2019,7 @@ router.put('/:id', async (req, res) => {
     const invoiceId = req.params.id;
     const updateData = req.body;
     const regenerate = updateData.regenerate === true;
+    delete updateData.gl_sync;
 
     // Helper function to parse Decimal128 or number values
     const parseDecimal = (value) => {
@@ -2455,6 +2480,7 @@ router.put('/:id', async (req, res) => {
         delete updateData.invoice_type;
         Object.assign(invoice, updateData);
         await invoice.save();
+        const codGl = await syncInvoiceLedger(invoice, { actorId: req.user?.id });
 
         // Populate the updated invoice for response
         const populatedInvoice = await Invoice.findById(invoice._id)
@@ -2487,6 +2513,7 @@ router.put('/:id', async (req, res) => {
           success: true,
           data: transformInvoice(populatedInvoice),
           message: 'COD invoice updated successfully',
+          gl: codGl,
         };
         if (codDeliveryAssignment !== undefined) codResponse.delivery_assignment = codDeliveryAssignment;
         if (codDeliveryAssignmentWarning !== undefined) codResponse.delivery_assignment_warning = codDeliveryAssignmentWarning;
@@ -2584,6 +2611,7 @@ router.put('/:id', async (req, res) => {
         delete updateData.invoice_type;
         Object.assign(invoice, updateData);
         await invoice.save();
+        const taxGl = await syncInvoiceLedger(invoice, { actorId: req.user?.id });
 
         // Populate the updated invoice for response
         const populatedInvoice = await Invoice.findById(invoice._id)
@@ -2616,6 +2644,7 @@ router.put('/:id', async (req, res) => {
           success: true,
           data: transformInvoice(populatedInvoice),
           message: 'Tax invoice updated successfully',
+          gl: taxGl,
         };
         if (taxDeliveryAssignment !== undefined) taxResponse.delivery_assignment = taxDeliveryAssignment;
         if (taxDeliveryAssignmentWarning !== undefined) taxResponse.delivery_assignment_warning = taxDeliveryAssignmentWarning;
@@ -2818,6 +2847,8 @@ router.put('/:id', async (req, res) => {
     Object.assign(invoice, updateData);
     await invoice.save();
 
+    const gl = await syncInvoiceLedger(invoice, { actorId: req.user?.id });
+
     // Populate the updated invoice for response
     const populatedInvoice = await Invoice.findById(invoice._id)
       .populate('request_id', REQUEST_POPULATE_FIELDS)
@@ -2858,6 +2889,7 @@ router.put('/:id', async (req, res) => {
       success: true,
       data: transformInvoice(populatedInvoice),
       message: 'Invoice updated successfully',
+      gl,
     };
     if (delivery_assignment !== undefined) response.delivery_assignment = delivery_assignment;
     if (delivery_assignment_warning !== undefined) response.delivery_assignment_warning = delivery_assignment_warning;
@@ -2884,11 +2916,13 @@ router.delete('/:id', async (req, res) => {
       });
     }
 
+    const gl = await reverseInvoiceJournal(invoice, { actorId: req.user?.id, reason: 'invoice deleted' });
     await Invoice.findByIdAndDelete(invoiceId);
 
     res.json({
       success: true,
-      message: 'Invoice deleted successfully'
+      message: 'Invoice deleted successfully',
+      gl,
     });
   } catch (error) {
     console.error('Error deleting invoice:', error);
@@ -3100,6 +3134,11 @@ router.post('/:invoiceId/cancel', validateObjectIdParam('invoiceId'), async (req
     // Commit transaction
     await session.commitTransaction();
     session.endSession();
+
+    const gl = await reverseInvoiceJournal(invoice, {
+      actorId: req.user?.id,
+      reason: reason ? `cancelled: ${reason}` : 'invoice cancelled',
+    });
     
     // Fetch updated invoice for response
     // Note: request_id may reference InvoiceRequest, but schema references ShipmentRequest
@@ -3127,6 +3166,7 @@ router.post('/:invoiceId/cancel', validateObjectIdParam('invoiceId'), async (req
     res.json({
       success: true,
       message: 'Invoice and related entities cancelled successfully',
+      gl,
       data: {
         invoice: transformInvoice(updatedInvoice),
         updatedEntities: {
