@@ -12,6 +12,8 @@ const {
   reverseInvoiceJournal,
   syncInvoiceReceipts,
   syncInvoiceLedger,
+  recordInvoicePayment,
+  voidInvoicePayment,
 } = require('../services/invoice-gl');
 // const { createNotificationsForAllUsers } = require('./notifications');
 
@@ -233,7 +235,7 @@ function buildInvoiceSearchQuery(searchTerm) {
 }
 
 // Essential fields for invoice list view (lightweight)
-const INVOICE_LIST_FIELDS = '_id invoice_id awb_number batch_number receiver_name receiver_address receiver_phone service_code weight_kg weight_type volume_cbm amount delivery_charge pickup_charge insurance_charge tax_amount total_amount status issue_date due_date paid_at createdAt updatedAt client_id request_id created_by';
+const INVOICE_LIST_FIELDS = '_id invoice_id awb_number batch_number receiver_name receiver_address receiver_phone service_code weight_kg weight_type volume_cbm amount delivery_charge pickup_charge insurance_charge tax_amount total_amount amount_paid gateway_charges_total payment_mode payments status issue_date due_date paid_at createdAt updatedAt client_id request_id created_by';
 
 // Get all invoices with pagination and search (OPTIMIZED for list view)
 router.get('/', async (req, res) => {
@@ -2013,6 +2015,66 @@ router.patch('/:id/remit', async (req, res) => {
   }
 });
 
+async function respondWithInvoice(res, invoiceId, extra) {
+  const populatedInvoice = await Invoice.findById(invoiceId)
+    .populate('request_id', REQUEST_POPULATE_FIELDS)
+    .populate('client_id', 'company_name contact_name email phone')
+    .populate('created_by', 'full_name email department_id');
+  res.json({ success: true, data: transformInvoice(populatedInvoice), ...extra });
+}
+
+// Record money collected (mode of payment, full / partial) — posts the receipt + gateway charge journal
+router.post('/:id/payments', async (req, res) => {
+  try {
+    const invoice = await Invoice.findById(req.params.id);
+    if (!invoice) return res.status(404).json({ success: false, error: 'Invoice not found' });
+
+    const { mode, payment_type, amount_collected, reference, collected_at } = req.body || {};
+    const result = await recordInvoicePayment(invoice, {
+      mode,
+      paymentType: payment_type,
+      amountCollected: amount_collected,
+      reference,
+      collectedAt: collected_at,
+      actorId: req.user?.id,
+    });
+    if (result.error) return res.status(400).json({ success: false, error: result.error });
+
+    await respondWithInvoice(res, invoice._id, {
+      payment: result.payment,
+      journal_no: result.journal.entry_no,
+      balance: result.balance,
+      message: result.balance > 0.009
+        ? `Payment recorded — AED ${result.balance.toFixed(2)} still outstanding`
+        : 'Payment recorded — invoice fully settled',
+    });
+  } catch (error) {
+    console.error('Error recording invoice payment:', error);
+    res.status(500).json({ success: false, error: 'Failed to record payment' });
+  }
+});
+
+router.post('/:id/payments/:paymentId/void', async (req, res) => {
+  try {
+    const invoice = await Invoice.findById(req.params.id);
+    if (!invoice) return res.status(404).json({ success: false, error: 'Invoice not found' });
+
+    const result = await voidInvoicePayment(invoice, req.params.paymentId, {
+      actorId: req.user?.id,
+      reason: req.body?.reason,
+    });
+    if (result.error) return res.status(400).json({ success: false, error: result.error });
+
+    await respondWithInvoice(res, invoice._id, {
+      reversal_journal_no: result.reversal_journal_no,
+      message: 'Payment voided',
+    });
+  } catch (error) {
+    console.error('Error voiding invoice payment:', error);
+    res.status(500).json({ success: false, error: 'Failed to void payment' });
+  }
+});
+
 // Update invoice
 router.put('/:id', async (req, res) => {
   try {
@@ -2020,6 +2082,10 @@ router.put('/:id', async (req, res) => {
     const updateData = req.body;
     const regenerate = updateData.regenerate === true;
     delete updateData.gl_sync;
+    delete updateData.payments;
+    delete updateData.amount_paid;
+    delete updateData.gateway_charges_total;
+    delete updateData.payment_mode;
 
     // Helper function to parse Decimal128 or number values
     const parseDecimal = (value) => {

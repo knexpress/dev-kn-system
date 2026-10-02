@@ -5,24 +5,46 @@ const SOURCE_LABEL = 'Finance invoice';
 const REVERSAL_LABEL = 'Finance invoice reversal';
 const COLLECTION_LABEL = 'Finance invoice driver collection';
 const RECEIPT_LABEL = 'Finance invoice receipt';
+const PAYMENT_LABEL = 'Finance invoice payment';
+const PAYMENT_VOID_LABEL = 'Finance invoice payment void';
 
 const glCodes = () => ({
   ar: String(process.env.FINANCE_INVOICE_AR_CODE || '1300').trim(),
   revenue: String(process.env.FINANCE_INVOICE_REVENUE_CODE || '4000').trim(),
+  shipping: String(process.env.FINANCE_SALES_SHIPPING_CODE || '4010').trim(),
+  pickup: String(process.env.FINANCE_SALES_PICKUP_CODE || '4020').trim(),
+  delivery: String(process.env.FINANCE_SALES_DELIVERY_CODE || '4030').trim(),
+  gateway: String(process.env.FINANCE_GATEWAY_REVENUE_CODE || '4040').trim(),
   vat: String(process.env.FINANCE_INVOICE_VAT_CODE || '2200').trim(),
   driverCash: String(process.env.FINANCE_DRIVER_CASH_CODE || '1020').trim(),
   remitted: String(process.env.FINANCE_REMIT_ACCOUNT_CODE || '1000').trim(),
   paid: String(process.env.FINANCE_PAID_ACCOUNT_CODE || '1100').trim(),
+  tabby: String(process.env.FINANCE_TABBY_CLEARING_CODE || '1320').trim(),
+  card: String(process.env.FINANCE_CARD_CLEARING_CODE || '1330').trim(),
 });
 
 const DEFAULT_ACCOUNTS = {
   ar: { name: 'Accounts Receivable', type: 'Asset', subtype: 'Receivables' },
   revenue: { name: 'Sales Revenue', type: 'Revenue', subtype: 'Operating' },
+  shipping: { name: 'Sale - Shipping Charge', type: 'Revenue', subtype: 'Operating', parent_code: '4000' },
+  pickup: { name: 'Sale - Pickup Charge', type: 'Revenue', subtype: 'Operating', parent_code: '4000' },
+  delivery: { name: 'Sale - Delivery Fee', type: 'Revenue', subtype: 'Operating', parent_code: '4000' },
+  gateway: { name: 'Payment Gateway Revenue', type: 'Revenue', subtype: 'Operating', parent_code: '4000' },
   vat: { name: 'VAT Output Payable', type: 'Liability', subtype: 'Tax' },
   driverCash: { name: 'Cash with Drivers (in transit)', type: 'Asset', subtype: 'Cash' },
   remitted: { name: 'Cash on Hand', type: 'Asset', subtype: 'Cash' },
   paid: { name: 'Cash at Bank', type: 'Asset', subtype: 'Bank' },
+  tabby: { name: 'Tabby Receivable (clearing)', type: 'Asset', subtype: 'Receivables' },
+  card: { name: 'Card Payments Clearing', type: 'Asset', subtype: 'Receivables' },
 };
+
+const PAYMENT_MODES = {
+  TABBY: { label: 'Tabby', rate: 0.1, debitRole: 'tabby' },
+  CARD: { label: 'Card payment', rate: 0.04, debitRole: 'card' },
+  CASH: { label: 'Cash', rate: 0, debitRole: 'driverCash' },
+  BANK_TRANSFER: { label: 'Bank transfer', rate: 0, debitRole: 'paid' },
+};
+const GATEWAY_VAT_RATE = 0.05;
 
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
@@ -66,7 +88,9 @@ async function resolveAccount(role) {
   const code = glCodes()[role];
   let account = await Account.findOne({ code });
   if (!account) {
-    account = await Account.create({ code, ...DEFAULT_ACCOUNTS[role], is_active: true, is_postable: true });
+    const defaults = { ...DEFAULT_ACCOUNTS[role] };
+    if (defaults.parent_code && !(await Account.exists({ code: defaults.parent_code }))) delete defaults.parent_code;
+    account = await Account.create({ code, ...defaults, is_active: true, is_postable: true });
   }
   if (account.is_active === false || account.is_postable === false) {
     throw new Error(`GL account ${code} (${account.name}) is inactive or not postable`);
@@ -113,6 +137,52 @@ function invoiceRef(invoice) {
   return invoice.invoice_id || String(invoice._id);
 }
 
+const REVENUE_LINE_TEXT = {
+  shipping: 'Shipping charge',
+  pickup: 'Pickup charge',
+  delivery: 'Delivery fee',
+};
+
+function isPhToUaeInvoice(invoice) {
+  return /PH[\s_-]*TO[\s_-]*UAE/i.test(String(invoice.service_code || ''));
+}
+
+// Splits net revenue (total − VAT) into shipping / pickup / delivery. Insurance is shown on the invoice as
+// its own charge but booked under delivery. Lines are scaled to the net figure so VAT-inclusive invoices
+// (UAE→PH Flomic/Personal) still balance; any rounding difference lands on the largest line.
+function invoiceRevenueSplit(invoice, revenue) {
+  const shipping = toAmount(invoice.amount);
+  const pickup = toAmount(invoice.pickup_charge);
+  const delivery = toAmount(invoice.delivery_charge);
+  let parts;
+  if (isPhToUaeInvoice(invoice)) {
+    if (Number(invoice.tax_rate) === 5) {
+      parts = { shipping: 0, pickup: 0, delivery };
+    } else {
+      const codDelivery = invoice.cod_delivery_charge != null ? toAmount(invoice.cod_delivery_charge) : delivery;
+      parts = { shipping, pickup, delivery: codDelivery };
+      const withPickup = shipping + pickup + codDelivery;
+      if (Math.abs(withPickup - revenue) >= 0.01 && Math.abs(shipping + codDelivery - revenue) < 0.01) parts.pickup = 0;
+    }
+  } else {
+    parts = { shipping, pickup, delivery: delivery + toAmount(invoice.insurance_charge) };
+  }
+
+  const gross = parts.shipping + parts.pickup + parts.delivery;
+  if (gross <= 0) return [{ role: 'shipping', amount: revenue }];
+  const scale = Math.abs(gross - revenue) < 0.01 ? 1 : revenue / gross;
+  const lines = ['shipping', 'pickup', 'delivery']
+    .map((role) => ({ role, amount: round2(parts[role] * scale) }))
+    .filter((l) => l.amount > 0);
+  if (!lines.length) return [{ role: 'shipping', amount: revenue }];
+  const diff = round2(revenue - lines.reduce((s, l) => s + l.amount, 0));
+  if (diff) {
+    const largest = lines.reduce((a, b) => (b.amount > a.amount ? b : a));
+    largest.amount = round2(largest.amount + diff);
+  }
+  return lines;
+}
+
 async function saveGlSync(invoice, patch) {
   const current = invoice.gl_sync?.toObject ? invoice.gl_sync.toObject() : invoice.gl_sync || {};
   const next = { ...current, ...patch, last_attempt_at: new Date() };
@@ -144,10 +214,11 @@ async function postInvoiceJournal(invoice, { actorId, customerName } = {}) {
       return { status: 'SKIPPED', reason: 'Invoice total is zero' };
     }
 
-    const [arGl, revGl, vatGl] = await Promise.all([
+    const split = invoiceRevenueSplit(invoice, revenue);
+    const [arGl, vatGl, ...revenueGls] = await Promise.all([
       resolveAccount('ar'),
-      resolveAccount('revenue'),
       tax > 0 ? resolveAccount('vat') : Promise.resolve(null),
+      ...split.map((part) => resolveAccount(part.role)),
     ]);
     const ref = invoiceRef(invoice);
     const customer = customerName || (await resolveCustomerName(invoice));
@@ -163,14 +234,14 @@ async function postInvoiceJournal(invoice, { actorId, customerName } = {}) {
         debit: total,
         credit: 0,
       },
-      {
-        account_id: revGl._id,
-        account_code: revGl.code,
-        account_name: revGl.name,
-        description: `Shipping revenue ${ref}${awb}`,
+      ...split.map((part, i) => ({
+        account_id: revenueGls[i]._id,
+        account_code: revenueGls[i].code,
+        account_name: revenueGls[i].name,
+        description: `${REVENUE_LINE_TEXT[part.role]} ${ref}${awb}`,
         debit: 0,
-        credit: revenue,
-      },
+        credit: part.amount,
+      })),
     ];
     if (tax > 0) {
       lines.push({
@@ -369,6 +440,7 @@ async function reverseLinkedJournal(invoice, field, { actor, reason, adjustWalle
  *   REMITTED            → Dr Cash on Hand / Cr Cash with Drivers (or AR if never collected)
  *   PAID                → Dr Cash at Bank / Cr Cash with Drivers (or AR if never collected)
  *   UNPAID / OVERDUE    → reverse any collection / receipt journals
+ * Invoices settled through recorded payments only move unremitted cash on REMITTED (Dr Cash on Hand / Cr Cash with Drivers).
  */
 async function syncInvoiceReceipts(invoice, { actorId, reason } = {}) {
   try {
@@ -383,6 +455,40 @@ async function syncInvoiceReceipts(invoice, { actorId, reason } = {}) {
     const ref = invoiceRef(invoice);
     const actor = await resolveActor(actorId);
     const result = { status: 'UNCHANGED', posted: [], reversed: [] };
+
+    const recorded = (invoice.payments || []).filter((p) => p.status !== 'VOID');
+    if (recorded.length) {
+      if (status !== 'REMITTED') {
+        return { status: 'SKIPPED', reason: 'Payments are recorded individually on this invoice' };
+      }
+      const cash = recorded.filter((p) => p.mode === 'CASH' && !p.remitted);
+      const cashTotal = round2(cash.reduce((s, p) => s + (p.amount_collected || 0), 0));
+      if (!cashTotal) return result;
+      const journal = await postTwoLineJournal(invoice, {
+        debitRole: 'remitted',
+        creditRole: 'driverCash',
+        amount: cashTotal,
+        memo: `Driver remitted ${ref}`,
+        label: RECEIPT_LABEL,
+        describe: { debit: `Cash remitted ${ref}`, credit: `Clear driver cash ${ref}` },
+        actor,
+      });
+      await adjustWalletBalances(journal.lines);
+      const Invoice = mongoose.models.Invoice;
+      for (const p of cash) {
+        await Invoice.updateOne(
+          { _id: invoice._id, 'payments._id': p._id },
+          {
+            $set: {
+              'payments.$.remitted': true,
+              'payments.$.remit_journal_id': journal._id,
+              'payments.$.remit_journal_no': journal.entry_no,
+            },
+          }
+        );
+      }
+      return { status: 'POSTED', posted: [journal.entry_no], reversed: [] };
+    }
 
     if (status === 'UNPAID' || status === 'OVERDUE' || status === 'COLLECTED_BY_DRIVER') {
       const why = reason || `invoice moved back to ${status}`;
@@ -442,6 +548,184 @@ async function syncInvoiceReceipts(invoice, { actorId, reason } = {}) {
   }
 }
 
+function invoicePaymentSummary(invoice) {
+  const total = toAmount(invoice.total_amount);
+  const paid = round2(
+    (invoice.payments || []).filter((p) => p.status !== 'VOID').reduce((s, p) => s + (p.amount_applied || 0), 0)
+  );
+  return { total, paid, balance: round2(Math.max(0, total - paid)) };
+}
+
+/**
+ * Record money collected against an invoice. FULL settles the open balance and treats anything collected
+ * above it as the gateway charge; PARTIAL settles collected ÷ (1 + mode rate). The gateway charge is
+ * VAT-inclusive:  Dr Tabby/Card clearing · Bank · Cash with drivers  /  Cr AR  /  Cr 4040  /  Cr VAT output.
+ * Returns { error } for anything the user should correct.
+ */
+async function recordInvoicePayment(invoice, { mode, paymentType, amountCollected, reference, collectedAt, actorId } = {}) {
+  const modeKey = String(mode || '').toUpperCase();
+  const config = PAYMENT_MODES[modeKey];
+  if (!config) return { error: 'Choose a mode of payment: Tabby, Card payment, Cash or Bank transfer' };
+  const type = String(paymentType || '').toUpperCase();
+  if (!['FULL', 'PARTIAL'].includes(type)) return { error: 'Choose full or partial payment' };
+  const collected = round2(Number(amountCollected));
+  if (!(collected > 0)) return { error: 'Enter the amount collected' };
+  if (invoice.status === 'CANCELLED') return { error: 'This invoice is cancelled' };
+  if (invoice.gl_sync?.collection_journal_id || invoice.gl_sync?.receipt_journal_id) {
+    return { error: 'This invoice was already settled through the older Collect / Paid buttons' };
+  }
+  if (invoice.gl_sync?.status !== 'POSTED') {
+    const posted = await postInvoiceJournal(invoice, { actorId });
+    if (posted.status !== 'POSTED') {
+      return { error: `Post the invoice to the ledger first (${posted.error || posted.reason || posted.status})` };
+    }
+  }
+
+  const { total, paid, balance } = invoicePaymentSummary(invoice);
+  if (balance <= 0.009) return { error: 'This invoice is already fully paid' };
+
+  let applied;
+  if (type === 'FULL') {
+    if (collected < balance - 0.009) {
+      return { error: `AED ${collected.toFixed(2)} is less than the AED ${balance.toFixed(2)} balance — record it as a partial payment` };
+    }
+    if (config.rate === 0 && collected > balance + 0.009) {
+      return { error: `${config.label} carries no charges — the amount should be AED ${balance.toFixed(2)}` };
+    }
+    applied = balance;
+  } else {
+    applied = round2(collected / (1 + config.rate));
+    if (applied >= balance - 0.009) {
+      return { error: `That covers the full AED ${balance.toFixed(2)} balance — record it as a full payment` };
+    }
+  }
+  const gatewayCharge = round2(collected - applied);
+  const gatewayNet = round2(gatewayCharge / (1 + GATEWAY_VAT_RATE));
+  const gatewayVat = round2(gatewayCharge - gatewayNet);
+
+  const roles = [config.debitRole, 'ar'];
+  if (gatewayNet > 0) roles.push('gateway');
+  if (gatewayVat > 0) roles.push('vat');
+  const accounts = {};
+  for (const role of roles) accounts[role] = await resolveAccount(role);
+
+  const ref = invoiceRef(invoice);
+  const actor = await resolveActor(actorId);
+  const when = collectedAt ? new Date(collectedAt) : new Date();
+  const refText = reference ? ` · ${reference}` : '';
+  const line = (role, debit, credit, description) => ({
+    account_id: accounts[role]._id,
+    account_code: accounts[role].code,
+    account_name: accounts[role].name,
+    description,
+    debit,
+    credit,
+  });
+  const lines = [
+    line(config.debitRole, collected, 0, `${config.label} received ${ref}${refText}`),
+    line('ar', 0, applied, `Clear AR ${ref}${type === 'PARTIAL' ? ' (partial)' : ''}`),
+  ];
+  if (gatewayNet > 0) lines.push(line('gateway', 0, gatewayNet, `${config.label} charge ${ref}`));
+  if (gatewayVat > 0) lines.push(line('vat', 0, gatewayVat, `VAT 5% on ${config.label.toLowerCase()} charge ${ref}`));
+
+  const journal = await createJournalWithNextNo(when, {
+    memo: `${type === 'FULL' ? 'Payment' : 'Partial payment'} ${ref} via ${config.label}`,
+    source: 'PAYMENT',
+    status: 'POSTED',
+    lines,
+    total_debit: collected,
+    total_credit: collected,
+    posted_at: new Date(),
+    source_reference: ref,
+    source_label: PAYMENT_LABEL,
+    ...actor,
+  });
+  await adjustWalletBalances(journal.lines);
+
+  const payment = {
+    mode: modeKey,
+    payment_type: type,
+    amount_collected: collected,
+    amount_applied: applied,
+    gateway_charge: gatewayCharge,
+    gateway_net: gatewayNet,
+    gateway_vat: gatewayVat,
+    reference: reference ? String(reference).trim() : undefined,
+    collected_at: when,
+    status: 'POSTED',
+    journal_id: journal._id,
+    journal_no: journal.entry_no,
+    remitted: false,
+    recorded_by_name: actor.created_by_name,
+    recorded_by_email: actor.created_by_email,
+  };
+  const newPaid = round2(paid + applied);
+  const remaining = round2(Math.max(0, total - newPaid));
+  const set = {
+    amount_paid: newPaid,
+    gateway_charges_total: round2((invoice.gateway_charges_total || 0) + gatewayCharge),
+    payment_mode: modeKey,
+  };
+  if (remaining <= 0.009) {
+    const unremittedCash = [...(invoice.payments || []), payment].some(
+      (p) => p.status !== 'VOID' && p.mode === 'CASH' && !p.remitted
+    );
+    set.status = unremittedCash ? 'COLLECTED_BY_DRIVER' : 'PAID';
+    set.paid_at = when;
+    if (payment.reference) set.payment_reference = payment.reference;
+  }
+
+  const Invoice = mongoose.models.Invoice;
+  const updated = await Invoice.findByIdAndUpdate(invoice._id, { $push: { payments: payment }, $set: set }, { new: true });
+  return {
+    payment: updated.payments[updated.payments.length - 1],
+    journal,
+    invoice: updated,
+    balance: remaining,
+  };
+}
+
+/** Undo a mistaken payment entry: reversing journal, balance reopened. Remitted cash can't be voided. */
+async function voidInvoicePayment(invoice, paymentId, { actorId, reason } = {}) {
+  const payment = (invoice.payments || []).find((p) => String(p._id) === String(paymentId));
+  if (!payment) return { error: 'Payment not found on this invoice' };
+  if (payment.status === 'VOID') return { error: 'This payment is already voided' };
+  if (payment.remitted) return { error: 'This cash has already been remitted, so the payment cannot be voided' };
+
+  const actor = await resolveActor(actorId);
+  let reversal = null;
+  const original = payment.journal_id ? await JournalEntry.findById(payment.journal_id).lean() : null;
+  if (original && original.status === 'POSTED') {
+    reversal = await reverseJournal(original, {
+      ref: invoiceRef(invoice),
+      actor,
+      reason: reason || 'payment entry voided',
+      label: PAYMENT_VOID_LABEL,
+    });
+    await adjustWalletBalances(reversal.lines);
+  }
+
+  const { paid } = invoicePaymentSummary(invoice);
+  const set = {
+    'payments.$.status': 'VOID',
+    'payments.$.void_reason': reason || undefined,
+    'payments.$.void_journal_no': reversal?.entry_no,
+    amount_paid: round2(Math.max(0, paid - (payment.amount_applied || 0))),
+    gateway_charges_total: round2(Math.max(0, (invoice.gateway_charges_total || 0) - (payment.gateway_charge || 0))),
+  };
+  const update = { $set: set };
+  if (['PAID', 'COLLECTED_BY_DRIVER'].includes(invoice.status)) {
+    set.status = 'UNPAID';
+    update.$unset = { paid_at: '' };
+  }
+  Object.keys(set).forEach((key) => set[key] === undefined && delete set[key]);
+  const Invoice = mongoose.models.Invoice;
+  const updated = await Invoice.findOneAndUpdate({ _id: invoice._id, 'payments._id': payment._id }, update, {
+    new: true,
+  });
+  return { invoice: updated, reversal_journal_no: reversal?.entry_no };
+}
+
 /** Edit hook: refresh the invoice journal if amounts changed, then align receipts with the status. */
 async function syncInvoiceLedger(invoice, opts = {}) {
   const journal = await syncInvoiceJournalAfterEdit(invoice, opts);
@@ -456,5 +740,10 @@ module.exports = {
   syncInvoiceJournalAfterEdit,
   syncInvoiceReceipts,
   syncInvoiceLedger,
+  recordInvoicePayment,
+  voidInvoicePayment,
+  invoicePaymentSummary,
+  invoiceRevenueSplit,
+  PAYMENT_MODES,
   SOURCE_LABEL,
 };

@@ -738,6 +738,36 @@ const invoiceSchema = new mongoose.Schema({
     last_error: { type: String, required: false },
     last_attempt_at: { type: Date, required: false },
   },
+  // Collections recorded against the invoice (mode + amount actually received). Anything collected above
+  // the invoice amount is the VAT-inclusive payment gateway charge.
+  amount_paid: { type: Number, default: 0 }, // invoice balance settled so far (excludes gateway charges)
+  gateway_charges_total: { type: Number, default: 0 },
+  payment_mode: {
+    type: String,
+    enum: ['TABBY', 'CARD', 'CASH', 'BANK_TRANSFER'],
+    required: false,
+  },
+  payments: [{
+    mode: { type: String, enum: ['TABBY', 'CARD', 'CASH', 'BANK_TRANSFER'], required: true },
+    payment_type: { type: String, enum: ['FULL', 'PARTIAL'], required: true },
+    amount_collected: { type: Number, required: true },
+    amount_applied: { type: Number, required: true },
+    gateway_charge: { type: Number, default: 0 },
+    gateway_net: { type: Number, default: 0 },
+    gateway_vat: { type: Number, default: 0 },
+    reference: { type: String, required: false, trim: true },
+    collected_at: { type: Date, required: true },
+    status: { type: String, enum: ['POSTED', 'VOID'], default: 'POSTED' },
+    journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
+    journal_no: { type: String, required: false },
+    remitted: { type: Boolean, default: false },
+    remit_journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
+    remit_journal_no: { type: String, required: false },
+    void_journal_no: { type: String, required: false },
+    void_reason: { type: String, required: false },
+    recorded_by_name: { type: String, required: false },
+    recorded_by_email: { type: String, required: false },
+  }],
 }, {
   timestamps: true,
 });
