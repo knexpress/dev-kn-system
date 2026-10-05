@@ -630,7 +630,12 @@ async function syncInvoiceReceipts(invoice, { actorId, reason } = {}) {
       return { status: 'SKIPPED', reason: 'Invoice journal is not posted, so there is no receivable to clear' };
     }
 
-    const amount = round2(sync.posted_total || toAmount(invoice.total_amount));
+    const netAmount = round2(
+      (sync.posted_total || toAmount(invoice.total_amount)) -
+        (Number(invoice.credit_notes_total) || 0) +
+        (Number(invoice.debit_notes_total) || 0)
+    );
+    const amount = sync.collection_journal_id && sync.settled_amount ? sync.settled_amount : netAmount;
     const ref = invoiceRef(invoice);
     const actor = await resolveActor(actorId);
     const result = { status: 'UNCHANGED', posted: [], reversed: [] };
@@ -676,7 +681,13 @@ async function syncInvoiceReceipts(invoice, { actorId, reason } = {}) {
       if (status !== 'COLLECTED_BY_DRIVER') {
         const collectionRev = await reverseLinkedJournal(invoice, 'collection', { actor, reason: why });
         if (collectionRev) result.reversed.push(collectionRev.entry_no);
+        if (sync.settled_amount !== undefined) await saveGlSync(invoice, { settled_amount: undefined });
       }
+    }
+
+    if (amount <= 0.009) {
+      if (result.reversed.length) result.status = 'POSTED';
+      return result;
     }
 
     if (status === 'COLLECTED_BY_DRIVER' && !invoice.gl_sync?.collection_journal_id) {
@@ -689,7 +700,11 @@ async function syncInvoiceReceipts(invoice, { actorId, reason } = {}) {
         describe: { debit: `Cash held by driver ${ref}`, credit: `Clear AR ${ref}` },
         actor,
       });
-      await saveGlSync(invoice, { collection_journal_id: journal._id, collection_journal_no: journal.entry_no });
+      await saveGlSync(invoice, {
+        collection_journal_id: journal._id,
+        collection_journal_no: journal.entry_no,
+        settled_amount: amount,
+      });
       result.posted.push(journal.entry_no);
     }
 
@@ -710,7 +725,11 @@ async function syncInvoiceReceipts(invoice, { actorId, reason } = {}) {
         date: status === 'PAID' && invoice.paid_at ? invoice.paid_at : new Date(),
       });
       await adjustWalletBalances(journal.lines);
-      await saveGlSync(invoice, { receipt_journal_id: journal._id, receipt_journal_no: journal.entry_no });
+      await saveGlSync(invoice, {
+        receipt_journal_id: journal._id,
+        receipt_journal_no: journal.entry_no,
+        settled_amount: amount,
+      });
       result.posted.push(journal.entry_no);
     }
 
@@ -727,12 +746,37 @@ async function syncInvoiceReceipts(invoice, { actorId, reason } = {}) {
   }
 }
 
-function invoicePaymentSummary(invoice) {
-  const total = toAmount(invoice.total_amount);
-  const paid = round2(
-    (invoice.payments || []).filter((p) => p.status !== 'VOID').reduce((s, p) => s + (p.amount_applied || 0), 0)
+function isLegacySettled(invoice) {
+  return Boolean(invoice.gl_sync?.collection_journal_id || invoice.gl_sync?.receipt_journal_id);
+}
+
+/** Amount due after posted credit / debit notes. */
+function invoiceNetTotal(invoice) {
+  return round2(
+    toAmount(invoice.total_amount) - (Number(invoice.credit_notes_total) || 0) + (Number(invoice.debit_notes_total) || 0)
   );
-  return { total, paid, balance: round2(Math.max(0, total - paid)) };
+}
+
+/**
+ * total: amount due (credit / debit notes applied). paid: money kept against it — recorded payments, or the
+ * original total when settled through the older Collect / Paid buttons — less refunds. credit: overpaid amount.
+ */
+function invoicePaymentSummary(invoice) {
+  const total = invoiceNetTotal(invoice);
+  const applied = (invoice.payments || [])
+    .filter((p) => p.status !== 'VOID')
+    .reduce((s, p) => s + (p.amount_applied || 0), 0);
+  const sync = invoice.gl_sync || {};
+  const legacy = isLegacySettled(invoice)
+    ? toAmount(sync.settled_amount ?? sync.posted_total ?? invoice.total_amount)
+    : 0;
+  const paid = round2(legacy + applied - (Number(invoice.refunds_total) || 0));
+  return {
+    total,
+    paid,
+    balance: round2(Math.max(0, total - paid)),
+    credit: round2(Math.max(0, paid - total)),
+  };
 }
 
 /**
@@ -757,7 +801,9 @@ async function recordInvoicePayment(
   const collected = round2(Number(amountCollected));
   if (!(collected > 0)) return { error: 'Enter the amount collected' };
   if (invoice.status === 'CANCELLED') return { error: 'This invoice is cancelled' };
-  if (invoice.gl_sync?.collection_journal_id || invoice.gl_sync?.receipt_journal_id) {
+  // Older Collect / Paid settlements only take new payments for a debit note raised after they were paid.
+  const settledLegacy = ['PAID', 'REMITTED'].includes(invoice.status) && (Number(invoice.debit_notes_total) || 0) > 0;
+  if (isLegacySettled(invoice) && !settledLegacy) {
     return { error: 'This invoice was already settled through the older Collect / Paid buttons' };
   }
   if (invoice.gl_sync?.status !== 'POSTED') {
@@ -929,7 +975,14 @@ module.exports = {
   recordInvoicePayment,
   voidInvoicePayment,
   invoicePaymentSummary,
+  invoiceNetTotal,
   invoiceRevenueSplit,
+  resolveAccount,
+  resolveActor,
+  resolveCustomerName,
+  createJournalWithNextNo,
+  reverseJournal,
+  adjustWalletBalances,
   upsertQuoteDraftJournal,
   voidQuoteDraftJournal,
   isUaeToPhCode,

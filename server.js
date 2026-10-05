@@ -263,6 +263,7 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/performance', performanceRoutes);
 app.use('/api/invoices', invoiceRoutes);
 app.use('/api/invoices-unified', invoiceUnifiedRoutes);
+app.use('/api/invoice-notes', require('./routes/invoice-notes'));
 app.use('/api/price-brackets', priceBracketsRoutes);
 app.use('/api/quotations', quotationRoutes);
 

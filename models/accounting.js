@@ -933,6 +933,85 @@ eInvoiceSchema.index({ sales_invoice_id: 1 });
 
 const EInvoice = mongoose.models.EInvoice || mongoose.model('EInvoice', eInvoiceSchema);
 
+// Credit / debit notes against finance (logistics) invoices. Raised by Finance, posted to the GL when a
+// Finance Manager approves; the invoice keeps its original figures and carries the note totals.
+const INVOICE_NOTE_CATEGORIES = ['SHIPPING', 'PICKUP', 'DELIVERY', 'INSURANCE'];
+const INVOICE_NOTE_REASONS = [
+  'PRICING_ERROR',
+  'WEIGHT_CORRECTION',
+  'SERVICE_CANCELLED',
+  'DISCOUNT',
+  'DAMAGE_OR_LOSS',
+  'ADDITIONAL_SERVICE',
+  'OTHER',
+];
+const INVOICE_NOTE_REFUND_MODES = ['CASH', 'BANK_TRANSFER', 'CARD', 'TABBY'];
+
+const invoiceNoteLineSchema = new mongoose.Schema(
+  {
+    category: { type: String, enum: INVOICE_NOTE_CATEGORIES, required: true },
+    description: { type: String, required: false, trim: true },
+    amount: { type: Number, required: true, min: 0.01 },
+    vat_rate: { type: Number, enum: [0, 5], default: 0 },
+    vat_amount: { type: Number, default: 0 },
+    total: { type: Number, required: true },
+  },
+  { _id: false }
+);
+
+const invoiceNoteSchema = new mongoose.Schema(
+  {
+    note_no: { type: String, required: true, unique: true },
+    note_type: { type: String, enum: ['CREDIT', 'DEBIT'], required: true },
+    note_date: { type: Date, default: Date.now },
+    invoice_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice', required: true, index: true },
+    invoice_no: { type: String, required: true },
+    invoice_date: { type: Date, required: false },
+    invoice_total: { type: Number, required: false },
+    awb_number: { type: String, required: false },
+    customer_name: { type: String, required: false },
+    customer_trn: { type: String, required: false },
+    service_code: { type: String, required: false },
+    reason_code: { type: String, enum: INVOICE_NOTE_REASONS, required: true },
+    reason: { type: String, required: true, trim: true },
+    lines: { type: [invoiceNoteLineSchema], default: [] },
+    subtotal: { type: Number, required: true },
+    vat_amount: { type: Number, default: 0 },
+    total_amount: { type: Number, required: true },
+    status: {
+      type: String,
+      enum: ['PENDING_APPROVAL', 'POSTED', 'REJECTED', 'VOID'],
+      default: 'PENDING_APPROVAL',
+      index: true,
+    },
+    journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
+    journal_no: { type: String, required: false },
+    refund_mode: { type: String, enum: INVOICE_NOTE_REFUND_MODES, required: false },
+    refund_reference: { type: String, required: false, trim: true },
+    refund_amount: { type: Number, default: 0 },
+    refund_journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
+    refund_journal_no: { type: String, required: false },
+    created_by_name: { type: String, required: false },
+    created_by_email: { type: String, required: false },
+    created_by_user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: false },
+    approved_by_name: { type: String, required: false },
+    approved_at: { type: Date, required: false },
+    rejected_by_name: { type: String, required: false },
+    rejected_at: { type: Date, required: false },
+    rejection_reason: { type: String, required: false },
+    voided_by_name: { type: String, required: false },
+    voided_at: { type: Date, required: false },
+    void_reason: { type: String, required: false },
+    void_journal_no: { type: String, required: false },
+    void_refund_journal_no: { type: String, required: false },
+  },
+  { timestamps: true }
+);
+
+invoiceNoteSchema.index({ status: 1, createdAt: -1 });
+
+const InvoiceNote = mongoose.models.InvoiceNote || mongoose.model('InvoiceNote', invoiceNoteSchema);
+
 module.exports = {
   Account,
   JournalEntry,
@@ -951,4 +1030,8 @@ module.exports = {
   SalesInvoice,
   Vat201Return,
   EInvoice,
+  InvoiceNote,
+  INVOICE_NOTE_CATEGORIES,
+  INVOICE_NOTE_REASONS,
+  INVOICE_NOTE_REFUND_MODES,
 };

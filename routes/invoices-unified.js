@@ -14,9 +14,17 @@ const {
   syncInvoiceLedger,
   recordInvoicePayment,
   voidInvoicePayment,
+  invoicePaymentSummary,
   isUaeToPhCode,
   PAYMENT_MODES,
 } = require('../services/invoice-gl');
+const { blockingNotesFor } = require('../services/invoice-notes');
+
+async function notesBlockMessage(invoiceId, action) {
+  const notes = await blockingNotesFor(invoiceId);
+  if (!notes.length) return null;
+  return `This invoice has credit / debit notes (${notes.map((n) => n.note_no).join(', ')}). Void or reject them before you ${action} it.`;
+}
 // const { createNotificationsForAllUsers } = require('./notifications');
 
 const router = express.Router();
@@ -155,6 +163,7 @@ const transformInvoice = (invoice) => {
       unit_price: convertDecimal128(item.unit_price),
       total: convertDecimal128(item.total),
     })) : invoiceObj.line_items,
+    payment_summary: invoiceObj.total_amount !== undefined ? invoicePaymentSummary(invoiceObj) : undefined,
   };
 };
 
@@ -237,7 +246,7 @@ function buildInvoiceSearchQuery(searchTerm) {
 }
 
 // Essential fields for invoice list view (lightweight)
-const INVOICE_LIST_FIELDS = '_id invoice_id awb_number batch_number receiver_name receiver_address receiver_phone service_code weight_kg weight_type volume_cbm amount delivery_charge pickup_charge insurance_charge tax_amount total_amount amount_paid gateway_charges_total payment_mode payments status issue_date due_date paid_at createdAt updatedAt client_id request_id created_by';
+const INVOICE_LIST_FIELDS = '_id invoice_id awb_number batch_number receiver_name receiver_address receiver_phone service_code weight_kg weight_type volume_cbm amount delivery_charge pickup_charge insurance_charge tax_amount total_amount amount_paid gateway_charges_total credit_notes_total debit_notes_total refunds_total gl_sync.status gl_sync.posted_total gl_sync.settled_amount gl_sync.collection_journal_id gl_sync.receipt_journal_id payment_mode payments status issue_date due_date paid_at createdAt updatedAt client_id request_id created_by';
 
 // Get all invoices with pagination and search (OPTIMIZED for list view)
 router.get('/', async (req, res) => {
@@ -1917,6 +1926,11 @@ router.put('/:id/status', async (req, res) => {
       });
     }
 
+    if (status === 'CANCELLED' && invoice.status !== 'CANCELLED') {
+      const blocked = await notesBlockMessage(invoice._id, 'cancel');
+      if (blocked) return res.status(400).json({ success: false, error: blocked });
+    }
+
     invoice.status = status;
     if (status === 'PAID') {
       invoice.paid_at = new Date();
@@ -3032,6 +3046,9 @@ router.delete('/:id', async (req, res) => {
       });
     }
 
+    const blocked = await notesBlockMessage(invoice._id, 'delete');
+    if (blocked) return res.status(400).json({ success: false, error: blocked });
+
     const gl = await reverseInvoiceJournal(invoice, { actorId: req.user?.id, reason: 'invoice deleted' });
     await Invoice.findByIdAndDelete(invoiceId);
 
@@ -3125,6 +3142,13 @@ router.post('/:invoiceId/cancel', validateObjectIdParam('invoiceId'), async (req
         success: false, 
         error: 'Invoice is already cancelled' 
       });
+    }
+
+    const blockedByNotes = await notesBlockMessage(invoice._id, 'cancel');
+    if (blockedByNotes) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(400).json({ success: false, error: blockedByNotes });
     }
     
     // Store original status for EMPOST logic

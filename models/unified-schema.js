@@ -735,6 +735,7 @@ const invoiceSchema = new mongoose.Schema({
     collection_journal_no: { type: String, required: false },
     receipt_journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
     receipt_journal_no: { type: String, required: false },
+    settled_amount: { type: Number, required: false }, // receivable cleared by the collection / receipt journals
     // Prepaid UAE→PH: Card/Tabby charge carved out of the invoice total (not added on top)
     gateway_included_mode: { type: String, required: false },
     gateway_included_rate: { type: Number, required: false },
@@ -746,6 +747,10 @@ const invoiceSchema = new mongoose.Schema({
   // the invoice amount is the VAT-inclusive payment gateway charge.
   amount_paid: { type: Number, default: 0 }, // invoice balance settled so far (excludes gateway charges)
   gateway_charges_total: { type: Number, default: 0 },
+  // Posted credit / debit notes and refunds. Amount due = total_amount − credit notes + debit notes.
+  credit_notes_total: { type: Number, default: 0 },
+  debit_notes_total: { type: Number, default: 0 },
+  refunds_total: { type: Number, default: 0 },
   payment_mode: {
     type: String,
     enum: ['TABBY', 'CARD', 'CASH', 'BANK_TRANSFER'],
