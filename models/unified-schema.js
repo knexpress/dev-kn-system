@@ -735,6 +735,10 @@ const invoiceSchema = new mongoose.Schema({
     collection_journal_no: { type: String, required: false },
     receipt_journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
     receipt_journal_no: { type: String, required: false },
+    // Prepaid UAE→PH: Card/Tabby charge carved out of the invoice total (not added on top)
+    gateway_included_mode: { type: String, required: false },
+    gateway_included_rate: { type: Number, required: false },
+    gateway_included_net: { type: Number, required: false },
     last_error: { type: String, required: false },
     last_attempt_at: { type: Date, required: false },
   },

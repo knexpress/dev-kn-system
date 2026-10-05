@@ -7,8 +7,30 @@ const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/id-generators');
 const { sanitizeRegex } = require('../middleware/security');
 const { cleanupBookingIdentityDocumentsForDeliveredInvoiceRequest } = require('../utils/booking-identity-cleanup');
+const auth = require('../middleware/auth');
+const jwt = require('jsonwebtoken');
+const { upsertQuoteDraftJournal, voidQuoteDraftJournal, isUaeToPhCode } = require('../services/invoice-gl');
 
 const router = express.Router();
+
+// Routes without the auth middleware: identify the caller when a token is sent, never reject.
+async function optionalUser(req) {
+  try {
+    const token = req.header('Authorization')?.replace('Bearer ', '');
+    if (!token) return null;
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const { User } = require('../models');
+    return await User.findById(decoded.userId).select('full_name email').lean();
+  } catch (_) {
+    return null;
+  }
+}
+
+// UAE→PH requests that went through the quotation step are paid by the customer before the invoice.
+function isPrepaidQuotedRequest(request) {
+  return Boolean(request?.quotation_request?.quotation_id) &&
+    isUaeToPhCode(request.service_code || request.verification?.service_code);
+}
 
 // Force PH_TO_UAE classification to GENERAL (ignore incoming box classifications)
 const normalizePhToUaeClassification = (invoiceRequest) => {
@@ -288,7 +310,7 @@ function buildStatusQuery(status) {
   const sanitized = typeof status === 'string' ? status.trim().toUpperCase() : String(status).trim().toUpperCase();
   
   // Valid statuses
-  const validStatuses = ['DRAFT', 'SUBMITTED', 'IN_PROGRESS', 'VERIFIED', 'COMPLETED', 'CANCELLED'];
+  const validStatuses = ['DRAFT', 'SUBMITTED', 'QUOTATION_REQUEST', 'IN_PROGRESS', 'VERIFIED', 'COMPLETED', 'CANCELLED'];
   if (!validStatuses.includes(sanitized)) {
     console.warn(`⚠️ Invalid status filter: "${status}" (sanitized: "${sanitized}"). Valid statuses: ${validStatuses.join(', ')}`);
     return null;
@@ -1308,6 +1330,166 @@ router.put('/:id', async (req, res) => {
   }
 });
 
+// ========================================
+// Quotation request step (SUBMITTED → QUOTATION_REQUEST → IN_PROGRESS)
+// These endpoints deliberately skip EMPOST sync and booking shipment history.
+// The move to IN_PROGRESS still goes through PUT /:id/status once Finance quotes.
+// ========================================
+
+function canHandleOperationsQuotation(user) {
+  const role = String(user?.role || '').toUpperCase();
+  const dept = user?.department?.name;
+  return role === 'SUPERADMIN' || role === 'ADMIN' || dept === 'Operations' || dept === 'IT';
+}
+
+function actorName(user) {
+  return user?.employee?.full_name || user?.email || 'Unknown';
+}
+
+router.put('/:id/quotation-request/start', auth, async (req, res) => {
+  try {
+    if (!canHandleOperationsQuotation(req.user)) {
+      return res.status(403).json({ success: false, error: 'Only Operations can start processing' });
+    }
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, error: 'Invalid invoice request ID' });
+    }
+
+    const invoiceRequest = await InvoiceRequest.findOneAndUpdate(
+      { _id: req.params.id, status: 'SUBMITTED' },
+      {
+        $set: {
+          status: 'QUOTATION_REQUEST',
+          quotation_request: {
+            stage: 'PENDING_DETAILS',
+            started_at: new Date(),
+            started_by_name: actorName(req.user),
+          },
+        },
+      },
+      { new: true, runValidators: true }
+    );
+
+    if (!invoiceRequest) {
+      return res.status(409).json({ success: false, error: 'Request is no longer SUBMITTED' });
+    }
+
+    requestCache.clear();
+    res.json({ success: true, data: normalizeInvoiceRequest(invoiceRequest) });
+  } catch (error) {
+    console.error('Error starting quotation request:', error);
+    res.status(500).json({ success: false, error: 'Failed to start processing' });
+  }
+});
+
+router.put('/:id/quotation-request', auth, async (req, res) => {
+  try {
+    if (!canHandleOperationsQuotation(req.user)) {
+      return res.status(403).json({ success: false, error: 'Only Operations can request a quotation' });
+    }
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, error: 'Invalid invoice request ID' });
+    }
+
+    const actualWeight = Number(req.body.actual_weight);
+    const volumetricWeight = Number(req.body.volumetric_weight);
+    const numberOfBoxes = parseInt(req.body.number_of_boxes, 10);
+    const items = (Array.isArray(req.body.items) ? req.body.items : [])
+      .map((item, index) => ({
+        box_number: (item?.box_number || String(index + 1)).toString().trim(),
+        name: (item?.name || '').toString().trim(),
+        quantity: parseInt(item?.quantity, 10),
+      }))
+      .filter((item) => item.name && item.quantity > 0);
+
+    if (!Number.isFinite(actualWeight) || actualWeight <= 0) {
+      return res.status(400).json({ success: false, error: 'Actual weight must be greater than 0 kg' });
+    }
+    if (!Number.isFinite(volumetricWeight) || volumetricWeight <= 0) {
+      return res.status(400).json({ success: false, error: 'Volumetric weight must be greater than 0 kg' });
+    }
+    if (!Number.isFinite(numberOfBoxes) || numberOfBoxes < 1) {
+      return res.status(400).json({ success: false, error: 'Number of boxes must be at least 1' });
+    }
+    if (!items.length) {
+      return res.status(400).json({ success: false, error: 'Add at least one item with a name and quantity' });
+    }
+
+    const invoiceRequest = await InvoiceRequest.findOneAndUpdate(
+      {
+        _id: req.params.id,
+        status: 'QUOTATION_REQUEST',
+        'quotation_request.stage': { $ne: 'QUOTED' },
+      },
+      {
+        $set: {
+          'quotation_request.stage': 'REQUESTED',
+          'quotation_request.actual_weight': Math.round(actualWeight * 100) / 100,
+          'quotation_request.volumetric_weight': Math.round(volumetricWeight * 100) / 100,
+          'quotation_request.number_of_boxes': numberOfBoxes,
+          'quotation_request.items': items,
+          'quotation_request.notes': (req.body.notes || '').toString().trim(),
+          'quotation_request.requested_at': new Date(),
+          'quotation_request.requested_by_name': actorName(req.user),
+          'quotation_request.requested_by_email': req.user?.email || '',
+        },
+      },
+      { new: true, runValidators: true }
+    );
+
+    if (!invoiceRequest) {
+      return res.status(409).json({
+        success: false,
+        error: 'Request is not waiting for quotation details (it may already be quoted)',
+      });
+    }
+
+    requestCache.clear();
+    res.json({ success: true, data: normalizeInvoiceRequest(invoiceRequest) });
+  } catch (error) {
+    console.error('Error submitting quotation request:', error);
+    res.status(500).json({ success: false, error: 'Failed to send quotation request' });
+  }
+});
+
+// Finance confirms/edits the per-kg rate right before invoice generation.
+// Only touches verification.amount / calculated_rate (what invoice creation reads) — no EMPOST calls.
+router.put('/:id/invoice-rate', auth, async (req, res) => {
+  try {
+    const role = String(req.user?.role || '').toUpperCase();
+    const dept = req.user?.department?.name;
+    if (!(role === 'SUPERADMIN' || role === 'ADMIN' || dept === 'Finance' || dept === 'IT')) {
+      return res.status(403).json({ success: false, error: 'Only Finance can change the invoice rate' });
+    }
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, error: 'Invalid invoice request ID' });
+    }
+
+    const rate = Number(req.body.rate_per_kg);
+    if (!Number.isFinite(rate) || rate <= 0) {
+      return res.status(400).json({ success: false, error: 'Rate per kg must be greater than 0' });
+    }
+    const rateDecimal = new mongoose.Types.Decimal128((Math.round(rate * 100) / 100).toFixed(2));
+
+    const invoiceRequest = await InvoiceRequest.findOneAndUpdate(
+      { _id: req.params.id, status: 'VERIFIED' },
+      { $set: { 'verification.amount': rateDecimal, 'verification.calculated_rate': rateDecimal } },
+      { new: true }
+    );
+
+    if (!invoiceRequest) {
+      return res.status(409).json({ success: false, error: 'Rate can only be changed while the request is VERIFIED' });
+    }
+
+    requestCache.clear();
+    if (global.awbCache) global.awbCache.clear();
+    res.json({ success: true, data: normalizeInvoiceRequest(invoiceRequest) });
+  } catch (error) {
+    console.error('Error updating invoice rate:', error);
+    res.status(500).json({ success: false, error: 'Failed to update invoice rate' });
+  }
+});
+
 // Update invoice request status
 router.put('/:id/status', async (req, res) => {
   try {
@@ -1333,11 +1515,21 @@ router.put('/:id/status', async (req, res) => {
       invoiceRequest.delivery_status = delivery_status;
     }
     
+    const sentToOperations =
+      oldStatus === 'QUOTATION_REQUEST' &&
+      status === 'IN_PROGRESS' &&
+      Boolean(invoiceRequest.quotation_request?.quotation_id);
+    const sender = sentToOperations ? await optionalUser(req) : null;
+    if (sentToOperations) {
+      invoiceRequest.quotation_request.sent_to_operations_at = new Date();
+      invoiceRequest.quotation_request.sent_to_operations_by_name = sender?.full_name || sender?.email || undefined;
+    }
+
     if (status === 'COMPLETED') {
       invoiceRequest.invoice_generated_at = new Date();
       
-      // Automatically create collection entry when invoice is generated
-      if (invoiceRequest.invoice_amount || invoiceRequest.financial?.invoice_amount) {
+      // Automatically create collection entry when invoice is generated (prepaid UAE→PH has nothing to collect)
+      if (!isPrepaidQuotedRequest(invoiceRequest) && (invoiceRequest.invoice_amount || invoiceRequest.financial?.invoice_amount)) {
         // Use the auto-generated invoice_number from the invoice request
         const invoiceId = invoiceRequest.invoice_number || `INV-${invoiceRequest._id.toString().slice(-6).toUpperCase()}`;
         const invoiceAmount = invoiceRequest.financial?.invoice_amount || invoiceRequest.invoice_amount;
@@ -1442,9 +1634,19 @@ router.put('/:id/status', async (req, res) => {
       });
     }
 
+    let draftJournal;
+    if (sentToOperations) {
+      draftJournal = await upsertQuoteDraftJournal(invoiceRequest, { actorId: sender?._id });
+      if (draftJournal.status === 'DRAFT') {
+        invoiceRequest.quotation_request.draft_journal_id = draftJournal.journal_id;
+        invoiceRequest.quotation_request.draft_journal_no = draftJournal.journal_no;
+      }
+    }
+
     res.json({
       success: true,
       invoiceRequest: normalizeInvoiceRequest(invoiceRequest),
+      ...(draftJournal ? { draft_journal: draftJournal } : {}),
       message: 'Invoice request status updated successfully'
     });
   } catch (error) {
@@ -2847,6 +3049,7 @@ router.get('/:id/details', async (req, res) => {
                           1),
       sender_delivery_option: normalizedRequest.sender_delivery_option,
       receiver_delivery_option: normalizedRequest.receiver_delivery_option,
+      quotation_request: normalizedRequest.quotation_request || null,
       
       // Full verification object with ALL fields
       verification: {
@@ -3149,6 +3352,8 @@ router.post('/:id/cancel', async (req, res) => {
     // 11. Commit transaction
     await session.commitTransaction();
     session.endSession();
+
+    await voidQuoteDraftJournal(invoiceRequest, { reason: 'request cancelled' });
     
     console.log(`✅ Invoice request ${id} cancelled successfully. Audit entry: ${auditEntry[0]._id}`);
     

@@ -167,7 +167,10 @@ function invoiceRevenueSplit(invoice, revenue) {
   } else {
     parts = { shipping, pickup, delivery: delivery + toAmount(invoice.insurance_charge) };
   }
+  return scaleRevenueParts(parts, revenue);
+}
 
+function scaleRevenueParts(parts, revenue) {
   const gross = parts.shipping + parts.pickup + parts.delivery;
   if (gross <= 0) return [{ role: 'shipping', amount: revenue }];
   const scale = Math.abs(gross - revenue) < 0.01 ? 1 : revenue / gross;
@@ -183,6 +186,25 @@ function invoiceRevenueSplit(invoice, revenue) {
   return lines;
 }
 
+// Prepaid Card/Tabby: the charge is part of the total the customer paid, so it is moved out of the
+// revenue lines into gateway revenue (total and VAT unchanged).
+function carveGatewayCharge(split, revenue, rate) {
+  const gatewayNet = round2(revenue * rate);
+  if (!(gatewayNet > 0)) return { lines: split, gatewayNet: 0 };
+  const lines = split.map((l) => ({ ...l, amount: round2(l.amount * (1 - rate)) }));
+  const diff = round2(revenue - gatewayNet - lines.reduce((s, l) => s + l.amount, 0));
+  if (diff) {
+    const largest = lines.reduce((a, b) => (b.amount > a.amount ? b : a));
+    largest.amount = round2(largest.amount + diff);
+  }
+  return { lines: [...lines.filter((l) => l.amount > 0), { role: 'gateway', amount: gatewayNet }], gatewayNet };
+}
+
+function isUaeToPhCode(code) {
+  const normalized = String(code || '').toUpperCase().replace(/[\s-]+/g, '_');
+  return normalized.includes('UAE_TO_PH') || normalized.includes('UAE_TO_PINAS');
+}
+
 async function saveGlSync(invoice, patch) {
   const current = invoice.gl_sync?.toObject ? invoice.gl_sync.toObject() : invoice.gl_sync || {};
   const next = { ...current, ...patch, last_attempt_at: new Date() };
@@ -195,9 +217,11 @@ async function saveGlSync(invoice, patch) {
 
 /**
  * Post Dr Accounts Receivable / Cr Sales Revenue / Cr VAT Output for a generated finance invoice.
+ * draftJournalId: the quotation's DRAFT journal is finalised with the invoice figures and posted instead of
+ * creating a new one. gatewayMode (prepaid Card/Tabby) moves the charge out of revenue into 4040.
  * Never throws: failures are recorded on invoice.gl_sync so invoice generation is not blocked.
  */
-async function postInvoiceJournal(invoice, { actorId, customerName } = {}) {
+async function postInvoiceJournal(invoice, { actorId, customerName, draftJournalId, gatewayMode, quotationNumber } = {}) {
   try {
     if (invoice.gl_sync?.status === 'POSTED' && invoice.gl_sync?.journal_id) {
       return { status: 'POSTED', journal_no: invoice.gl_sync.journal_no, already_posted: true };
@@ -214,7 +238,13 @@ async function postInvoiceJournal(invoice, { actorId, customerName } = {}) {
       return { status: 'SKIPPED', reason: 'Invoice total is zero' };
     }
 
-    const split = invoiceRevenueSplit(invoice, revenue);
+    const modeKey = gatewayMode ? String(gatewayMode).toUpperCase() : invoice.gl_sync?.gateway_included_mode;
+    const gatewayConfig = modeKey ? PAYMENT_MODES[modeKey] : null;
+    const { lines: split, gatewayNet } = carveGatewayCharge(
+      invoiceRevenueSplit(invoice, revenue),
+      revenue,
+      gatewayConfig?.rate || 0
+    );
     const [arGl, vatGl, ...revenueGls] = await Promise.all([
       resolveAccount('ar'),
       tax > 0 ? resolveAccount('vat') : Promise.resolve(null),
@@ -238,7 +268,10 @@ async function postInvoiceJournal(invoice, { actorId, customerName } = {}) {
         account_id: revenueGls[i]._id,
         account_code: revenueGls[i].code,
         account_name: revenueGls[i].name,
-        description: `${REVENUE_LINE_TEXT[part.role]} ${ref}${awb}`,
+        description:
+          part.role === 'gateway'
+            ? `${gatewayConfig.label} charge ${Math.round(gatewayConfig.rate * 100)}% (included in total) ${ref}${awb}`
+            : `${REVENUE_LINE_TEXT[part.role]} ${ref}${awb}`,
         debit: 0,
         credit: part.amount,
       })),
@@ -254,8 +287,10 @@ async function postInvoiceJournal(invoice, { actorId, customerName } = {}) {
       });
     }
 
-    const journal = await createJournalWithNextNo(invoice.issue_date || new Date(), {
-      memo: `Finance invoice ${ref} — ${customer}`,
+    const quoteText = quotationNumber ? ` · ${quotationNumber}` : '';
+    const entryDate = invoice.issue_date || new Date();
+    const posting = {
+      memo: `Finance invoice ${ref}${quoteText} — ${customer}`,
       source: 'INVOICE',
       status: 'POSTED',
       lines,
@@ -264,8 +299,18 @@ async function postInvoiceJournal(invoice, { actorId, customerName } = {}) {
       posted_at: new Date(),
       source_reference: ref,
       source_label: SOURCE_LABEL,
-      ...actor,
-    });
+    };
+    let journal = null;
+    if (draftJournalId && mongoose.isValidObjectId(draftJournalId)) {
+      journal = await JournalEntry.findOneAndUpdate(
+        { _id: draftJournalId, status: 'DRAFT' },
+        { $set: { ...posting, entry_date: entryDate } },
+        { new: true, runValidators: true }
+      );
+    }
+    if (!journal) {
+      journal = await createJournalWithNextNo(entryDate, { ...posting, ...actor });
+    }
 
     await saveGlSync(invoice, {
       status: 'POSTED',
@@ -273,9 +318,12 @@ async function postInvoiceJournal(invoice, { actorId, customerName } = {}) {
       journal_no: journal.entry_no,
       posted_total: total,
       posted_tax: tax,
+      ...(gatewayNet > 0
+        ? { gateway_included_mode: modeKey, gateway_included_rate: gatewayConfig.rate, gateway_included_net: gatewayNet }
+        : {}),
       last_error: undefined,
     });
-    return { status: 'POSTED', journal_id: journal._id, journal_no: journal.entry_no };
+    return { status: 'POSTED', journal_id: journal._id, journal_no: journal.entry_no, gateway_net: gatewayNet };
   } catch (error) {
     console.error(`❌ GL posting failed for invoice ${invoiceRef(invoice)}:`, error.message);
     try {
@@ -283,6 +331,137 @@ async function postInvoiceJournal(invoice, { actorId, customerName } = {}) {
     } catch (_) {
       /* ignore */
     }
+    return { status: 'FAILED', error: error.message };
+  }
+}
+
+const QUOTE_DRAFT_LABEL = 'Finance quotation (draft until invoiced)';
+const PICKUP_LOCATION_TEXT = { INSIDE_DUBAI: 'inside Dubai', OUTSIDE_DUBAI: 'outside Dubai', DROP_OFF: 'drop off' };
+
+/**
+ * UAE→PH: when Finance sends a quoted request to Operations, raise (or refresh) a DRAFT journal from the
+ * quote — Dr AR / Cr Shipping, Pickup, Delivery / Cr VAT. Drafts stay out of the ledger until the invoice
+ * is generated (postInvoiceJournal with draftJournalId). Never throws.
+ */
+async function upsertQuoteDraftJournal(request, { actorId } = {}) {
+  try {
+    const q = request?.quotation_request || {};
+    if (!q.quotation_id) return { status: 'SKIPPED', reason: 'Request has no quotation' };
+    if (!isUaeToPhCode(request.service_code || request.verification?.service_code)) {
+      return { status: 'SKIPPED', reason: 'Only UAE to PH quotations raise a draft journal' };
+    }
+
+    const shipping = toAmount(q.quotation_shipping_amount);
+    const pickup = toAmount(q.quotation_pickup_charge);
+    const deliveryFee = toAmount(q.quotation_delivery_charge);
+    const insurance = toAmount(q.quotation_insurance_charge);
+    const total = toAmount(q.quotation_total);
+    if (total <= 0) return { status: 'SKIPPED', reason: 'Quotation total is zero' };
+    const tax = round2(Math.max(0, total - (shipping + pickup + deliveryFee + insurance)));
+    const revenue = round2(total - tax);
+    const split = scaleRevenueParts({ shipping, pickup, delivery: deliveryFee + insurance }, revenue);
+
+    const awb = request.tracking_code || request.awb_number || '';
+    const awbText = awb ? ` · AWB ${awb}` : '';
+    const qno = q.quotation_number || 'Quotation';
+    const customer = request.customer_name || 'Customer';
+    const lineText = {
+      shipping: `Shipping ${q.quotation_chargeable_weight || 0} kg × AED ${q.quotation_rate_per_kg || 0}/kg${awbText}`,
+      pickup: `Pickup charge (${PICKUP_LOCATION_TEXT[q.quotation_pickup_location] || 'pickup'})${awbText}`,
+      delivery: `Delivery fee${insurance > 0 ? ` + insurance AED ${insurance.toFixed(2)}` : ''}${awbText}`,
+    };
+
+    const [arGl, vatGl, ...revenueGls] = await Promise.all([
+      resolveAccount('ar'),
+      tax > 0 ? resolveAccount('vat') : Promise.resolve(null),
+      ...split.map((part) => resolveAccount(part.role)),
+    ]);
+    const lines = [
+      {
+        account_id: arGl._id,
+        account_code: arGl.code,
+        account_name: arGl.name,
+        description: `AR ${qno} — ${customer} (payment not yet received)`,
+        debit: total,
+        credit: 0,
+      },
+      ...split.map((part, i) => ({
+        account_id: revenueGls[i]._id,
+        account_code: revenueGls[i].code,
+        account_name: revenueGls[i].name,
+        description: lineText[part.role],
+        debit: 0,
+        credit: part.amount,
+      })),
+    ];
+    if (tax > 0) {
+      lines.push({
+        account_id: vatGl._id,
+        account_code: vatGl.code,
+        account_name: vatGl.name,
+        description: `VAT output 5% on pickup ${qno}`,
+        debit: 0,
+        credit: tax,
+      });
+    }
+
+    const items = (q.items || []).map((item) => `${item.name} ×${item.quantity}`).join(', ');
+    const draft = {
+      memo: `Quotation ${qno}${awbText} — ${customer}${items ? ` · Items: ${items}` : ''}. Draft until the invoice is generated.`,
+      source: 'INVOICE',
+      status: 'DRAFT',
+      lines,
+      total_debit: total,
+      total_credit: total,
+      source_reference: awb || qno,
+      source_label: QUOTE_DRAFT_LABEL,
+    };
+
+    let journal = null;
+    if (q.draft_journal_id) {
+      const existing = await JournalEntry.findById(q.draft_journal_id).select('status entry_no').lean();
+      if (existing?.status === 'POSTED') {
+        return { status: 'SKIPPED', reason: `Journal ${existing.entry_no} is already posted`, journal_no: existing.entry_no };
+      }
+      if (existing?.status === 'DRAFT') {
+        journal = await JournalEntry.findOneAndUpdate(
+          { _id: q.draft_journal_id, status: 'DRAFT' },
+          { $set: draft },
+          { new: true, runValidators: true }
+        );
+      }
+    }
+    if (!journal) {
+      journal = await createJournalWithNextNo(new Date(), { ...draft, ...(await resolveActor(actorId)) });
+    }
+
+    const InvoiceRequest = mongoose.models.InvoiceRequest;
+    await InvoiceRequest.updateOne(
+      { _id: request._id },
+      { $set: { 'quotation_request.draft_journal_id': journal._id, 'quotation_request.draft_journal_no': journal.entry_no } }
+    );
+    return { status: 'DRAFT', journal_id: journal._id, journal_no: journal.entry_no };
+  } catch (error) {
+    console.error(`❌ Quotation draft journal failed for request ${request?._id}:`, error.message);
+    return { status: 'FAILED', error: error.message };
+  }
+}
+
+/** Cancelled request: the unposted quotation draft is voided. Never throws. */
+async function voidQuoteDraftJournal(request, { reason } = {}) {
+  try {
+    const id = request?.quotation_request?.draft_journal_id;
+    if (!id) return { status: 'SKIPPED' };
+    const draft = await JournalEntry.findOne({ _id: id, status: 'DRAFT' }).select('memo').lean();
+    if (!draft) return { status: 'SKIPPED' };
+    const voided = await JournalEntry.findOneAndUpdate(
+      { _id: id, status: 'DRAFT' },
+      { $set: { status: 'VOID', memo: `Voided${reason ? ` (${reason})` : ''} — ${draft.memo || ''}`.trim() } },
+      { new: true }
+    );
+    return voided ? { status: 'VOID', journal_no: voided.entry_no } : { status: 'SKIPPED' };
+  } catch (error) {
+    console.error(`❌ Voiding quotation draft journal failed for request ${request?._id}:`, error.message);
     return { status: 'FAILED', error: error.message };
   }
 }
@@ -560,12 +739,19 @@ function invoicePaymentSummary(invoice) {
  * Record money collected against an invoice. FULL settles the open balance and treats anything collected
  * above it as the gateway charge; PARTIAL settles collected ÷ (1 + mode rate). The gateway charge is
  * VAT-inclusive:  Dr Tabby/Card clearing · Bank · Cash with drivers  /  Cr AR  /  Cr 4040  /  Cr VAT output.
+ * prepaid: customer paid before the invoice was generated (UAE→PH) — cash is already in the office
+ * (Dr Cash on Hand, nothing for a driver to remit).
  * Returns { error } for anything the user should correct.
  */
-async function recordInvoicePayment(invoice, { mode, paymentType, amountCollected, reference, collectedAt, actorId } = {}) {
+async function recordInvoicePayment(
+  invoice,
+  { mode, paymentType, amountCollected, reference, collectedAt, actorId, prepaid = false } = {}
+) {
   const modeKey = String(mode || '').toUpperCase();
-  const config = PAYMENT_MODES[modeKey];
-  if (!config) return { error: 'Choose a mode of payment: Tabby, Card payment, Cash or Bank transfer' };
+  const baseConfig = PAYMENT_MODES[modeKey];
+  if (!baseConfig) return { error: 'Choose a mode of payment: Tabby, Card payment, Cash or Bank transfer' };
+  const officeCash = prepaid && modeKey === 'CASH';
+  const config = officeCash ? { ...baseConfig, debitRole: 'remitted' } : baseConfig;
   const type = String(paymentType || '').toUpperCase();
   if (!['FULL', 'PARTIAL'].includes(type)) return { error: 'Choose full or partial payment' };
   const collected = round2(Number(amountCollected));
@@ -655,7 +841,7 @@ async function recordInvoicePayment(invoice, { mode, paymentType, amountCollecte
     status: 'POSTED',
     journal_id: journal._id,
     journal_no: journal.entry_no,
-    remitted: false,
+    remitted: officeCash,
     recorded_by_name: actor.created_by_name,
     recorded_by_email: actor.created_by_email,
   };
@@ -744,6 +930,9 @@ module.exports = {
   voidInvoicePayment,
   invoicePaymentSummary,
   invoiceRevenueSplit,
+  upsertQuoteDraftJournal,
+  voidQuoteDraftJournal,
+  isUaeToPhCode,
   PAYMENT_MODES,
   SOURCE_LABEL,
 };

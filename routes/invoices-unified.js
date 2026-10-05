@@ -14,6 +14,8 @@ const {
   syncInvoiceLedger,
   recordInvoicePayment,
   voidInvoicePayment,
+  isUaeToPhCode,
+  PAYMENT_MODES,
 } = require('../services/invoice-gl');
 // const { createNotificationsForAllUsers } = require('./notifications');
 
@@ -621,8 +623,17 @@ router.post('/', async (req, res) => {
       customer_trn,
       batch_number,
       total_amount_cod, // NEW: COD Invoice total (PH_TO_UAE only)
-      total_amount_tax_invoice // NEW: Tax Invoice total (PH_TO_UAE only)
+      total_amount_tax_invoice, // NEW: Tax Invoice total (PH_TO_UAE only)
+      prepaid_payment, // UAE_TO_PH: { mode, reference } — customer already paid; invoice is settled on creation
     } = req.body;
+
+    const prepaidMode = prepaid_payment?.mode ? String(prepaid_payment.mode).toUpperCase() : null;
+    if (prepaidMode && !PAYMENT_MODES[prepaidMode]) {
+      return res.status(400).json({
+        success: false,
+        error: 'Choose how the customer paid: Cash, Bank transfer, Card payment or Tabby',
+      });
+    }
     
     console.log('Extracted fields:', {
       request_id,
@@ -1610,14 +1621,19 @@ router.post('/', async (req, res) => {
     });
 
     // Populate the created invoice for response
-    const populatedInvoice = await Invoice.findById(invoice._id)
+    let populatedInvoice = await Invoice.findById(invoice._id)
       .populate('request_id', REQUEST_POPULATE_FIELDS)
       .populate('client_id', 'company_name contact_name email phone address city country')
       .populate('created_by', 'full_name email department_id');
 
+    const prepaid = Boolean(prepaidMode) && isUaeToPhCode(invoice.service_code || providedServiceCode);
+    const quote = invoiceRequest?.quotation_request;
     const gl = await postInvoiceJournal(invoice, {
       actorId: created_by,
       customerName: populatedInvoice?.client_id?.company_name,
+      draftJournalId: quote?.draft_journal_id,
+      quotationNumber: quote?.draft_journal_id ? quote.quotation_number : undefined,
+      gatewayMode: prepaid ? prepaidMode : undefined,
     });
     populatedInvoice.gl_sync = invoice.gl_sync;
     if (gl.status === 'POSTED') {
@@ -1681,6 +1697,39 @@ router.post('/', async (req, res) => {
         await invoice.save();
       } catch (_) {
         /* ignore */
+      }
+    }
+
+    // Prepaid UAE→PH: settle the invoice now (after EMPOST so its payload is unchanged)
+    let prepaidResult;
+    if (prepaid) {
+      if (gl.status !== 'POSTED') {
+        prepaidResult = { status: 'FAILED', error: 'Invoice journal is not posted — record the payment from the invoice page' };
+      } else {
+        try {
+          const fresh = await Invoice.findById(invoice._id);
+          const paid = await recordInvoicePayment(fresh, {
+            mode: prepaidMode,
+            paymentType: 'FULL',
+            amountCollected: parseFloat(fresh.total_amount?.toString() || '0'),
+            reference: prepaid_payment.reference,
+            actorId: created_by,
+            prepaid: true,
+          });
+          prepaidResult = paid.error
+            ? { status: 'FAILED', error: paid.error }
+            : { status: 'PAID', journal_no: paid.journal.entry_no, mode: prepaidMode };
+          if (!paid.error) {
+            const refreshed = await Invoice.findById(invoice._id)
+              .populate('request_id', REQUEST_POPULATE_FIELDS)
+              .populate('client_id', 'company_name contact_name email phone address city country')
+              .populate('created_by', 'full_name email department_id');
+            if (refreshed) populatedInvoice = refreshed;
+          }
+        } catch (paymentError) {
+          console.error('❌ Prepaid payment posting failed:', paymentError.message);
+          prepaidResult = { status: 'FAILED', error: paymentError.message };
+        }
       }
     }
 
@@ -1836,6 +1885,7 @@ router.post('/', async (req, res) => {
       data: transformInvoice(populatedInvoice),
       message: 'Invoice created successfully',
       gl,
+      ...(prepaidResult ? { prepaid: prepaidResult } : {}),
       ...(invoiceIdReassignedFrom
         ? {
             invoice_id_reassigned_from: invoiceIdReassignedFrom,
