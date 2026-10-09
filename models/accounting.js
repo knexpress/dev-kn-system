@@ -178,6 +178,9 @@ const bankCashAccountSchema = new mongoose.Schema(
     current_balance: { type: Number, default: 0 },
     is_active: { type: Boolean, default: true },
     notes: { type: String, required: false },
+    last_reconciled_at: { type: Date, required: false },
+    last_reconciled_to: { type: Date, required: false },
+    last_reconciliation_id: { type: mongoose.Schema.Types.ObjectId, ref: 'BankReconciliation', required: false },
     created_by_name: { type: String, required: false },
     created_by_email: { type: String, required: false },
     created_by_user_id: {
@@ -1012,6 +1015,75 @@ invoiceNoteSchema.index({ status: 1, createdAt: -1 });
 
 const InvoiceNote = mongoose.models.InvoiceNote || mongoose.model('InvoiceNote', invoiceNoteSchema);
 
+const bankReconLineSchema = new mongoose.Schema(
+  {
+    line_no: { type: Number, required: true },
+    date: { type: Date, required: false },
+    description: { type: String, default: '' },
+    reference: { type: String, default: '' },
+    money_in: { type: Number, default: 0 },
+    money_out: { type: Number, default: 0 },
+    amount: { type: Number, default: 0 },
+    balance: { type: Number, required: false },
+    status: { type: String, enum: ['UNMATCHED', 'MATCHED', 'IGNORED'], default: 'UNMATCHED' },
+    matched_book_id: { type: String, required: false },
+  },
+  { _id: false }
+);
+
+const bankReconBookSchema = new mongoose.Schema(
+  {
+    book_id: { type: String, required: true },
+    journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
+    journal_no: { type: String, required: false },
+    date: { type: Date, required: false },
+    description: { type: String, default: '' },
+    source: { type: String, required: false },
+    source_reference: { type: String, required: false },
+    debit: { type: Number, default: 0 },
+    credit: { type: Number, default: 0 },
+    amount: { type: Number, default: 0 },
+    status: { type: String, enum: ['UNMATCHED', 'MATCHED', 'IGNORED'], default: 'UNMATCHED' },
+    matched_line_no: { type: Number, required: false },
+  },
+  { _id: false }
+);
+
+const bankReconciliationSchema = new mongoose.Schema(
+  {
+    recon_no: { type: String, required: true, unique: true },
+    status: { type: String, enum: ['OPEN', 'IN_PROGRESS', 'COMPLETED', 'VOID'], default: 'OPEN' },
+    bank_cash_account_id: { type: mongoose.Schema.Types.ObjectId, ref: 'BankCashAccount', required: true },
+    bank_cash_account_code: { type: String, required: true },
+    bank_cash_account_name: { type: String, required: true },
+    gl_account_code: { type: String, required: true },
+    file_name: { type: String, required: false },
+    sheet_name: { type: String, required: false },
+    column_map: { type: mongoose.Schema.Types.Mixed, default: {} },
+    period_start: { type: Date, required: false },
+    period_end: { type: Date, required: false },
+    statement_opening: { type: Number, required: false },
+    statement_closing: { type: Number, required: false },
+    book_opening: { type: Number, default: 0 },
+    book_closing: { type: Number, default: 0 },
+    statement_lines: { type: [bankReconLineSchema], default: [] },
+    book_lines: { type: [bankReconBookSchema], default: [] },
+    created_by_name: { type: String, required: false },
+    created_by_email: { type: String, required: false },
+    created_by_user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: false },
+    completed_at: { type: Date, required: false },
+    completed_by_name: { type: String, required: false },
+    notes: { type: String, required: false },
+  },
+  { timestamps: true }
+);
+
+bankReconciliationSchema.index({ bank_cash_account_id: 1, createdAt: -1 });
+bankReconciliationSchema.index({ status: 1, createdAt: -1 });
+
+const BankReconciliation =
+  mongoose.models.BankReconciliation || mongoose.model('BankReconciliation', bankReconciliationSchema);
+
 module.exports = {
   Account,
   JournalEntry,
@@ -1031,6 +1103,7 @@ module.exports = {
   Vat201Return,
   EInvoice,
   InvoiceNote,
+  BankReconciliation,
   INVOICE_NOTE_CATEGORIES,
   INVOICE_NOTE_REASONS,
   INVOICE_NOTE_REFUND_MODES,

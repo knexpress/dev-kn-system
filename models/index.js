@@ -471,6 +471,15 @@ const invoiceRequestSchema = new mongoose.Schema({
     draft_journal_no: { type: String, required: false },
     sent_to_operations_at: { type: Date, required: false },
     sent_to_operations_by_name: { type: String, required: false },
+    cancelled_at: { type: Date, required: false },
+    cancelled_by_name: { type: String, required: false },
+    cancellation_reason: { type: String, required: false },
+    cancellation_charged: { type: Boolean, required: false },
+    cancellation_amount: { type: Number, required: false },
+    cancellation_invoice_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice', required: false },
+    cancellation_invoice_no: { type: String, required: false },
+    cancellation_journal_no: { type: String, required: false },
+    cancellation_payment_mode: { type: String, required: false },
   },
   
   // Employee References

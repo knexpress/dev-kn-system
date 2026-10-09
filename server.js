@@ -281,6 +281,7 @@ app.use('/api/bookings', bookingsRoutes);
 app.use('/api/system-settings', systemSettingsRoutes);
 app.use('/api/empost', require('./routes/empost-pending'));
 app.use('/api/accounting', require('./routes/accounting'));
+app.use('/api/accounting', require('./routes/bank-reconciliation'));
 app.use('/uploads/accounting', express.static(path.join(__dirname, 'uploads/accounting')));
 
 // Activity tracking routes

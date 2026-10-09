@@ -1,7 +1,7 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const { InvoiceRequest, Employee, Collections, AuditReport, Booking, Department } = require('../models');
-const { DeliveryAssignment, Invoice } = require('../models/unified-schema');
+const { DeliveryAssignment, Invoice, Client } = require('../models/unified-schema');
 const { createNotificationsForAllUsers, createNotificationsForDepartment } = require('./notifications');
 const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/id-generators');
@@ -9,7 +9,14 @@ const { sanitizeRegex } = require('../middleware/security');
 const { cleanupBookingIdentityDocumentsForDeliveredInvoiceRequest } = require('../utils/booking-identity-cleanup');
 const auth = require('../middleware/auth');
 const jwt = require('jsonwebtoken');
-const { upsertQuoteDraftJournal, voidQuoteDraftJournal, isUaeToPhCode } = require('../services/invoice-gl');
+const {
+  upsertQuoteDraftJournal,
+  voidQuoteDraftJournal,
+  isUaeToPhCode,
+  postInvoiceJournal,
+  recordInvoicePayment,
+  PAYMENT_MODES,
+} = require('../services/invoice-gl');
 
 const router = express.Router();
 
@@ -30,6 +37,69 @@ async function optionalUser(req) {
 function isPrepaidQuotedRequest(request) {
   return Boolean(request?.quotation_request?.quotation_id) &&
     isUaeToPhCode(request.service_code || request.verification?.service_code);
+}
+
+function canCancelQuotedShipment(user) {
+  const role = String(user?.role || '').toUpperCase();
+  const dept = user?.department?.name;
+  return role === 'SUPERADMIN' || role === 'ADMIN' || dept === 'Finance' || dept === 'IT';
+}
+
+function actorNameFromReq(user) {
+  return user?.employee?.full_name || user?.full_name || user?.email || 'Finance';
+}
+
+function roundMoney(n) {
+  return Math.round((Number(n) || 0) * 100) / 100;
+}
+
+function asDecimal(n) {
+  return mongoose.Types.Decimal128.fromString(roundMoney(n).toFixed(2));
+}
+
+async function markBookingCancelled(invoiceRequest, actorName, reason) {
+  let bookingId = invoiceRequest.booking_id;
+  if (bookingId && typeof bookingId === 'object') bookingId = bookingId._id || bookingId;
+  if (!bookingId) {
+    const booking = await Booking.findOne({ converted_to_invoice_request_id: invoiceRequest._id }).select('_id');
+    bookingId = booking?._id;
+  }
+  if (!bookingId) return;
+  const booking = await Booking.findById(bookingId);
+  if (!booking) return;
+  const entry = {
+    status: 'Cancelled',
+    updated_at: new Date(),
+    updated_by: actorName || 'Finance',
+    notes: reason || 'Shipment cancelled at quotation',
+  };
+  if (Array.isArray(booking.shipment_status_history)) booking.shipment_status_history.push(entry);
+  else booking.shipment_status_history = [entry];
+  await booking.save();
+}
+
+async function ensureClientFromInvoiceRequest(request) {
+  const name = (request.customer_name || 'Customer').toString().trim() || 'Customer';
+  const phone = (request.customer_phone || 'N/A').toString().trim() || 'N/A';
+  const email = (request.customer_email || `noreply+${request._id}@knexpress.ae`).toString().trim();
+  const address = (request.origin_place || senderAddressOf(request) || 'Address not provided').toString().trim();
+  const existing = await Client.findOne({ company_name: name, phone }).sort({ createdAt: -1 });
+  if (existing) return existing;
+  return Client.create({
+    company_name: name,
+    contact_name: name,
+    email,
+    phone,
+    address,
+    city: 'Dubai',
+    country: 'UAE',
+    isActive: true,
+  });
+}
+
+function senderAddressOf(request) {
+  const sender = request.booking_snapshot?.sender || request.booking_data?.sender || {};
+  return sender.completeAddress || sender.addressLine1 || sender.address || '';
 }
 
 // Force PH_TO_UAE classification to GENERAL (ignore incoming box classifications)
@@ -3183,6 +3253,191 @@ router.get('/:id/details', async (req, res) => {
       error: 'Failed to fetch invoice request details',
       details: error.message
     });
+  }
+});
+
+// POST /api/invoice-requests/:id/cancel-shipment
+// Finance cancels a quotation-stage shipment. Never sent to EMPOST.
+// charge=false: mark CANCELLED. charge=true: raise a cancellation invoice and record payment.
+router.post('/:id/cancel-shipment', auth, async (req, res) => {
+  try {
+    if (!canCancelQuotedShipment(req.user)) {
+      return res.status(403).json({ success: false, error: 'Only Finance can cancel a shipment at quotation' });
+    }
+
+    const charge = req.body?.charge === true || req.body?.charge === 'true';
+    const reason = (req.body?.reason || '').toString().trim();
+    const invoiceRequest = await InvoiceRequest.findById(req.params.id);
+    if (!invoiceRequest) {
+      return res.status(404).json({ success: false, error: 'Invoice request not found' });
+    }
+    if (invoiceRequest.status === 'CANCELLED') {
+      return res.status(400).json({ success: false, error: 'This shipment is already cancelled' });
+    }
+    if (invoiceRequest.status !== 'QUOTATION_REQUEST') {
+      return res.status(400).json({
+        success: false,
+        error: 'Cancel shipment here only while the request is still at quotation, before it is sent to Operations',
+      });
+    }
+    if (invoiceRequest.quotation_request?.sent_to_operations_at) {
+      return res.status(400).json({ success: false, error: 'This quotation was already sent to Operations' });
+    }
+
+    const existingInvoice = await Invoice.findOne({
+      $or: [{ request_id: invoiceRequest._id }, { invoice_request_id: invoiceRequest._id }],
+    }).select('_id invoice_id');
+    if (existingInvoice) {
+      return res.status(409).json({
+        success: false,
+        error: `Invoice ${existingInvoice.invoice_id || existingInvoice._id} already exists for this request`,
+      });
+    }
+
+    const actorName = actorNameFromReq(req.user);
+    const createdBy = req.user?.employee?._id || invoiceRequest.created_by_employee_id || req.user?.id;
+    if (!invoiceRequest.quotation_request) invoiceRequest.quotation_request = {};
+
+    let invoice = null;
+    let gl = null;
+    let prepaidResult = null;
+    let total = 0;
+    let paymentMode = null;
+
+    if (charge) {
+      const net = roundMoney(req.body?.amount);
+      if (!(net > 0)) {
+        return res.status(400).json({ success: false, error: 'Enter the cancellation fee to charge' });
+      }
+      const vatRate = Number(req.body?.vat_rate) === 5 ? 5 : 0;
+      const vat = roundMoney(net * (vatRate / 100));
+      total = roundMoney(net + vat);
+      paymentMode = String(req.body?.payment?.mode || req.body?.payment_mode || '').toUpperCase();
+      if (!PAYMENT_MODES[paymentMode]) {
+        return res.status(400).json({
+          success: false,
+          error: 'Choose how the customer paid: Cash, Bank transfer, Card payment or Tabby',
+        });
+      }
+      const paymentReference = (req.body?.payment?.reference || req.body?.payment_reference || '').toString().trim();
+
+      const client = await ensureClientFromInvoiceRequest(invoiceRequest);
+      const awb = invoiceRequest.tracking_code || invoiceRequest.awb_number || '';
+      const description = 'Shipment cancellation fee';
+      const due = new Date();
+      due.setDate(due.getDate() + 30);
+
+      invoice = new Invoice({
+        request_id: invoiceRequest._id,
+        client_id: client._id,
+        created_by: createdBy,
+        amount: asDecimal(net),
+        pickup_charge: asDecimal(0),
+        delivery_charge: asDecimal(0),
+        insurance_charge: asDecimal(0),
+        tax_rate: vatRate,
+        tax_amount: asDecimal(vat),
+        total_amount: asDecimal(total),
+        issue_date: new Date(),
+        due_date: due,
+        status: 'UNPAID',
+        awb_number: awb || undefined,
+        receiver_name: invoiceRequest.receiver_name || undefined,
+        receiver_address: invoiceRequest.receiver_address || undefined,
+        receiver_phone: invoiceRequest.receiver_phone || undefined,
+        service_code: invoiceRequest.service_code || invoiceRequest.verification?.service_code || undefined,
+        notes: [
+          'Shipment cancelled before processing. This invoice is the cancellation fee only. Not sent to EMPOST.',
+          reason ? `Reason: ${reason}` : '',
+          invoiceRequest.quotation_request?.quotation_number
+            ? `Quotation ${invoiceRequest.quotation_request.quotation_number}`
+            : '',
+        ].filter(Boolean).join(' '),
+        line_items: [{
+          description,
+          quantity: 1,
+          unit_price: asDecimal(net),
+          total: asDecimal(net),
+        }],
+        payment_reference: paymentReference || undefined,
+      });
+      await invoice.save();
+
+      gl = await postInvoiceJournal(invoice, {
+        actorId: req.user?.id,
+        customerName: client.company_name,
+        gatewayMode: paymentMode,
+        quotationNumber: invoiceRequest.quotation_request?.quotation_number,
+      });
+
+      if (gl.status === 'POSTED') {
+        const paid = await recordInvoicePayment(invoice, {
+          mode: paymentMode,
+          paymentType: 'FULL',
+          amountCollected: total,
+          reference: paymentReference || undefined,
+          collectedAt: req.body?.payment?.collected_at || req.body?.payment?.paid_at,
+          actorId: req.user?.id,
+          prepaid: true,
+        });
+        prepaidResult = paid.error
+          ? { status: 'FAILED', error: paid.error }
+          : { status: 'PAID', journal_no: paid.journal?.entry_no, mode: paymentMode };
+      } else {
+        prepaidResult = { status: 'FAILED', error: gl.error || gl.reason || 'Invoice journal is not posted' };
+      }
+
+      invoiceRequest.invoice_number = invoice.invoice_id;
+      invoiceRequest.invoice_amount = asDecimal(total);
+      invoiceRequest.invoice_generated_at = new Date();
+    }
+
+    invoiceRequest.status = 'CANCELLED';
+    invoiceRequest.quotation_request.cancelled_at = new Date();
+    invoiceRequest.quotation_request.cancelled_by_name = actorName;
+    invoiceRequest.quotation_request.cancellation_reason = reason || (charge ? 'Cancellation fee charged' : 'Cancelled without charge');
+    invoiceRequest.quotation_request.cancellation_charged = charge;
+    if (charge) {
+      invoiceRequest.quotation_request.cancellation_amount = total;
+      invoiceRequest.quotation_request.cancellation_invoice_id = invoice._id;
+      invoiceRequest.quotation_request.cancellation_invoice_no = invoice.invoice_id;
+      invoiceRequest.quotation_request.cancellation_journal_no = gl?.journal_no;
+      invoiceRequest.quotation_request.cancellation_payment_mode = paymentMode;
+    }
+    await invoiceRequest.save();
+
+    await voidQuoteDraftJournal(invoiceRequest, { actorId: req.user?.id, reason: 'shipment cancelled at quotation' });
+    await markBookingCancelled(
+      invoiceRequest,
+      actorName,
+      charge
+        ? `Cancelled at quotation with cancellation invoice ${invoice.invoice_id}`
+        : (reason || 'Cancelled at quotation, no charge')
+    );
+
+    res.json({
+      success: true,
+      data: {
+        invoice_request: normalizeInvoiceRequest(invoiceRequest),
+        charged: charge,
+        invoice: invoice
+          ? {
+              _id: invoice._id,
+              invoice_id: invoice.invoice_id,
+              total_amount: total,
+              status: invoice.status,
+              journal_no: gl?.journal_no,
+              payment: prepaidResult,
+            }
+          : null,
+      },
+      message: charge
+        ? `Shipment cancelled. Invoice ${invoice.invoice_id} raised for AED ${total.toFixed(2)}.`
+        : 'Shipment cancelled. The customer was not charged.',
+    });
+  } catch (error) {
+    console.error('Error cancelling shipment at quotation:', error);
+    res.status(500).json({ success: false, error: error.message || 'Failed to cancel the shipment' });
   }
 });
 

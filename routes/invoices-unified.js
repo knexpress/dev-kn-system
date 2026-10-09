@@ -13,6 +13,7 @@ const {
   syncInvoiceReceipts,
   syncInvoiceLedger,
   recordInvoicePayment,
+  updateInvoicePaymentDate,
   voidInvoicePayment,
   invoicePaymentSummary,
   isUaeToPhCode,
@@ -246,7 +247,7 @@ function buildInvoiceSearchQuery(searchTerm) {
 }
 
 // Essential fields for invoice list view (lightweight)
-const INVOICE_LIST_FIELDS = '_id invoice_id awb_number batch_number receiver_name receiver_address receiver_phone service_code weight_kg weight_type volume_cbm amount delivery_charge pickup_charge insurance_charge tax_amount total_amount amount_paid gateway_charges_total credit_notes_total debit_notes_total refunds_total gl_sync.status gl_sync.posted_total gl_sync.settled_amount gl_sync.collection_journal_id gl_sync.receipt_journal_id payment_mode payments status issue_date due_date paid_at createdAt updatedAt client_id request_id created_by';
+const INVOICE_LIST_FIELDS = '_id invoice_id awb_number batch_number receiver_name receiver_address receiver_phone service_code weight_kg weight_type volume_cbm amount delivery_charge pickup_charge insurance_charge tax_amount total_amount amount_paid gateway_charges_total credit_notes_total debit_notes_total refunds_total gl_sync.status gl_sync.posted_total gl_sync.settled_amount gl_sync.journal_id gl_sync.journal_no gl_sync.collection_journal_id gl_sync.receipt_journal_id payment_mode payments status issue_date due_date paid_at createdAt updatedAt client_id request_id created_by';
 
 // Get all invoices with pagination and search (OPTIMIZED for list view)
 router.get('/', async (req, res) => {
@@ -633,7 +634,7 @@ router.post('/', async (req, res) => {
       batch_number,
       total_amount_cod, // NEW: COD Invoice total (PH_TO_UAE only)
       total_amount_tax_invoice, // NEW: Tax Invoice total (PH_TO_UAE only)
-      prepaid_payment, // UAE_TO_PH: { mode, reference } — customer already paid; invoice is settled on creation
+      prepaid_payment, // UAE_TO_PH: { mode, reference, collected_at } — customer already paid; invoice is settled on creation
     } = req.body;
 
     const prepaidMode = prepaid_payment?.mode ? String(prepaid_payment.mode).toUpperCase() : null;
@@ -1722,6 +1723,7 @@ router.post('/', async (req, res) => {
             paymentType: 'FULL',
             amountCollected: parseFloat(fresh.total_amount?.toString() || '0'),
             reference: prepaid_payment.reference,
+            collectedAt: prepaid_payment.collected_at || prepaid_payment.paid_at,
             actorId: created_by,
             prepaid: true,
           });
@@ -2115,6 +2117,29 @@ router.post('/:id/payments', async (req, res) => {
   } catch (error) {
     console.error('Error recording invoice payment:', error);
     res.status(500).json({ success: false, error: 'Failed to record payment' });
+  }
+});
+
+router.patch('/:id/payments/:paymentId', async (req, res) => {
+  try {
+    const invoice = await Invoice.findById(req.params.id);
+    if (!invoice) return res.status(404).json({ success: false, error: 'Invoice not found' });
+
+    const collectedAt = req.body?.collected_at || req.body?.paid_at;
+    if (!collectedAt) {
+      return res.status(400).json({ success: false, error: 'Enter the date the customer paid' });
+    }
+
+    const result = await updateInvoicePaymentDate(invoice, req.params.paymentId, collectedAt);
+    if (result.error) return res.status(400).json({ success: false, error: result.error });
+
+    await respondWithInvoice(res, invoice._id, {
+      payment: result.payment,
+      message: 'Payment date updated',
+    });
+  } catch (error) {
+    console.error('Error updating invoice payment date:', error);
+    res.status(500).json({ success: false, error: 'Failed to update payment date' });
   }
 });
 

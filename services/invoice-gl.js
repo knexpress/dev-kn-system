@@ -48,6 +48,28 @@ const GATEWAY_VAT_RATE = 0.05;
 
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
+/** Calendar day the customer paid. YYYY-MM-DD is stored at noon local so it does not shift timezone. */
+function parsePaymentDate(value) {
+  if (!value) return new Date();
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value;
+  const text = String(value).trim();
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (match) {
+    return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 12, 0, 0);
+  }
+  const parsed = new Date(text);
+  return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+}
+
+function assertPaymentDate(value) {
+  const when = parsePaymentDate(value);
+  const limit = new Date();
+  limit.setDate(limit.getDate() + 1);
+  limit.setHours(23, 59, 59, 999);
+  if (when.getTime() > limit.getTime()) return { error: 'Payment date cannot be in the future' };
+  return { when };
+}
+
 function toAmount(value) {
   if (value === null || value === undefined) return 0;
   const n = parseFloat(value.toString());
@@ -843,7 +865,9 @@ async function recordInvoicePayment(
 
   const ref = invoiceRef(invoice);
   const actor = await resolveActor(actorId);
-  const when = collectedAt ? new Date(collectedAt) : new Date();
+  const dated = assertPaymentDate(collectedAt || new Date());
+  if (dated.error) return dated;
+  const when = dated.when;
   const refText = reference ? ` · ${reference}` : '';
   const line = (role, debit, credit, description) => ({
     account_id: accounts[role]._id,
@@ -917,6 +941,36 @@ async function recordInvoicePayment(
   };
 }
 
+/** Move a posted payment (and its journal) onto the day the customer actually paid — including advance payments. */
+async function updateInvoicePaymentDate(invoice, paymentId, collectedAt) {
+  const dated = assertPaymentDate(collectedAt);
+  if (dated.error) return dated;
+  const when = dated.when;
+  const payment = (invoice.payments || []).find((p) => String(p._id) === String(paymentId));
+  if (!payment) return { error: 'Payment not found on this invoice' };
+  if (payment.status === 'VOID') return { error: 'This payment was voided' };
+
+  payment.collected_at = when;
+  if (payment.journal_id) {
+    const journal = await JournalEntry.findById(payment.journal_id);
+    if (journal && journal.status !== 'VOID') {
+      journal.entry_date = when;
+      await journal.save();
+    }
+  }
+
+  const live = (invoice.payments || []).filter((p) => p.status !== 'VOID');
+  if (live.length && invoice.paid_at) {
+    invoice.paid_at = live.reduce(
+      (latest, p) => (new Date(p.collected_at) > new Date(latest) ? p.collected_at : latest),
+      live[0].collected_at
+    );
+  }
+  invoice.markModified('payments');
+  await invoice.save();
+  return { payment };
+}
+
 /** Undo a mistaken payment entry: reversing journal, balance reopened. Remitted cash can't be voided. */
 async function voidInvoicePayment(invoice, paymentId, { actorId, reason } = {}) {
   const payment = (invoice.payments || []).find((p) => String(p._id) === String(paymentId));
@@ -973,6 +1027,7 @@ module.exports = {
   syncInvoiceReceipts,
   syncInvoiceLedger,
   recordInvoicePayment,
+  updateInvoicePaymentDate,
   voidInvoicePayment,
   invoicePaymentSummary,
   invoiceNetTotal,
