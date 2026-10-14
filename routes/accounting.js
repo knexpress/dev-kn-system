@@ -4077,6 +4077,7 @@ async function ensureSalesAccounts(actor = {}) {
     { code: '2200', name: 'VAT Output Payable', type: 'Liability', subtype: 'Tax' },
     { code: '1100', name: 'Cash at Bank', type: 'Asset', subtype: 'Bank' },
     { code: '2210', name: 'VAT Settlement', type: 'Liability', subtype: 'Tax' },
+    { code: '2310', name: 'Customer Payment Due', type: 'Liability', subtype: 'Current' },
   ];
   for (const row of needed) {
     const existing = await Account.findOne({ code: row.code });

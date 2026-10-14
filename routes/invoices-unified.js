@@ -14,11 +14,15 @@ const {
   syncInvoiceLedger,
   recordInvoicePayment,
   updateInvoicePaymentDate,
+  applyQuoteAdvanceToInvoice,
+  remainingQuoteAdvance,
   voidInvoicePayment,
   invoicePaymentSummary,
   isUaeToPhCode,
   PAYMENT_MODES,
 } = require('../services/invoice-gl');
+const { raiseCancellationInvoice } = require('../services/cancellation-invoice');
+const auth = require('../middleware/auth');
 const { blockingNotesFor } = require('../services/invoice-notes');
 
 async function notesBlockMessage(invoiceId, action) {
@@ -247,7 +251,117 @@ function buildInvoiceSearchQuery(searchTerm) {
 }
 
 // Essential fields for invoice list view (lightweight)
-const INVOICE_LIST_FIELDS = '_id invoice_id awb_number batch_number receiver_name receiver_address receiver_phone service_code weight_kg weight_type volume_cbm amount delivery_charge pickup_charge insurance_charge tax_amount total_amount amount_paid gateway_charges_total credit_notes_total debit_notes_total refunds_total gl_sync.status gl_sync.posted_total gl_sync.settled_amount gl_sync.journal_id gl_sync.journal_no gl_sync.collection_journal_id gl_sync.receipt_journal_id payment_mode payments status issue_date due_date paid_at createdAt updatedAt client_id request_id created_by';
+const INVOICE_LIST_FIELDS = '_id invoice_id invoice_origin awb_number batch_number receiver_name receiver_address receiver_phone service_code weight_kg weight_type volume_cbm amount delivery_charge pickup_charge insurance_charge tax_amount total_amount amount_paid gateway_charges_total credit_notes_total debit_notes_total refunds_total gl_sync.status gl_sync.posted_total gl_sync.settled_amount gl_sync.journal_id gl_sync.journal_no gl_sync.collection_journal_id gl_sync.receipt_journal_id payment_mode payments status issue_date due_date paid_at createdAt updatedAt client_id request_id created_by';
+
+function canRaiseCancellationInvoice(user) {
+  const role = String(user?.role || '').toUpperCase();
+  const dept = user?.department?.name;
+  return role === 'SUPERADMIN' || role === 'ADMIN' || dept === 'Finance' || dept === 'IT';
+}
+
+// Cancelled shipments that do not yet have a cancellation-fee invoice
+router.get('/cancellation-candidates', auth, async (req, res) => {
+  try {
+    if (!canRaiseCancellationInvoice(req.user)) {
+      return res.status(403).json({ success: false, error: 'Only Finance can raise a cancellation invoice' });
+    }
+    const search = (req.query.search || '').toString().trim();
+    const query = {
+      status: 'CANCELLED',
+      $or: [
+        { 'quotation_request.cancellation_invoice_id': { $exists: false } },
+        { 'quotation_request.cancellation_invoice_id': null },
+      ],
+    };
+    if (search) {
+      const sanitized = sanitizeRegex(search);
+      if (sanitized) {
+        const rx = new RegExp(sanitized, 'i');
+        query.$and = [{
+          $or: [
+            { tracking_code: rx },
+            { awb_number: rx },
+            { invoice_number: rx },
+            { customer_name: rx },
+            { receiver_name: rx },
+            { 'quotation_request.quotation_number': rx },
+          ],
+        }];
+      }
+    }
+    const rows = await InvoiceRequest.find(query)
+      .select('tracking_code awb_number customer_name customer_phone receiver_name receiver_phone service_code status quotation_request.quotation_number quotation_request.quotation_total quotation_request.cancellation_charged quotation_request.advance')
+      .sort({ cancelled_at: -1, updatedAt: -1 })
+      .limit(30)
+      .lean();
+    res.json({
+      success: true,
+      data: rows.map((row) => ({
+        _id: row._id,
+        awb: row.tracking_code || row.awb_number || '',
+        customer_name: row.customer_name || '',
+        customer_phone: row.customer_phone || '',
+        receiver_name: row.receiver_name || '',
+        service_code: row.service_code || '',
+        quotation_number: row.quotation_request?.quotation_number || '',
+        quotation_total: row.quotation_request?.quotation_total || 0,
+        has_advance: Boolean(row.quotation_request?.advance?.journal_id)
+          && !row.quotation_request?.advance?.void_journal_id
+          && !row.quotation_request?.advance?.applied_journal_id,
+        advance_amount: row.quotation_request?.advance?.amount || 0,
+      })),
+    });
+  } catch (error) {
+    console.error('Error listing cancellation invoice candidates:', error);
+    res.status(500).json({ success: false, error: 'Failed to load cancelled shipments' });
+  }
+});
+
+router.post('/cancellation', auth, async (req, res) => {
+  try {
+    if (!canRaiseCancellationInvoice(req.user)) {
+      return res.status(403).json({ success: false, error: 'Only Finance can raise a cancellation invoice' });
+    }
+    const requestId = req.body?.request_id;
+    let invoiceRequest = null;
+    if (requestId) {
+      invoiceRequest = await InvoiceRequest.findById(requestId);
+      if (!invoiceRequest) {
+        return res.status(404).json({ success: false, error: 'Shipment not found' });
+      }
+    }
+    const createdBy = req.user?.employee?._id || invoiceRequest?.created_by_employee_id || req.user?.id;
+    const raised = await raiseCancellationInvoice({
+      invoiceRequest,
+      amount: req.body?.amount,
+      vatRate: req.body?.vat_rate,
+      reason: (req.body?.reason || '').toString().trim(),
+      payment: req.body?.paid ? req.body?.payment : undefined,
+      actorId: req.user?.id,
+      actorName: req.user?.employee?.full_name || req.user?.full_name || req.user?.email,
+      createdBy,
+      customerName: req.body?.customer_name,
+      customerPhone: req.body?.customer_phone,
+      customerEmail: req.body?.customer_email,
+      awbNumber: req.body?.awb_number,
+    });
+    if (raised.error) {
+      return res.status(400).json({ success: false, error: raised.error });
+    }
+    res.json({
+      success: true,
+      data: {
+        invoice: transformInvoice(raised.invoice),
+        journal_no: raised.gl?.journal_no,
+        payment: raised.payment,
+      },
+      message: `Cancellation invoice ${raised.invoice.invoice_id} raised for AED ${raised.total.toFixed(2)}.`,
+    });
+  } catch (error) {
+    console.error('Error creating cancellation invoice:', error);
+    res.status(500).json({ success: false, error: error.message || 'Failed to create cancellation invoice' });
+  }
+});
 
 // Get all invoices with pagination and search (OPTIMIZED for list view)
 router.get('/', async (req, res) => {
@@ -1018,6 +1132,12 @@ router.post('/', async (req, res) => {
       // User has explicitly set insurance in line_items (could be 0 for "no insurance")
       insuranceCharge = parseFloat(insuranceLineItem.total?.toString() || insuranceLineItem.unit_price?.toString() || 0);
       console.log(`✅ Using insurance charge from line_items (user's explicit choice): ${insuranceCharge} AED`);
+    } else if (
+      !isPhToUae &&
+      Number(invoiceRequest?.quotation_request?.quotation_insurance_charge) > 0
+    ) {
+      insuranceCharge = Math.round(Number(invoiceRequest.quotation_request.quotation_insurance_charge) * 100) / 100;
+      console.log(`✅ Using quoted insurance charge: ${insuranceCharge} AED`);
     } else if (isPhToUae) {
       // PH_TO_UAE: insurance not offered, force to 0
       insuranceCharge = 0;
@@ -1163,6 +1283,16 @@ router.post('/', async (req, res) => {
       console.log(`   Tax Rate from request: ${tax_rate}%`);
       console.log(`   Delivery Charge: ${deliveryCharge} AED`);
       console.log(`   Tax (5%): ${taxAmount} AED`);
+    } else if (isUaeToPh && invoiceRequest?.quotation_request?.quotation_id && pickupCharge > 0) {
+      // Rule 2b: UAE→PH quoted invoices match the quotation: 5% VAT on pickup
+      const quotedPickupVat = Number(invoiceRequest.quotation_request.quotation_pickup_vat);
+      finalTaxRate = 5;
+      taxAmount = Number.isFinite(quotedPickupVat) && quotedPickupVat > 0
+        ? quotedPickupVat
+        : pickupCharge * 0.05;
+      console.log('✅ Applying 5% VAT on pickup (UAE_TO_PH quotation)');
+      console.log(`   Pickup Charge: ${pickupCharge} AED`);
+      console.log(`   Tax (5% on pickup): ${taxAmount} AED`);
     } else {
       // Rule 3: No tax
       finalTaxRate = 0;
@@ -1638,12 +1768,13 @@ router.post('/', async (req, res) => {
 
     const prepaid = Boolean(prepaidMode) && isUaeToPhCode(invoice.service_code || providedServiceCode);
     const quote = invoiceRequest?.quotation_request;
+    const quoteHasAdvance = remainingQuoteAdvance(invoiceRequest) > 0;
     const gl = await postInvoiceJournal(invoice, {
       actorId: created_by,
       customerName: populatedInvoice?.client_id?.company_name,
       draftJournalId: quote?.draft_journal_id,
       quotationNumber: quote?.draft_journal_id ? quote.quotation_number : undefined,
-      gatewayMode: prepaid ? prepaidMode : undefined,
+      gatewayMode: prepaid && !quoteHasAdvance ? prepaidMode : undefined,
     });
     populatedInvoice.gl_sync = invoice.gl_sync;
     if (gl.status === 'POSTED') {
@@ -1710,9 +1841,43 @@ router.post('/', async (req, res) => {
       }
     }
 
-    // Prepaid UAE→PH: settle the invoice now (after EMPOST so its payload is unchanged)
+    // Prepaid UAE→PH or quotation advance: settle after EMPOST so its payload is unchanged
     let prepaidResult;
-    if (prepaid) {
+    const quoteAdvance = quote?.advance;
+    const hasQuoteAdvance = remainingQuoteAdvance(invoiceRequest) > 0;
+    if (hasQuoteAdvance) {
+      if (gl.status !== 'POSTED') {
+        prepaidResult = { status: 'FAILED', error: 'Invoice journal is not posted — record the payment from the invoice page' };
+      } else {
+        try {
+          const fresh = await Invoice.findById(invoice._id);
+          const requestDoc = invoiceRequest && typeof invoiceRequest.save === 'function'
+            ? invoiceRequest
+            : await InvoiceRequest.findById(request_id);
+          const paid = await applyQuoteAdvanceToInvoice(fresh, requestDoc, { actorId: created_by });
+          prepaidResult = paid.error
+            ? { status: 'FAILED', error: paid.error }
+            : paid.skipped
+              ? { status: 'SKIPPED' }
+              : {
+                  status: paid.balance > 0.009 ? 'PARTIAL' : 'PAID',
+                  journal_no: paid.journal?.entry_no,
+                  mode: quoteAdvance.mode,
+                  from_advance: true,
+                };
+          if (!paid.error && !paid.skipped) {
+            const refreshed = await Invoice.findById(invoice._id)
+              .populate('request_id', REQUEST_POPULATE_FIELDS)
+              .populate('client_id', 'company_name contact_name email phone address city country')
+              .populate('created_by', 'full_name email department_id');
+            if (refreshed) populatedInvoice = refreshed;
+          }
+        } catch (paymentError) {
+          console.error('❌ Quotation advance apply failed:', paymentError.message);
+          prepaidResult = { status: 'FAILED', error: paymentError.message };
+        }
+      }
+    } else if (prepaid) {
       if (gl.status !== 'POSTED') {
         prepaidResult = { status: 'FAILED', error: 'Invoice journal is not posted — record the payment from the invoice page' };
       } else {

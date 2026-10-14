@@ -2,7 +2,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const { ManualQuotation, InvoiceRequest } = require('../models');
 const auth = require('../middleware/auth');
-const { upsertQuoteDraftJournal } = require('../services/invoice-gl');
+const { upsertQuoteDraftJournal, recordManualQuotationAdvance } = require('../services/invoice-gl');
 
 const router = express.Router();
 
@@ -277,6 +277,7 @@ function quotePriceFields(quotation) {
     'quotation_request.quotation_shipping_amount': quotation.shipping_amount,
     'quotation_request.quotation_pickup_location': quotation.pickup_location,
     'quotation_request.quotation_pickup_charge': quotation.pickup_charge,
+    'quotation_request.quotation_pickup_vat': quotation.pickup_vat,
     'quotation_request.quotation_delivery_charge': quotation.delivery_charge,
     'quotation_request.quotation_insurance_charge': quotation.insurance_charge,
   };
@@ -346,6 +347,39 @@ router.post('/from-request/:invoiceRequestId', auth, async (req, res) => {
   } catch (error) {
     console.error('Error generating quotation from request:', error);
     res.status(500).json({ success: false, error: 'Failed to generate quotation' });
+  }
+});
+
+router.post('/:id/advance-payment', auth, async (req, res) => {
+  try {
+    if (!canGenerateQuotation(req.user)) {
+      return res.status(403).json({ success: false, error: 'Only Finance can record a quotation advance' });
+    }
+    const quotation = await ManualQuotation.findById(req.params.id);
+    if (!quotation) return res.status(404).json({ success: false, error: 'Quotation not found' });
+
+    const result = await recordManualQuotationAdvance(quotation, {
+      mode: req.body?.mode || req.body?.payment?.mode,
+      amountCollected: req.body?.amount ?? req.body?.payment?.amount,
+      reference: req.body?.reference || req.body?.payment?.reference,
+      collectedAt: req.body?.collected_at || req.body?.paid_at || req.body?.payment?.collected_at,
+      actorId: req.user?.id,
+    });
+    if (result.error) return res.status(400).json({ success: false, error: result.error });
+
+    const fresh = await ManualQuotation.findById(quotation._id).lean();
+    res.json({
+      success: true,
+      data: {
+        quotation: fresh,
+        advance: result.advance,
+        journal_no: result.journal?.entry_no,
+      },
+      message: `Advance recorded · ${result.journal?.entry_no || ''} credited to Customer Payment Due`.trim(),
+    });
+  } catch (error) {
+    console.error('Error recording quotation advance:', error);
+    res.status(500).json({ success: false, error: 'Failed to record advance payment' });
   }
 });
 

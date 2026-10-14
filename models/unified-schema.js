@@ -504,6 +504,12 @@ const invoiceSchema = new mongoose.Schema({
     required: false, // Will be generated in pre-save hook
     unique: true,
   },
+  invoice_origin: {
+    type: String,
+    enum: ['SHIPMENT', 'CANCELLATION'],
+    required: false,
+    default: 'SHIPMENT',
+  },
   awb_number: {
     type: String,
     required: false,

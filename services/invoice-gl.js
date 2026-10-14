@@ -7,6 +7,8 @@ const COLLECTION_LABEL = 'Finance invoice driver collection';
 const RECEIPT_LABEL = 'Finance invoice receipt';
 const PAYMENT_LABEL = 'Finance invoice payment';
 const PAYMENT_VOID_LABEL = 'Finance invoice payment void';
+const ADVANCE_LABEL = 'Quotation advance';
+const ADVANCE_APPLY_LABEL = 'Quotation advance applied';
 
 const glCodes = () => ({
   ar: String(process.env.FINANCE_INVOICE_AR_CODE || '1300').trim(),
@@ -21,6 +23,7 @@ const glCodes = () => ({
   paid: String(process.env.FINANCE_PAID_ACCOUNT_CODE || '1100').trim(),
   tabby: String(process.env.FINANCE_TABBY_CLEARING_CODE || '1320').trim(),
   card: String(process.env.FINANCE_CARD_CLEARING_CODE || '1330').trim(),
+  customerAdvance: String(process.env.FINANCE_CUSTOMER_ADVANCE_CODE || '2310').trim(),
 });
 
 const DEFAULT_ACCOUNTS = {
@@ -36,6 +39,7 @@ const DEFAULT_ACCOUNTS = {
   paid: { name: 'Cash at Bank', type: 'Asset', subtype: 'Bank' },
   tabby: { name: 'Tabby Receivable (clearing)', type: 'Asset', subtype: 'Receivables' },
   card: { name: 'Card Payments Clearing', type: 'Asset', subtype: 'Receivables' },
+  customerAdvance: { name: 'Customer Payment Due', type: 'Liability', subtype: 'Current' },
 };
 
 const PAYMENT_MODES = {
@@ -169,9 +173,8 @@ function isPhToUaeInvoice(invoice) {
   return /PH[\s_-]*TO[\s_-]*UAE/i.test(String(invoice.service_code || ''));
 }
 
-// Splits net revenue (total − VAT) into shipping / pickup / delivery. Insurance is shown on the invoice as
-// its own charge but booked under delivery. Lines are scaled to the net figure so VAT-inclusive invoices
-// (UAE→PH Flomic/Personal) still balance; any rounding difference lands on the largest line.
+// Splits net revenue (total − VAT) into GL sales lines. PH→UAE keeps delivery on 4030.
+// UAE→PH: delivery and insurance stay on the invoice, but the journal books them in shipping (4010).
 function invoiceRevenueSplit(invoice, revenue) {
   const shipping = toAmount(invoice.amount);
   const pickup = toAmount(invoice.pickup_charge);
@@ -187,7 +190,11 @@ function invoiceRevenueSplit(invoice, revenue) {
       if (Math.abs(withPickup - revenue) >= 0.01 && Math.abs(shipping + codDelivery - revenue) < 0.01) parts.pickup = 0;
     }
   } else {
-    parts = { shipping, pickup, delivery: delivery + toAmount(invoice.insurance_charge) };
+    parts = {
+      shipping: shipping + delivery + toAmount(invoice.insurance_charge),
+      pickup,
+      delivery: 0,
+    };
   }
   return scaleRevenueParts(parts, revenue);
 }
@@ -245,11 +252,26 @@ async function saveGlSync(invoice, patch) {
  */
 async function postInvoiceJournal(invoice, { actorId, customerName, draftJournalId, gatewayMode, quotationNumber } = {}) {
   try {
-    if (invoice.gl_sync?.status === 'POSTED' && invoice.gl_sync?.journal_id) {
-      return { status: 'POSTED', journal_no: invoice.gl_sync.journal_no, already_posted: true };
-    }
     if (invoice.status === 'CANCELLED') {
       return { status: 'SKIPPED', reason: 'Invoice is cancelled' };
+    }
+    const existingId = invoice.gl_sync?.journal_id;
+    if (existingId && invoice.gl_sync?.status === 'POSTED') {
+      return { status: 'POSTED', journal_no: invoice.gl_sync.journal_no, already_posted: true };
+    }
+    if (existingId && invoice.gl_sync?.status !== 'REVERSED') {
+      const existingJe = await JournalEntry.findById(existingId).select('status entry_no').lean();
+      if (existingJe?.status === 'POSTED') {
+        await saveGlSync(invoice, {
+          status: 'POSTED',
+          journal_id: existingJe._id,
+          journal_no: existingJe.entry_no,
+          posted_total: toAmount(invoice.total_amount),
+          posted_tax: Math.min(toAmount(invoice.tax_amount), toAmount(invoice.total_amount)),
+          last_error: undefined,
+        });
+        return { status: 'POSTED', journal_no: existingJe.entry_no, already_posted: true };
+      }
     }
 
     const total = toAmount(invoice.total_amount);
@@ -324,6 +346,18 @@ async function postInvoiceJournal(invoice, { actorId, customerName, draftJournal
     };
     let journal = null;
     if (draftJournalId && mongoose.isValidObjectId(draftJournalId)) {
+      const draftDoc = await JournalEntry.findById(draftJournalId).select('status entry_no').lean();
+      if (draftDoc?.status === 'POSTED') {
+        await saveGlSync(invoice, {
+          status: 'POSTED',
+          journal_id: draftDoc._id,
+          journal_no: draftDoc.entry_no,
+          posted_total: total,
+          posted_tax: tax,
+          last_error: undefined,
+        });
+        return { status: 'POSTED', journal_id: draftDoc._id, journal_no: draftDoc.entry_no, already_posted: true };
+      }
       journal = await JournalEntry.findOneAndUpdate(
         { _id: draftJournalId, status: 'DRAFT' },
         { $set: { ...posting, entry_date: entryDate } },
@@ -381,16 +415,19 @@ async function upsertQuoteDraftJournal(request, { actorId } = {}) {
     if (total <= 0) return { status: 'SKIPPED', reason: 'Quotation total is zero' };
     const tax = round2(Math.max(0, total - (shipping + pickup + deliveryFee + insurance)));
     const revenue = round2(total - tax);
-    const split = scaleRevenueParts({ shipping, pickup, delivery: deliveryFee + insurance }, revenue);
+    const split = scaleRevenueParts({ shipping: shipping + deliveryFee + insurance, pickup, delivery: 0 }, revenue);
 
     const awb = request.tracking_code || request.awb_number || '';
     const awbText = awb ? ` · AWB ${awb}` : '';
     const qno = q.quotation_number || 'Quotation';
     const customer = request.customer_name || 'Customer';
+    const extras = [];
+    if (deliveryFee > 0) extras.push(`delivery AED ${deliveryFee.toFixed(2)}`);
+    if (insurance > 0) extras.push(`insurance AED ${insurance.toFixed(2)}`);
     const lineText = {
-      shipping: `Shipping ${q.quotation_chargeable_weight || 0} kg × AED ${q.quotation_rate_per_kg || 0}/kg${awbText}`,
+      shipping: `Shipping ${q.quotation_chargeable_weight || 0} kg × AED ${q.quotation_rate_per_kg || 0}/kg${extras.length ? ` (incl. ${extras.join(', ')})` : ''}${awbText}`,
       pickup: `Pickup charge (${PICKUP_LOCATION_TEXT[q.quotation_pickup_location] || 'pickup'})${awbText}`,
-      delivery: `Delivery fee${insurance > 0 ? ` + insurance AED ${insurance.toFixed(2)}` : ''}${awbText}`,
+      delivery: `Delivery fee${awbText}`,
     };
 
     const [arGl, vatGl, ...revenueGls] = await Promise.all([
@@ -835,6 +872,14 @@ async function recordInvoicePayment(
     }
   }
 
+  const InvoiceRequest = mongoose.models.InvoiceRequest;
+  if (InvoiceRequest && invoice.request_id) {
+    const requestDoc = await InvoiceRequest.findById(invoice.request_id).select('quotation_request.advance').lean();
+    if (remainingQuoteAdvance(requestDoc) > 0.009) {
+      return { error: 'This quotation already has an advance in Customer Payment Due. Generate/apply the invoice offset instead of recording a second cash receipt.' };
+    }
+  }
+
   const { total, paid, balance } = invoicePaymentSummary(invoice);
   if (balance <= 0.009) return { error: 'This invoice is already fully paid' };
 
@@ -971,6 +1016,282 @@ async function updateInvoicePaymentDate(invoice, paymentId, collectedAt) {
   return { payment };
 }
 
+function quoteAdvanceOf(request) {
+  return request?.quotation_request?.advance || null;
+}
+
+function remainingQuoteAdvance(request) {
+  const adv = quoteAdvanceOf(request);
+  if (!adv?.journal_id || adv.void_journal_id) return 0;
+  return round2(Math.max(0, round2(Number(adv.amount) || 0) - round2(Number(adv.applied_amount) || 0)));
+}
+
+/** Cash in: Dr bank/cash/card · Cr Customer Payment Due (2310). Parked until the invoice posts. */
+async function recordQuoteAdvance(
+  invoiceRequest,
+  { mode, amountCollected, reference, collectedAt, actorId } = {}
+) {
+  const quote = invoiceRequest?.quotation_request;
+  if (!quote?.quotation_id) {
+    return { error: 'Generate the quotation first' };
+  }
+  if (quote.cancelled_at || invoiceRequest.status === 'CANCELLED') return { error: 'This quotation was cancelled' };
+  if (invoiceRequest.status === 'COMPLETED') {
+    return { error: 'An invoice was already generated for this quotation' };
+  }
+  if (quote.advance?.journal_id && !quote.advance?.void_journal_id) {
+    return { error: `Advance ${quote.advance.journal_no || ''} is already recorded on this quotation`.trim() };
+  }
+
+  const modeKey = String(mode || '').toUpperCase();
+  const baseConfig = PAYMENT_MODES[modeKey];
+  if (!baseConfig) return { error: 'Choose how the customer paid: Cash, Bank transfer, Card payment or Tabby' };
+  const config = modeKey === 'CASH' ? { ...baseConfig, debitRole: 'remitted' } : baseConfig;
+  const quoteTotal = round2(Number(quote.quotation_total) || 0);
+  const collected = round2(Number(amountCollected) || quoteTotal);
+  if (!(collected > 0)) return { error: 'Enter the advance amount' };
+  if (quoteTotal > 0 && collected > quoteTotal + 0.009) {
+    return { error: `Advance cannot be more than the quotation total AED ${quoteTotal.toFixed(2)}` };
+  }
+  const dated = assertPaymentDate(collectedAt || new Date());
+  if (dated.error) return dated;
+  const when = dated.when;
+  const actor = await resolveActor(actorId);
+  const [debitGl, advanceGl] = await Promise.all([
+    resolveAccount(config.debitRole),
+    resolveAccount('customerAdvance'),
+  ]);
+  const quoteNo = quote.quotation_number || 'quotation';
+  const refText = reference ? ` · ${String(reference).trim()}` : '';
+  const journal = await createJournalWithNextNo(when, {
+    memo: `Advance on ${quoteNo} via ${config.label}`,
+    source: 'PAYMENT',
+    status: 'POSTED',
+    lines: [
+      {
+        account_id: debitGl._id,
+        account_code: debitGl.code,
+        account_name: debitGl.name,
+        description: `${config.label} advance ${quoteNo}${refText}`,
+        debit: collected,
+        credit: 0,
+      },
+      {
+        account_id: advanceGl._id,
+        account_code: advanceGl.code,
+        account_name: advanceGl.name,
+        description: `Customer Payment Due ${quoteNo}`,
+        debit: 0,
+        credit: collected,
+      },
+    ],
+    total_debit: collected,
+    total_credit: collected,
+    posted_at: when,
+    createdAt: when,
+    updatedAt: when,
+    source_reference: quoteNo,
+    source_label: ADVANCE_LABEL,
+    ...actor,
+  });
+  await adjustWalletBalances(journal.lines);
+
+  const advance = {
+    amount: collected,
+    mode: modeKey,
+    reference: reference ? String(reference).trim() : undefined,
+    collected_at: when,
+    recorded_at: when,
+    recorded_by_name: actor.created_by_name,
+    journal_id: journal._id,
+    journal_no: journal.entry_no,
+  };
+  invoiceRequest.quotation_request.advance = advance;
+  invoiceRequest.markModified('quotation_request');
+  await invoiceRequest.save();
+  if (quote.quotation_id) {
+    try {
+      const { ManualQuotation } = require('../models');
+      await ManualQuotation.findByIdAndUpdate(quote.quotation_id, { $set: { advance } });
+    } catch (_) {
+      /* quotation copy is optional */
+    }
+  }
+  return { journal, advance };
+}
+
+async function recordManualQuotationAdvance(quotation, opts = {}) {
+  if (!quotation) return { error: 'Quotation not found' };
+  if (quotation.advance?.journal_id && !quotation.advance?.void_journal_id) {
+    return { error: `Advance ${quotation.advance.journal_no || ''} is already recorded on this quotation`.trim() };
+  }
+  if (quotation.invoice_request_id) {
+    const InvoiceRequest = mongoose.models.InvoiceRequest || require('../models').InvoiceRequest;
+    const invoiceRequest = await InvoiceRequest.findById(quotation.invoice_request_id);
+    if (!invoiceRequest) return { error: 'Linked invoice request not found' };
+    if (!invoiceRequest.quotation_request) invoiceRequest.quotation_request = {};
+    if (!invoiceRequest.quotation_request.quotation_id) {
+      invoiceRequest.quotation_request.quotation_id = quotation._id;
+      invoiceRequest.quotation_request.quotation_number = quotation.quotation_number;
+      invoiceRequest.quotation_request.stage = 'QUOTED';
+    }
+    if (!invoiceRequest.quotation_request.quotation_total) {
+      invoiceRequest.quotation_request.quotation_total = quotation.total_amount;
+    }
+    return recordQuoteAdvance(invoiceRequest, {
+      ...opts,
+      amountCollected: opts.amountCollected || quotation.total_amount,
+    });
+  }
+
+  const fakeRequest = {
+    status: 'QUOTATION_REQUEST',
+    quotation_request: {
+      stage: 'QUOTED',
+      quotation_id: quotation._id,
+      quotation_number: quotation.quotation_number,
+      quotation_total: quotation.total_amount,
+      advance: quotation.advance,
+    },
+    markModified() {},
+    async save() {
+      quotation.advance = this.quotation_request.advance;
+      quotation.markModified('advance');
+      await quotation.save();
+    },
+  };
+  return recordQuoteAdvance(fakeRequest, {
+    ...opts,
+    amountCollected: opts.amountCollected || quotation.total_amount,
+  });
+}
+
+/**
+ * Invoice JE already posted: Dr Customer Payment Due · Cr AR for the full remaining advance
+ * so 2310 is cleared. Payment journal entry_date and createdAt stay on the day the advance was recorded.
+ */
+async function applyQuoteAdvanceToInvoice(invoice, invoiceRequest, { actorId } = {}) {
+  const adv = quoteAdvanceOf(invoiceRequest);
+  if (!adv?.journal_id || adv.void_journal_id) return { skipped: true };
+  if (invoice.gl_sync?.status !== 'POSTED') {
+    return { error: 'Post the invoice journal first' };
+  }
+  const alreadyApplied = round2(Number(adv.applied_amount) || 0);
+  const remainingAdvance = remainingQuoteAdvance(invoiceRequest);
+  if (!(remainingAdvance > 0)) {
+    return { skipped: true, reason: 'advance fully applied', journal_no: adv.applied_journal_no };
+  }
+  const { total, paid, balance } = invoicePaymentSummary(invoice);
+  const applied = remainingAdvance;
+  const when = parsePaymentDate(adv.collected_at || adv.recorded_at || new Date());
+  const actor = await resolveActor(actorId);
+  const [advanceGl, arGl] = await Promise.all([
+    resolveAccount('customerAdvance'),
+    resolveAccount('ar'),
+  ]);
+  const ref = invoiceRef(invoice);
+  const quoteNo = invoiceRequest.quotation_request?.quotation_number || '';
+  const journal = await createJournalWithNextNo(when, {
+    memo: `Apply quotation advance ${quoteNo} to ${ref}`,
+    source: 'PAYMENT',
+    status: 'POSTED',
+    lines: [
+      {
+        account_id: advanceGl._id,
+        account_code: advanceGl.code,
+        account_name: advanceGl.name,
+        description: `Clear Customer Payment Due ${quoteNo} → ${ref}`,
+        debit: applied,
+        credit: 0,
+      },
+      {
+        account_id: arGl._id,
+        account_code: arGl.code,
+        account_name: arGl.name,
+        description: `Clear AR ${ref} from quotation advance`,
+        debit: 0,
+        credit: applied,
+      },
+    ],
+    total_debit: applied,
+    total_credit: applied,
+    posted_at: when,
+    createdAt: when,
+    updatedAt: when,
+    source_reference: ref,
+    source_label: ADVANCE_APPLY_LABEL,
+    ...actor,
+  });
+  const modeKey = PAYMENT_MODES[String(adv.mode || '').toUpperCase()]
+    ? String(adv.mode).toUpperCase()
+    : 'BANK_TRANSFER';
+  const payment = {
+    mode: modeKey,
+    payment_type: applied >= balance - 0.009 || balance <= 0.009 ? 'FULL' : 'PARTIAL',
+    amount_collected: applied,
+    amount_applied: applied,
+    gateway_charge: 0,
+    gateway_net: 0,
+    gateway_vat: 0,
+    reference: adv.reference,
+    collected_at: when,
+    status: 'POSTED',
+    journal_id: journal._id,
+    journal_no: journal.entry_no,
+    remitted: true,
+    recorded_by_name: actor.created_by_name,
+    recorded_by_email: actor.created_by_email,
+  };
+  const newPaid = round2(paid + applied);
+  const remaining = round2(Math.max(0, total - newPaid));
+  const set = { amount_paid: newPaid, payment_mode: modeKey };
+  if (remaining <= 0.009) {
+    set.status = 'PAID';
+    set.paid_at = when;
+    if (payment.reference) set.payment_reference = payment.reference;
+  }
+  const Invoice = mongoose.models.Invoice;
+  const updated = await Invoice.findByIdAndUpdate(
+    invoice._id,
+    { $push: { payments: payment }, $set: set },
+    { new: true }
+  );
+  adv.applied_invoice_id = invoice._id;
+  adv.applied_journal_id = journal._id;
+  adv.applied_journal_no = journal.entry_no;
+  adv.applied_amount = round2(alreadyApplied + applied);
+  invoiceRequest.markModified('quotation_request');
+  await invoiceRequest.save();
+  return {
+    journal,
+    payment: updated.payments[updated.payments.length - 1],
+    invoice: updated,
+    balance: remaining,
+  };
+}
+
+async function reverseQuoteAdvance(invoiceRequest, { actorId, reason } = {}) {
+  const adv = quoteAdvanceOf(invoiceRequest);
+  if (!adv?.journal_id || adv.void_journal_id) return { skipped: true };
+  if (adv.applied_journal_id) return { error: 'Advance already applied to an invoice' };
+  const original = await JournalEntry.findById(adv.journal_id).lean();
+  if (!original || original.status !== 'POSTED') return { skipped: true };
+  const actor = await resolveActor(actorId);
+  const quoteNo = invoiceRequest.quotation_request?.quotation_number || 'quotation';
+  const reversal = await reverseJournal(original, {
+    ref: quoteNo,
+    actor,
+    reason: reason || 'quotation cancelled',
+    label: ADVANCE_LABEL,
+  });
+  await adjustWalletBalances(reversal.lines);
+  adv.void_journal_id = reversal._id;
+  adv.void_journal_no = reversal.entry_no;
+  invoiceRequest.markModified('quotation_request');
+  await invoiceRequest.save();
+  return { journal: reversal };
+}
+
 /** Undo a mistaken payment entry: reversing journal, balance reopened. Remitted cash can't be voided. */
 async function voidInvoicePayment(invoice, paymentId, { actorId, reason } = {}) {
   const payment = (invoice.payments || []).find((p) => String(p._id) === String(paymentId));
@@ -1028,6 +1349,11 @@ module.exports = {
   syncInvoiceLedger,
   recordInvoicePayment,
   updateInvoicePaymentDate,
+  recordQuoteAdvance,
+  recordManualQuotationAdvance,
+  applyQuoteAdvanceToInvoice,
+  remainingQuoteAdvance,
+  reverseQuoteAdvance,
   voidInvoicePayment,
   invoicePaymentSummary,
   invoiceNetTotal,

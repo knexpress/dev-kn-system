@@ -15,8 +15,12 @@ const {
   isUaeToPhCode,
   postInvoiceJournal,
   recordInvoicePayment,
+  recordQuoteAdvance,
+  applyQuoteAdvanceToInvoice,
+  reverseQuoteAdvance,
   PAYMENT_MODES,
 } = require('../services/invoice-gl');
+const { raiseCancellationInvoice } = require('../services/cancellation-invoice');
 
 const router = express.Router();
 
@@ -1598,8 +1602,10 @@ router.put('/:id/status', async (req, res) => {
     if (status === 'COMPLETED') {
       invoiceRequest.invoice_generated_at = new Date();
       
-      // Automatically create collection entry when invoice is generated (prepaid UAE→PH has nothing to collect)
-      if (!isPrepaidQuotedRequest(invoiceRequest) && (invoiceRequest.invoice_amount || invoiceRequest.financial?.invoice_amount)) {
+      const quoteAdvance = invoiceRequest.quotation_request?.advance;
+      const hasQuoteAdvance = Boolean(quoteAdvance?.journal_id) && !quoteAdvance?.void_journal_id;
+      // Automatically create collection entry when invoice is generated (prepaid UAE→PH / quotation advance has nothing to collect)
+      if (!isPrepaidQuotedRequest(invoiceRequest) && !hasQuoteAdvance && (invoiceRequest.invoice_amount || invoiceRequest.financial?.invoice_amount)) {
         // Use the auto-generated invoice_number from the invoice request
         const invoiceId = invoiceRequest.invoice_number || `INV-${invoiceRequest._id.toString().slice(-6).toUpperCase()}`;
         const invoiceAmount = invoiceRequest.financial?.invoice_amount || invoiceRequest.invoice_amount;
@@ -3259,6 +3265,45 @@ router.get('/:id/details', async (req, res) => {
 // POST /api/invoice-requests/:id/cancel-shipment
 // Finance cancels a quotation-stage shipment. Never sent to EMPOST.
 // charge=false: mark CANCELLED. charge=true: raise a cancellation invoice and record payment.
+router.post('/:id/advance-payment', auth, async (req, res) => {
+  try {
+    if (!canCancelQuotedShipment(req.user)) {
+      return res.status(403).json({ success: false, error: 'Only Finance can record a quotation advance' });
+    }
+    const invoiceRequest = await InvoiceRequest.findById(req.params.id);
+    if (!invoiceRequest) return res.status(404).json({ success: false, error: 'Invoice request not found' });
+    if (invoiceRequest.status === 'COMPLETED' || invoiceRequest.status === 'CANCELLED') {
+      return res.status(400).json({
+        success: false,
+        error: 'Cannot record an advance after the invoice is generated or the shipment is cancelled',
+      });
+    }
+
+    const result = await recordQuoteAdvance(invoiceRequest, {
+      mode: req.body?.mode || req.body?.payment?.mode,
+      amountCollected: req.body?.amount ?? req.body?.payment?.amount,
+      reference: req.body?.reference || req.body?.payment?.reference,
+      collectedAt: req.body?.collected_at || req.body?.paid_at || req.body?.payment?.collected_at,
+      actorId: req.user?.id,
+    });
+    if (result.error) return res.status(400).json({ success: false, error: result.error });
+
+    requestCache.clear();
+    res.json({
+      success: true,
+      data: {
+        invoice_request: normalizeInvoiceRequest(invoiceRequest),
+        advance: result.advance,
+        journal_no: result.journal?.entry_no,
+      },
+      message: `Advance recorded · ${result.journal?.entry_no || ''} credited to Customer Payment Due`.trim(),
+    });
+  } catch (error) {
+    console.error('Error recording quotation advance:', error);
+    res.status(500).json({ success: false, error: 'Failed to record advance payment' });
+  }
+});
+
 router.post('/:id/cancel-shipment', auth, async (req, res) => {
   try {
     if (!canCancelQuotedShipment(req.user)) {
@@ -3305,91 +3350,28 @@ router.post('/:id/cancel-shipment', auth, async (req, res) => {
     let paymentMode = null;
 
     if (charge) {
-      const net = roundMoney(req.body?.amount);
-      if (!(net > 0)) {
-        return res.status(400).json({ success: false, error: 'Enter the cancellation fee to charge' });
-      }
-      const vatRate = Number(req.body?.vat_rate) === 5 ? 5 : 0;
-      const vat = roundMoney(net * (vatRate / 100));
-      total = roundMoney(net + vat);
-      paymentMode = String(req.body?.payment?.mode || req.body?.payment_mode || '').toUpperCase();
-      if (!PAYMENT_MODES[paymentMode]) {
-        return res.status(400).json({
-          success: false,
-          error: 'Choose how the customer paid: Cash, Bank transfer, Card payment or Tabby',
-        });
-      }
-      const paymentReference = (req.body?.payment?.reference || req.body?.payment_reference || '').toString().trim();
-
-      const client = await ensureClientFromInvoiceRequest(invoiceRequest);
-      const awb = invoiceRequest.tracking_code || invoiceRequest.awb_number || '';
-      const description = 'Shipment cancellation fee';
-      const due = new Date();
-      due.setDate(due.getDate() + 30);
-
-      invoice = new Invoice({
-        request_id: invoiceRequest._id,
-        client_id: client._id,
-        created_by: createdBy,
-        amount: asDecimal(net),
-        pickup_charge: asDecimal(0),
-        delivery_charge: asDecimal(0),
-        insurance_charge: asDecimal(0),
-        tax_rate: vatRate,
-        tax_amount: asDecimal(vat),
-        total_amount: asDecimal(total),
-        issue_date: new Date(),
-        due_date: due,
-        status: 'UNPAID',
-        awb_number: awb || undefined,
-        receiver_name: invoiceRequest.receiver_name || undefined,
-        receiver_address: invoiceRequest.receiver_address || undefined,
-        receiver_phone: invoiceRequest.receiver_phone || undefined,
-        service_code: invoiceRequest.service_code || invoiceRequest.verification?.service_code || undefined,
-        notes: [
-          'Shipment cancelled before processing. This invoice is the cancellation fee only. Not sent to EMPOST.',
-          reason ? `Reason: ${reason}` : '',
-          invoiceRequest.quotation_request?.quotation_number
-            ? `Quotation ${invoiceRequest.quotation_request.quotation_number}`
-            : '',
-        ].filter(Boolean).join(' '),
-        line_items: [{
-          description,
-          quantity: 1,
-          unit_price: asDecimal(net),
-          total: asDecimal(net),
-        }],
-        payment_reference: paymentReference || undefined,
-      });
-      await invoice.save();
-
-      gl = await postInvoiceJournal(invoice, {
+      const raised = await raiseCancellationInvoice({
+        invoiceRequest,
+        amount: req.body?.amount,
+        vatRate: req.body?.vat_rate,
+        reason,
+        payment: req.body?.payment || {
+          mode: req.body?.payment_mode,
+          reference: req.body?.payment_reference,
+          collected_at: req.body?.paid_at,
+        },
         actorId: req.user?.id,
-        customerName: client.company_name,
-        gatewayMode: paymentMode,
-        quotationNumber: invoiceRequest.quotation_request?.quotation_number,
+        actorName,
+        createdBy,
       });
-
-      if (gl.status === 'POSTED') {
-        const paid = await recordInvoicePayment(invoice, {
-          mode: paymentMode,
-          paymentType: 'FULL',
-          amountCollected: total,
-          reference: paymentReference || undefined,
-          collectedAt: req.body?.payment?.collected_at || req.body?.payment?.paid_at,
-          actorId: req.user?.id,
-          prepaid: true,
-        });
-        prepaidResult = paid.error
-          ? { status: 'FAILED', error: paid.error }
-          : { status: 'PAID', journal_no: paid.journal?.entry_no, mode: paymentMode };
-      } else {
-        prepaidResult = { status: 'FAILED', error: gl.error || gl.reason || 'Invoice journal is not posted' };
+      if (raised.error) {
+        return res.status(400).json({ success: false, error: raised.error });
       }
-
-      invoiceRequest.invoice_number = invoice.invoice_id;
-      invoiceRequest.invoice_amount = asDecimal(total);
-      invoiceRequest.invoice_generated_at = new Date();
+      invoice = raised.invoice;
+      gl = raised.gl;
+      prepaidResult = raised.payment;
+      total = raised.total;
+      paymentMode = raised.paymentMode;
     }
 
     invoiceRequest.status = 'CANCELLED';
@@ -3405,6 +3387,10 @@ router.post('/:id/cancel-shipment', auth, async (req, res) => {
       invoiceRequest.quotation_request.cancellation_payment_mode = paymentMode;
     }
     await invoiceRequest.save();
+
+    if (!charge) {
+      await reverseQuoteAdvance(invoiceRequest, { actorId: req.user?.id, reason: 'quotation cancelled without charge' });
+    }
 
     await voidQuoteDraftJournal(invoiceRequest, { actorId: req.user?.id, reason: 'shipment cancelled at quotation' });
     await markBookingCancelled(
