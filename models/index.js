@@ -1308,6 +1308,11 @@ const manualQuotationSchema = new mongoose.Schema({
     required: true,
     enum: ['ACTUAL', 'VOLUMETRIC'],
   },
+  number_of_boxes: {
+    type: Number,
+    required: false,
+    min: 1,
+  },
   items: [{
     box_number: { type: String, required: false, trim: true },
     name: { type: String, required: true, trim: true },

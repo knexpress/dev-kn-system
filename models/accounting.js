@@ -272,6 +272,9 @@ const purchaseOrderLineSchema = new mongoose.Schema(
     unit_cost: { type: Number, required: true, min: 0 },
     received_qty: { type: Number, default: 0, min: 0 },
     line_total: { type: Number, required: true, min: 0 },
+    // Debit GL account for this line; falls back to the PO's debit_account_code when absent
+    account_code: { type: String, required: false, trim: true },
+    account_name: { type: String, required: false },
   },
   { _id: true }
 );

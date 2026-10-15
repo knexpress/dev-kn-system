@@ -208,6 +208,13 @@ function buildQuotationFields(body) {
     return { error: 'Add at least one item' };
   }
 
+  const distinctBoxes = new Set(items.map((item) => item.box_number.toLowerCase())).size;
+  const enteredBoxes = parseInt(body.number_of_boxes, 10);
+  if (body.number_of_boxes !== undefined && body.number_of_boxes !== '' && !(enteredBoxes >= 1)) {
+    return { error: 'Number of boxes must be at least 1' };
+  }
+  const numberOfBoxes = enteredBoxes >= 1 ? enteredBoxes : distinctBoxes;
+
   const ratePerKg = Number(body.rate_per_kg);
   if (!Number.isFinite(ratePerKg) || ratePerKg <= 0) {
     return { error: 'Enter a rate per kg greater than 0' };
@@ -233,6 +240,7 @@ function buildQuotationFields(body) {
       volumetric_weight_kg: roundMoney(volumetricWeight),
       chargeable_weight_kg: roundMoney(chargeableWeight),
       weight_type: actualWeight >= volumetricWeight ? 'ACTUAL' : 'VOLUMETRIC',
+      number_of_boxes: numberOfBoxes,
       items,
       rate_per_kg: roundMoney(ratePerKg),
       rate_bracket: '',

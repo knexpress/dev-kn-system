@@ -1,4 +1,5 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
@@ -584,6 +585,116 @@ router.post('/inventory/items', auth, async (req, res) => {
     }
     console.error('Error creating inventory item:', error);
     res.status(500).json({ success: false, error: 'Failed to create inventory item' });
+  }
+});
+
+// Items with stock movements keep SKU, quantity and cost: those are carried by posted journals.
+router.put('/inventory/items/:id', auth, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, error: 'Invalid item id' });
+    }
+    const item = await InventoryItem.findById(req.params.id);
+    if (!item) {
+      return res.status(404).json({ success: false, error: 'Inventory item not found' });
+    }
+    const movementCount = await InventoryTransaction.countDocuments({ item_id: item._id });
+    const body = req.body || {};
+
+    if (body.name !== undefined) {
+      const itemName = String(body.name || '').trim();
+      if (!itemName) return res.status(400).json({ success: false, error: 'Item name is required' });
+      item.name = itemName;
+    }
+    if (body.unit !== undefined) {
+      item.unit = String(body.unit || 'PCS').trim().toUpperCase() || 'PCS';
+    }
+    if (body.reorder_level !== undefined) {
+      const reorder = toNum(body.reorder_level);
+      if (reorder < 0) return res.status(400).json({ success: false, error: 'Reorder level cannot be negative' });
+      item.reorder_level = reorder;
+    }
+    if (body.is_active !== undefined) {
+      item.is_active = body.is_active !== false && body.is_active !== 'false';
+    }
+    for (const [field, label] of [
+      ['asset_account_code', 'Asset'],
+      ['cogs_account_code', 'COGS'],
+      ['income_account_code', 'Income'],
+    ]) {
+      if (body[field] === undefined) continue;
+      const code = String(body[field] || '').trim();
+      if (!(await Account.exists({ code }))) {
+        return res.status(400).json({ success: false, error: `${label} account not found: ${code}` });
+      }
+      item[field] = code;
+    }
+
+    const lockedChange = [
+      body.sku !== undefined && String(body.sku).trim().toUpperCase() !== item.sku,
+      body.qty_on_hand !== undefined && toNum(body.qty_on_hand) !== item.qty_on_hand,
+      body.avg_cost !== undefined && toNum(body.avg_cost) !== item.avg_cost,
+    ].some(Boolean);
+    if (lockedChange && movementCount > 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'This item has stock movements — change quantity or cost with a stock movement, and the SKU cannot be renamed',
+      });
+    }
+    if (movementCount === 0) {
+      if (body.sku !== undefined) {
+        const itemSku = String(body.sku || '').trim().toUpperCase();
+        if (!/^[A-Z0-9][A-Z0-9._-]{1,31}$/.test(itemSku)) {
+          return res.status(400).json({ success: false, error: 'SKU must be 2–32 characters (letters, numbers, . _ -)' });
+        }
+        if (itemSku !== item.sku && (await InventoryItem.exists({ sku: itemSku, _id: { $ne: item._id } }))) {
+          return res.status(409).json({ success: false, error: `SKU ${itemSku} already exists` });
+        }
+        item.sku = itemSku;
+      }
+      if (body.qty_on_hand !== undefined || body.avg_cost !== undefined) {
+        const qty = body.qty_on_hand !== undefined ? toNum(body.qty_on_hand) : item.qty_on_hand;
+        const cost = body.avg_cost !== undefined ? toNum(body.avg_cost) : item.avg_cost;
+        if (qty < 0 || cost < 0) {
+          return res.status(400).json({ success: false, error: 'Quantity and average cost cannot be negative' });
+        }
+        item.qty_on_hand = qty;
+        item.avg_cost = cost;
+      }
+    }
+
+    await item.save();
+    res.json({ success: true, data: { ...item.toObject(), movement_count: movementCount } });
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(409).json({ success: false, error: 'SKU already exists' });
+    }
+    console.error('Error updating inventory item:', error);
+    res.status(500).json({ success: false, error: 'Failed to update inventory item' });
+  }
+});
+
+router.delete('/inventory/items/:id', auth, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, error: 'Invalid item id' });
+    }
+    const item = await InventoryItem.findById(req.params.id);
+    if (!item) {
+      return res.status(404).json({ success: false, error: 'Inventory item not found' });
+    }
+    const movementCount = await InventoryTransaction.countDocuments({ item_id: item._id });
+    if (movementCount > 0) {
+      return res.status(400).json({
+        success: false,
+        error: `${item.sku} has ${movementCount} stock movement${movementCount === 1 ? '' : 's'} posted to the ledger — mark it inactive instead`,
+      });
+    }
+    await InventoryItem.deleteOne({ _id: item._id });
+    res.json({ success: true, data: { _id: item._id, sku: item.sku } });
+  } catch (error) {
+    console.error('Error deleting inventory item:', error);
+    res.status(500).json({ success: false, error: 'Failed to delete inventory item' });
   }
 });
 
@@ -2007,6 +2118,7 @@ function buildPoLines(rawLines) {
       const quantity = toNum(raw.quantity);
       const unit_cost = toNum(raw.unit_cost);
       const line_total = Number((quantity * unit_cost).toFixed(2));
+      const account_code = String(raw.account_code || '').trim() || undefined;
       return {
         description,
         sku,
@@ -2014,9 +2126,47 @@ function buildPoLines(rawLines) {
         unit_cost,
         received_qty: toNum(raw.received_qty),
         line_total,
+        account_code,
       };
     })
     .filter((l) => l.description && l.quantity > 0);
+}
+
+function poLineAccountCode(po, line) {
+  return String(line.account_code || po.debit_account_code || '1200').trim();
+}
+
+// Splits `net` across debit accounts in proportion to `weights` (Map code -> amount); rounding
+// remainder lands on the largest account so the journal still balances to the cent.
+async function poDebitJournalLines(po, net, weights, description) {
+  const total = [...weights.values()].reduce((s, v) => s + v, 0);
+  const entries =
+    total > 0
+      ? [...weights.entries()].filter(([, v]) => v > 0)
+      : [[String(po.debit_account_code || '1200'), 1]];
+  const weightSum = entries.reduce((s, [, v]) => s + v, 0);
+  const lines = [];
+  let allocated = 0;
+  for (const [code, weight] of entries) {
+    const account = await loadPostableAccount(code);
+    if (!account) return { error: `GL account ${code} is not postable` };
+    const amount = Number(((net * weight) / weightSum).toFixed(2));
+    allocated += amount;
+    lines.push({
+      account_id: account._id,
+      account_code: account.code,
+      account_name: account.name,
+      description,
+      debit: amount,
+      credit: 0,
+    });
+  }
+  const remainder = Number((net - allocated).toFixed(2));
+  if (remainder !== 0 && lines.length) {
+    const largest = lines.reduce((a, b) => (b.debit > a.debit ? b : a));
+    largest.debit = Number((largest.debit + remainder).toFixed(2));
+  }
+  return { lines: lines.filter((l) => l.debit !== 0) };
 }
 
 async function ensurePoAccounts(actor = {}) {
@@ -2113,7 +2263,6 @@ router.post('/purchase-orders', auth, async (req, res) => {
       notes = '',
       debit_account_code = '1200',
       credit_account_code = '2000',
-      submit = false,
       lines: rawLines,
       supplier_invoice_no = '',
       supplier_invoice_date,
@@ -2123,10 +2272,10 @@ router.post('/purchase-orders', auth, async (req, res) => {
 
     const lines = buildPoLines(rawLines);
     const invoiceNo = String(supplier_invoice_no || '').trim();
-    const poDate = supplier_invoice_date
-      ? new Date(supplier_invoice_date)
-      : po_date
-        ? new Date(po_date)
+    const poDate = po_date
+      ? new Date(po_date)
+      : supplier_invoice_date
+        ? new Date(supplier_invoice_date)
         : new Date();
 
     const resolved = await resolvePoSupplier(req.body || {}, actorFromReq(req));
@@ -2155,9 +2304,12 @@ router.post('/purchase-orders', auth, async (req, res) => {
     }
 
     const termsDays = toNum(supplier?.payment_terms_days ?? 30);
+    const invoiceDate = supplier_invoice_date ? new Date(supplier_invoice_date) : null;
     const dueDate = due_date
       ? new Date(due_date)
-      : new Date(poDate.getTime() + termsDays * 24 * 60 * 60 * 1000);
+      : invoiceDate
+        ? new Date(invoiceDate.getTime() + termsDays * 24 * 60 * 60 * 1000)
+        : undefined;
 
     const debitCode = String(debit_account_code || '1200').trim();
     const creditCode = String(credit_account_code || '2000').trim();
@@ -2169,14 +2321,26 @@ router.post('/purchase-orders', auth, async (req, res) => {
         error: 'Debit/credit GL accounts must be postable',
       });
     }
+    for (const line of lines) {
+      const code = line.account_code || debitCode;
+      const account = code === debitCode ? debitAccount : await loadPostableAccount(code);
+      if (!account) {
+        return res.status(400).json({
+          success: false,
+          error: `GL account ${code} on line "${line.description}" is not postable`,
+        });
+      }
+      line.account_code = account.code;
+      line.account_name = account.name;
+    }
 
     const subtotal = Number(lines.reduce((s, l) => s + l.line_total, 0).toFixed(2));
     const tax = Math.max(0, toNum(tax_amount));
     const total = Number((subtotal + tax).toFixed(2));
     const actor = actorFromReq(req);
     const po_no = await nextPurchaseOrderNo(poDate);
-    const shouldSubmit = Boolean(submit);
 
+    // A new PO is always a draft; the supplier invoice is recorded when the delivery arrives.
     const po = await PurchaseOrder.create({
       po_no,
       po_date: poDate,
@@ -2184,11 +2348,11 @@ router.post('/purchase-orders', auth, async (req, res) => {
       ...snapshot,
       supplier_reference: String(supplier_reference || '').trim() || invoiceNo,
       supplier_invoice_no: invoiceNo || undefined,
-      supplier_invoice_date: supplier_invoice_date ? new Date(supplier_invoice_date) : undefined,
+      supplier_invoice_date: invoiceDate || undefined,
       due_date: dueDate,
       receive_later: Boolean(receive_later),
       currency: String(currency || 'AED').trim() || 'AED',
-      status: shouldSubmit ? 'PENDING_APPROVAL' : 'DRAFT',
+      status: 'DRAFT',
       lines,
       subtotal,
       tax_amount: tax,
@@ -2215,12 +2379,83 @@ router.post('/purchase-orders/:id/submit', auth, async (req, res) => {
     if (po.status !== 'DRAFT') {
       return res.status(400).json({ success: false, error: 'Only draft POs can be submitted' });
     }
+    if (!po.supplier_invoice_no) {
+      return res.status(400).json({
+        success: false,
+        error: 'Record the supplier invoice number and date once the delivery arrives',
+      });
+    }
     po.status = 'PENDING_APPROVAL';
     await po.save();
     res.json({ success: true, data: po });
   } catch (error) {
     console.error('Error submitting purchase order:', error);
     res.status(500).json({ success: false, error: 'Failed to submit purchase order' });
+  }
+});
+
+// Delivery received: record the supplier's invoice on the draft PO and send it for approval.
+router.post('/purchase-orders/:id/invoice', auth, async (req, res) => {
+  try {
+    const po = await PurchaseOrder.findById(req.params.id);
+    if (!po) return res.status(404).json({ success: false, error: 'Purchase order not found' });
+    if (po.status !== 'DRAFT') {
+      return res.status(400).json({
+        success: false,
+        error: `PO is ${po.status}; the supplier invoice can only be recorded on a draft PO`,
+      });
+    }
+
+    const body = req.body || {};
+    const invoiceNo = String(body.supplier_invoice_no || '').trim();
+    const invoiceDate = body.supplier_invoice_date ? new Date(body.supplier_invoice_date) : null;
+    if (!invoiceNo) {
+      return res.status(400).json({ success: false, error: 'Supplier invoice number is required' });
+    }
+    if (!invoiceDate || Number.isNaN(invoiceDate.getTime())) {
+      return res.status(400).json({ success: false, error: 'Supplier invoice date is required' });
+    }
+
+    const duplicate = await PurchaseOrder.findOne({
+      _id: { $ne: po._id },
+      ...(po.supplier_id ? { supplier_id: po.supplier_id } : { supplier_name: po.supplier_name }),
+      supplier_invoice_no: new RegExp(`^${escapeRegex(invoiceNo)}$`, 'i'),
+      status: { $nin: ['REJECTED', 'CANCELLED'] },
+    }).lean();
+    if (duplicate) {
+      return res.status(400).json({
+        success: false,
+        error: `Invoice ${invoiceNo} from ${po.supplier_name} is already entered as ${duplicate.po_no}`,
+      });
+    }
+
+    let termsDays = 30;
+    if (po.supplier_id) {
+      const supplier = await Supplier.findById(po.supplier_id).select('payment_terms_days').lean();
+      if (supplier) termsDays = toNum(supplier.payment_terms_days ?? 30);
+    }
+    const dueDate = body.due_date
+      ? new Date(body.due_date)
+      : new Date(invoiceDate.getTime() + termsDays * 24 * 60 * 60 * 1000);
+
+    if (body.tax_amount !== undefined) {
+      const tax = toNum(body.tax_amount);
+      if (tax < 0) return res.status(400).json({ success: false, error: 'VAT cannot be negative' });
+      po.tax_amount = tax;
+      po.total_amount = Number((toNum(po.subtotal) + tax).toFixed(2));
+    }
+
+    po.supplier_invoice_no = invoiceNo;
+    po.supplier_invoice_date = invoiceDate;
+    po.due_date = dueDate;
+    if (!po.supplier_reference) po.supplier_reference = invoiceNo;
+    po.receive_later = false;
+    po.status = 'PENDING_APPROVAL';
+    await po.save();
+    res.json({ success: true, data: po });
+  } catch (error) {
+    console.error('Error recording supplier invoice:', error);
+    res.status(500).json({ success: false, error: 'Failed to record supplier invoice' });
   }
 });
 
@@ -2237,6 +2472,12 @@ router.post('/purchase-orders/:id/approve', auth, async (req, res) => {
         error: `PO is ${po.status} and cannot be approved`,
       });
     }
+    if (!po.supplier_invoice_no) {
+      return res.status(400).json({
+        success: false,
+        error: 'Record the supplier invoice number and date before approving',
+      });
+    }
 
     await ensurePoAccounts(actorFromReq(req));
 
@@ -2250,9 +2491,15 @@ router.post('/purchase-orders/:id/approve', auth, async (req, res) => {
     const subtotal = toNum(po.subtotal);
     const tax = Math.max(0, toNum(po.tax_amount));
     const amount = toNum(po.total_amount) || Number((subtotal + tax).toFixed(2));
-    const entry_no = await nextJournalEntryNo(po.po_date);
+    const entryDate = po.supplier_invoice_date || po.po_date;
+    const entry_no = await nextJournalEntryNo(entryDate);
 
     // Approve creates DRAFT journal. Split VAT Input when tax is present for VAT201.
+    const weights = new Map();
+    for (const line of po.lines) {
+      const code = poLineAccountCode(po, line);
+      weights.set(code, (weights.get(code) || 0) + toNum(line.line_total));
+    }
     const lines = [];
     if (tax > 0) {
       const vatInput = await loadPostableAccount('1310');
@@ -2263,14 +2510,14 @@ router.post('/purchase-orders/:id/approve', auth, async (req, res) => {
         });
       }
       const netDebit = Number((amount - tax).toFixed(2));
-      lines.push({
-        account_id: debitAccount._id,
-        account_code: debitAccount.code,
-        account_name: debitAccount.name,
-        description: `PO ${po.po_no} — ${po.supplier_name} (excl. VAT)`,
-        debit: netDebit > 0 ? netDebit : amount,
-        credit: 0,
-      });
+      const debits = await poDebitJournalLines(
+        po,
+        netDebit > 0 ? netDebit : amount,
+        weights,
+        `PO ${po.po_no} — ${po.supplier_name} (excl. VAT)`
+      );
+      if (debits.error) return res.status(400).json({ success: false, error: debits.error });
+      lines.push(...debits.lines);
       if (netDebit > 0) {
         lines.push({
           account_id: vatInput._id,
@@ -2282,14 +2529,9 @@ router.post('/purchase-orders/:id/approve', auth, async (req, res) => {
         });
       }
     } else {
-      lines.push({
-        account_id: debitAccount._id,
-        account_code: debitAccount.code,
-        account_name: debitAccount.name,
-        description: `PO ${po.po_no} — ${po.supplier_name}`,
-        debit: amount,
-        credit: 0,
-      });
+      const debits = await poDebitJournalLines(po, amount, weights, `PO ${po.po_no} — ${po.supplier_name}`);
+      if (debits.error) return res.status(400).json({ success: false, error: debits.error });
+      lines.push(...debits.lines);
     }
     lines.push({
       account_id: creditAccount._id,
@@ -2305,7 +2547,7 @@ router.post('/purchase-orders/:id/approve', auth, async (req, res) => {
 
     const journal = await JournalEntry.create({
       entry_no,
-      entry_date: po.po_date,
+      entry_date: entryDate,
       memo: `Purchase order ${po.po_no} — ${po.supplier_name}`,
       source: 'PAYMENT',
       status: 'DRAFT',
@@ -2452,6 +2694,9 @@ async function receiveIntoPo(po, receipts, actor) {
   if (!debitAccount || !creditAccount || (toNum(po.tax_amount) > 0 && !vatInput)) {
     return { error: 'Linked GL accounts are not postable' };
   }
+  for (const code of new Set(po.lines.map((l) => poLineAccountCode(po, l)))) {
+    if (!(await loadPostableAccount(code))) return { error: `GL account ${code} is not postable` };
+  }
 
   const inventoryTxns = [];
   const receivePlan = [];
@@ -2551,16 +2796,19 @@ async function receiveIntoPo(po, receipts, actor) {
     const deltaNet = Number((deltaGross - deltaTax).toFixed(2));
 
     if (deltaGross > 0.009) {
-      const lines = [
-        {
-          account_id: debitAccount._id,
-          account_code: debitAccount.code,
-          account_name: debitAccount.name,
-          description: `Goods received PO ${po.po_no} — ${po.supplier_name}`,
-          debit: deltaNet,
-          credit: 0,
-        },
-      ];
+      const weights = new Map();
+      for (const { line, qty } of receivePlan) {
+        const code = poLineAccountCode(po, line);
+        weights.set(code, (weights.get(code) || 0) + qty * toNum(line.unit_cost));
+      }
+      const debits = await poDebitJournalLines(
+        po,
+        deltaNet,
+        weights,
+        `Goods received PO ${po.po_no} — ${po.supplier_name}`
+      );
+      if (debits.error) return { error: debits.error };
+      const lines = [...debits.lines];
       if (deltaTax > 0) {
         lines.push({
           account_id: vatInput._id,
@@ -4796,11 +5044,24 @@ async function nextVat201ReturnNo(periodEnd) {
   return `${prefix}${String(nextNum).padStart(3, '0')}`;
 }
 
+// Posted journals from booking/shipment invoices (services/invoice-gl.js, services/invoice-notes.js).
+// Reading the journals keeps cancellations, edits, notes and gateway charges in the period they were booked.
+const SHIPMENT_VAT_JOURNAL_KINDS = {
+  'Finance invoice': 'SHIPMENT_INVOICE',
+  'Finance invoice reversal': 'SHIPMENT_INVOICE_REVERSAL',
+  'Finance invoice payment': 'GATEWAY_CHARGE',
+  'Finance invoice payment void': 'GATEWAY_CHARGE_VOID',
+  'Finance credit note': 'CREDIT_NOTE',
+  'Finance debit note': 'DEBIT_NOTE',
+  'Finance note void': 'NOTE_VOID',
+};
+const UAE_STANDARD_VAT_RATE = 0.05;
+
 async function computeVat201Period(period_start, period_end) {
   const invoiceStatuses = ['APPROVED', 'PARTIALLY_PAID', 'PAID'];
   const poStatuses = ['APPROVED', 'PARTIALLY_RECEIVED', 'RECEIVED', 'CLOSED'];
 
-  const [invoices, customers, purchaseOrders, journals] = await Promise.all([
+  const [invoices, customers, purchaseOrders, journals, shipmentJournals] = await Promise.all([
     SalesInvoice.find({
       status: { $in: invoiceStatuses },
       invoice_date: { $gte: period_start, $lte: period_end },
@@ -4819,8 +5080,18 @@ async function computeVat201Period(period_start, period_end) {
       status: 'POSTED',
       entry_date: { $gte: period_start, $lte: period_end },
       $or: [{ 'lines.account_code': '2200' }, { 'lines.account_code': '1310' }],
+      // Settling a filed return clears 2200/1310 against the bank; it is not tax for this period.
+      source_label: { $ne: 'VAT201 settlement' },
     })
       .select('entry_no entry_date source_reference source_label lines memo')
+      .lean(),
+    JournalEntry.find({
+      status: 'POSTED',
+      entry_date: { $gte: period_start, $lte: period_end },
+      source_label: { $in: Object.keys(SHIPMENT_VAT_JOURNAL_KINDS) },
+    })
+      .sort({ entry_date: 1, entry_no: 1 })
+      .select('_id entry_no entry_date source_reference source_label lines memo')
       .lean(),
   ]);
 
@@ -4885,6 +5156,55 @@ async function computeVat201Period(period_start, period_end) {
       status: inv.status,
     });
   }
+
+  // Shipment invoices are supplied from the Dubai establishment, so standard-rated value goes to box 1b.
+  // Revenue lines (4xxx) are the supply value; the part carrying 5% VAT is standard-rated, the rest zero-rated.
+  let shipmentCount = 0;
+  for (const je of shipmentJournals) {
+    let vat = 0;
+    let revenue = 0;
+    for (const line of je.lines || []) {
+      const code = String(line.account_code || '');
+      const net = toNum(line.credit) - toNum(line.debit);
+      if (code === '2200') vat += net;
+      else if (code.startsWith('4')) revenue += net;
+    }
+    vat = Number(vat.toFixed(2));
+    revenue = Number(revenue.toFixed(2));
+    if (vat === 0 && revenue === 0) continue;
+
+    let standard = 0;
+    let zero = revenue;
+    if (vat !== 0) {
+      standard = Number((vat / UAE_STANDARD_VAT_RATE).toFixed(2));
+      if (Math.abs(standard) > Math.abs(revenue) || Math.abs(revenue - standard) < 0.05) standard = revenue;
+      zero = Number((revenue - standard).toFixed(2));
+    }
+
+    const kind = SHIPMENT_VAT_JOURNAL_KINDS[je.source_label] || 'SHIPMENT_INVOICE';
+    const memoCustomer = String(je.memo || '').split(' — ')[1];
+    emirateSupplies['1b'] = Number((emirateSupplies['1b'] + standard).toFixed(2));
+    standardSupplies = Number((standardSupplies + standard).toFixed(2));
+    zeroRatedSupplies = Number((zeroRatedSupplies + zero).toFixed(2));
+    outputVat = Number((outputVat + vat).toFixed(2));
+    if (kind === 'SHIPMENT_INVOICE') shipmentCount += 1;
+
+    salesSources.push({
+      type: kind,
+      id: je._id,
+      ref: je.source_reference || je.entry_no,
+      date: je.entry_date,
+      customer: memoCustomer ? memoCustomer.replace(/\s*\(.*\)$/, '').trim() : je.source_label,
+      customer_trn: null,
+      emirate_box: '1b',
+      taxable_supplies: standard,
+      zero_rated: zero,
+      output_vat: vat,
+      journal_no: je.entry_no,
+      status: 'POSTED',
+    });
+  }
+  salesSources.sort((a, b) => new Date(a.date) - new Date(b.date));
 
   const box1Total = Object.values(emirateSupplies).reduce((s, v) => s + v, 0);
   const box3 = Number(box1Total.toFixed(2)); // + tourist refunds (box2=0)
@@ -5004,6 +5324,8 @@ async function computeVat201Period(period_start, period_end) {
       purchase_orders: purchaseSources,
       vat_traders_count: vatTraders.length,
       sales_count: salesSources.length,
+      sales_invoice_count: invoices.length,
+      shipment_invoice_count: shipmentCount,
       purchase_count: purchaseSources.length,
     },
     gl_reconciliation: {

@@ -269,6 +269,45 @@ async function postRefundJournal(note, amount, mode, reference, actor) {
 }
 
 /**
+ * Re-issue the invoice in EMPOST with the figures after posted credit / debit notes. Never throws; failures
+ * land on invoice.empost_sync so they show in the EMPOST pending list for retry.
+ */
+async function syncNoteToEmpost(invoiceId, noteNo) {
+  const {
+    markEmpostShipmentOk,
+    markEmpostShipmentFailed,
+    markEmpostInvoiceOk,
+    markEmpostInvoiceFailed,
+    hasValidUhawb,
+  } = require('../utils/empost-sync-status');
+  const invoice = await Invoice()
+    .findById(invoiceId)
+    .populate('client_id', 'company_name contact_name email phone address city country');
+  if (!invoice || invoice.status === 'CANCELLED') return { status: 'SKIPPED' };
+  try {
+    const empostAPI = require('./empost-api');
+    if (!hasValidUhawb(invoice)) {
+      try {
+        const shipment = await empostAPI.createShipment(invoice);
+        const uhawb = shipment?.data?.uhawb;
+        if (uhawb && uhawb !== 'N/A') markEmpostShipmentOk(invoice, uhawb);
+      } catch (error) {
+        markEmpostShipmentFailed(invoice, error);
+      }
+    }
+    await empostAPI.issueInvoice(invoice);
+    markEmpostInvoiceOk(invoice);
+    await invoice.save();
+    return { status: 'OK' };
+  } catch (error) {
+    console.error(`❌ EMPOST re-issue after ${noteNo} failed for ${invoice.invoice_id}:`, error.message);
+    markEmpostInvoiceFailed(invoice, error);
+    await invoice.save().catch(() => {});
+    return { status: 'FAILED', error: error.message };
+  }
+}
+
+/**
  * Align amount_paid / status with the amount due after notes. Invoices still settled only through the older
  * Collect / Paid buttons keep their status (moving them back to UNPAID would reverse those receipts).
  */
@@ -361,12 +400,14 @@ async function approveInvoiceNote(noteId, { refund_mode, refund_reference } = {}
 
   const posted = await InvoiceNote.findByIdAndUpdate(note._id, { $set: set }, { new: true });
   const updatedInvoice = await refreshInvoiceSettlement(invoice._id);
+  const empost = await syncNoteToEmpost(invoice._id, posted.note_no);
   return {
     note: posted,
     journal,
     refund_journal: refundJournal,
     refund_failed: refundAmount > 0.009 && !refundJournal,
     invoice: updatedInvoice,
+    empost,
   };
 }
 
@@ -427,7 +468,8 @@ async function voidInvoiceNote(noteId, reason, userId) {
   await Invoice().updateOne({ _id: invoice._id }, { $inc: inc });
   const voided = await InvoiceNote.findByIdAndUpdate(note._id, { $set: set }, { new: true });
   const updatedInvoice = await refreshInvoiceSettlement(invoice._id);
-  return { note: voided, invoice: updatedInvoice };
+  const empost = await syncNoteToEmpost(invoice._id, voided.note_no);
+  return { note: voided, invoice: updatedInvoice, empost };
 }
 
 /** Notes that block cancelling / deleting the invoice. */

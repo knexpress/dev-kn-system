@@ -173,14 +173,16 @@ function isPhToUaeInvoice(invoice) {
   return /PH[\s_-]*TO[\s_-]*UAE/i.test(String(invoice.service_code || ''));
 }
 
-// Splits net revenue (total − VAT) into GL sales lines. PH→UAE keeps delivery on 4030.
+// Splits net revenue (total − VAT) into GL sales lines. PH→UAE and cancellation (domestic delivery) fees go to 4030.
 // UAE→PH: delivery and insurance stay on the invoice, but the journal books them in shipping (4010).
 function invoiceRevenueSplit(invoice, revenue) {
   const shipping = toAmount(invoice.amount);
   const pickup = toAmount(invoice.pickup_charge);
   const delivery = toAmount(invoice.delivery_charge);
   let parts;
-  if (isPhToUaeInvoice(invoice)) {
+  if (invoice.invoice_origin === 'CANCELLATION') {
+    parts = { shipping: 0, pickup: 0, delivery: delivery > 0 ? delivery : shipping };
+  } else if (isPhToUaeInvoice(invoice)) {
     if (Number(invoice.tax_rate) === 5) {
       parts = { shipping: 0, pickup: 0, delivery };
     } else {
@@ -315,7 +317,7 @@ async function postInvoiceJournal(invoice, { actorId, customerName, draftJournal
         description:
           part.role === 'gateway'
             ? `${gatewayConfig.label} charge ${Math.round(gatewayConfig.rate * 100)}% (included in total) ${ref}${awb}`
-            : `${REVENUE_LINE_TEXT[part.role]} ${ref}${awb}`,
+            : `${invoice.invoice_origin === 'CANCELLATION' && part.role === 'delivery' ? 'Domestic delivery fees' : REVENUE_LINE_TEXT[part.role]} ${ref}${awb}`,
         debit: 0,
         credit: part.amount,
       })),

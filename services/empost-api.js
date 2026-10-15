@@ -612,7 +612,11 @@ class EMpostAPIService {
       } else {
         // Needs mapping (from invoice object)
       console.log('📄 Issuing invoice in EMpost for invoice:', invoice.invoice_id);
-        invoiceData = this.mapInvoiceToEMpostInvoice(invoice);
+        const adjustments = await this.invoiceNoteAdjustments(invoice);
+        if (adjustments.notes.length) {
+          console.log(`   Including notes ${adjustments.notes.join(', ')}: net ${adjustments.net}, VAT ${adjustments.vat}`);
+        }
+        invoiceData = this.mapInvoiceToEMpostInvoice(invoice, adjustments);
       }
       
       const headers = await this.getAuthHeaders();
@@ -644,11 +648,16 @@ class EMpostAPIService {
    */
   mapInvoiceToShipment(invoice) {
     const isPhToUae = (invoice.service_code || '').toUpperCase().includes('PH_TO_UAE');
+    const isDomesticDelivery = invoice.invoice_origin === 'CANCELLATION';
     const client = invoice.client_id;
     const clientAddress = this.parseAddress(client.address || '');
     
-    // Get receiver address
-    const receiverAddress = this.parseAddress(invoice.receiver_address || '');
+    // Cancelled UAE→PH goods are delivered back to the customer in the UAE
+    const domesticToClient = isDomesticDelivery && !isPhToUae;
+    const receiverAddress = domesticToClient
+      ? { ...clientAddress, countryCode: 'AE' }
+      : this.parseAddress(invoice.receiver_address || '');
+    if (isDomesticDelivery) receiverAddress.countryCode = 'AE';
     
     // Calculate dimensions from volume (CBM)
     // Assuming 1 CBM = 100cm x 100cm x 100cm as default
@@ -662,7 +671,7 @@ class EMpostAPIService {
     // Determine shipping type (DOM or INT) based on origin and destination
     const originCountry = this.extractCountryFromAddress(invoice.origin_place || '');
     const destinationCountry = this.extractCountryFromAddress(invoice.destination_place || invoice.receiver_address || '');
-    const shippingType = (originCountry && destinationCountry && 
+    const shippingType = isDomesticDelivery || (originCountry && destinationCountry &&
       originCountry.toLowerCase() === destinationCountry.toLowerCase()) ? 'DOM' : 'INT';
     
     // Get product category from shipment type
@@ -725,14 +734,22 @@ class EMpostAPIService {
         line3: this.truncateField(clientAddress.line3 || '', 250, ''),
       },
       receiver: {
-        name: invoice.receiver_name || 'N/A',
+        name: (domesticToClient ? client.contact_name || client.company_name : invoice.receiver_name) || 'N/A',
         email: '',
-        phone: invoice.receiver_phone || '+971500000000',
+        phone: (domesticToClient ? client.phone : invoice.receiver_phone) || '+971500000000',
         countryCode: receiverAddress.countryCode || 'AE',
         state: receiverAddress.state || '',
         postCode: receiverAddress.postCode || '',
-        city: this.normalizeCity(receiverAddress.city, invoice.receiver_address || receiverAddress.line1, 'Dubai'),
-        line1: this.truncateField(receiverAddress.line1 || invoice.receiver_address || 'N/A', 250, 'N/A'),
+        city: this.normalizeCity(
+          receiverAddress.city,
+          (domesticToClient ? client.address : invoice.receiver_address) || receiverAddress.line1,
+          'Dubai'
+        ),
+        line1: this.truncateField(
+          receiverAddress.line1 || (domesticToClient ? client.address : invoice.receiver_address) || 'N/A',
+          250,
+          'N/A'
+        ),
         line2: this.truncateField(receiverAddress.line2 || '', 250, ''),
         line3: this.truncateField(receiverAddress.line3 || '', 250, ''),
       },
@@ -747,7 +764,9 @@ class EMpostAPIService {
         },
         deliveryCharges: {
           currencyCode: 'AED',
-          amount: isPhToUae ? parseFloat(invoice.delivery_charge?.toString() || 0) : parseFloat(invoice.amount?.toString() || 0)
+          amount: isPhToUae || isDomesticDelivery
+            ? this.domesticDeliveryFee(invoice, isPhToUae && !isDomesticDelivery)
+            : parseFloat(invoice.amount?.toString() || 0)
         },
         numberOfPieces: numberOfBoxes,
         pickupDate: new Date().toISOString(),
@@ -779,20 +798,60 @@ class EMpostAPIService {
     return shipmentData;
   }
 
+  /** PH→UAE delivery charge, or the cancellation fee (older ones stored it in amount). */
+  domesticDeliveryFee(invoice, deliveryOnly) {
+    const delivery = parseFloat(invoice.delivery_charge?.toString() || 0) || 0;
+    if (deliveryOnly || delivery > 0) return delivery;
+    return parseFloat(invoice.amount?.toString() || 0) || 0;
+  }
+
   /**
-   * Map invoice data to EMpost invoice format
+   * Net and VAT movement from posted credit / debit notes on this invoice. PH→UAE tax invoices only carry
+   * the delivery charge in EMPOST, so only delivery lines move them.
+   */
+  async invoiceNoteAdjustments(invoice) {
+    const empty = { net: 0, vat: 0, notes: [] };
+    if (!invoice?._id) return empty;
+    if (!(Number(invoice.credit_notes_total) > 0) && !(Number(invoice.debit_notes_total) > 0)) return empty;
+    const InvoiceNote = require('mongoose').models.InvoiceNote;
+    if (!InvoiceNote) return empty;
+    const notes = await InvoiceNote.find({ invoice_id: invoice._id, status: 'POSTED' })
+      .select('note_no note_type lines')
+      .lean();
+    const isPhToUae = (invoice.service_code || '').toUpperCase().includes('PH_TO_UAE')
+      && invoice.invoice_origin !== 'CANCELLATION';
+    let net = 0;
+    let vat = 0;
+    for (const note of notes) {
+      const sign = note.note_type === 'CREDIT' ? -1 : 1;
+      for (const line of note.lines || []) {
+        if (isPhToUae && line.category !== 'DELIVERY') continue;
+        net += sign * (Number(line.amount) || 0);
+        vat += sign * (Number(line.vat_amount) || 0);
+      }
+    }
+    const r2 = (n) => Math.round(n * 100) / 100;
+    return { net: r2(net), vat: r2(vat), notes: notes.map((n) => n.note_no) };
+  }
+
+  /**
+   * Map invoice data to EMpost invoice format: the tax invoice as it stands after posted credit / debit notes.
    * @param {Object} invoice - Invoice object
+   * @param {Object} [adjustments] - { net, vat } from invoiceNoteAdjustments
    * @returns {Object} EMpost invoice payload
    */
-  mapInvoiceToEMpostInvoice(invoice) {
+  mapInvoiceToEMpostInvoice(invoice, adjustments = { net: 0, vat: 0 }) {
     const isPhToUae = (invoice.service_code || '').toUpperCase().includes('PH_TO_UAE');
-    const baseCharge = isPhToUae
-      ? parseFloat(invoice.delivery_charge?.toString() || 0)
-      : parseFloat(invoice.amount?.toString() || 0);
-    const taxAmount = parseFloat(invoice.tax_amount?.toString() || 0);
-    const totalAmountIncludingTax = isPhToUae
-      ? baseCharge + taxAmount
-      : parseFloat(invoice.total_amount?.toString() || 0);
+    const isDomesticDelivery = invoice.invoice_origin === 'CANCELLATION';
+    const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+    const invoiceTax = parseFloat(invoice.tax_amount?.toString() || 0) || 0;
+    const invoiceTotal = parseFloat(invoice.total_amount?.toString() || 0) || 0;
+    const invoiceBase = isPhToUae || isDomesticDelivery
+      ? this.domesticDeliveryFee(invoice, isPhToUae && !isDomesticDelivery)
+      : invoiceTotal - invoiceTax;
+    const baseCharge = r2(Math.max(0, invoiceBase + (adjustments.net || 0)));
+    const taxAmount = r2(Math.max(0, invoiceTax + (adjustments.vat || 0)));
+    const totalAmountIncludingTax = r2(baseCharge + taxAmount);
     
     const invoiceData = {
       trackingNumber: invoice.awb_number || invoice.invoice_id,
@@ -822,13 +881,12 @@ class EMpostAPIService {
       },
     };
     
-    // Add tax as a separate charge if applicable
-    if (invoice.tax_amount && parseFloat(invoice.tax_amount.toString()) > 0) {
+    if (taxAmount > 0) {
       invoiceData.charges.push({
         type: 'Tax',
         amount: {
           currencyCode: 'AED',
-          amount: parseFloat(invoice.tax_amount.toString()),
+          amount: taxAmount,
         },
       });
     }

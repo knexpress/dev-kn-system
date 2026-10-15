@@ -8,6 +8,8 @@ const {
   PAYMENT_MODES,
 } = require('./invoice-gl');
 
+const DOMESTIC_DELIVERY_TEXT = 'Domestic delivery fees';
+
 function roundMoney(n) {
   return Math.round((Number(n) || 0) * 100) / 100;
 }
@@ -48,8 +50,55 @@ async function ensureClient({ request, customerName, customerPhone, customerEmai
   });
 }
 
+/** Domestic delivery shipment + invoice in EMPOST. Never throws; failures land on invoice.empost_sync. */
+async function pushCancellationToEmpost(invoice) {
+  const {
+    markEmpostShipmentOk,
+    markEmpostShipmentFailed,
+    markEmpostInvoiceOk,
+    markEmpostInvoiceFailed,
+    markEmpostInvoicePending,
+    hasValidUhawb,
+  } = require('../utils/empost-sync-status');
+  try {
+    const empostAPI = require('./empost-api');
+    markEmpostInvoicePending(invoice);
+    await invoice.save();
+    const populated = await Invoice.findById(invoice._id)
+      .populate('client_id', 'company_name contact_name email phone address city country');
+    try {
+      const shipment = await empostAPI.createShipment(populated);
+      const uhawb = shipment?.data?.uhawb;
+      if (uhawb && uhawb !== 'N/A') {
+        markEmpostShipmentOk(invoice, uhawb);
+        populated.empost_uhawb = uhawb;
+      } else if (!hasValidUhawb(invoice)) {
+        markEmpostShipmentFailed(invoice, { message: 'EMPOST did not return a valid UHAWB.' });
+      }
+    } catch (error) {
+      markEmpostShipmentFailed(invoice, error);
+    }
+    await invoice.save();
+    try {
+      await empostAPI.issueInvoice(populated);
+      markEmpostInvoiceOk(invoice);
+    } catch (error) {
+      markEmpostInvoiceFailed(invoice, error);
+    }
+    await invoice.save();
+  } catch (error) {
+    console.error(`❌ EMPOST push failed for cancellation invoice ${invoice.invoice_id}:`, error.message);
+    try {
+      markEmpostInvoiceFailed(invoice, error);
+      await invoice.save();
+    } catch (_) {
+      /* ignore */
+    }
+  }
+}
+
 /**
- * Raises a cancellation-fee invoice (never sent to EMPOST).
+ * Raises a cancellation invoice, charged as domestic delivery fees and sent to EMPOST.
  * Optionally links it to a cancelled / quoting invoice request and applies a live quotation advance.
  */
 async function raiseCancellationInvoice({
@@ -109,10 +158,12 @@ async function raiseCancellationInvoice({
     client_id: client._id,
     created_by: createdBy,
     invoice_origin: 'CANCELLATION',
-    amount: asDecimal(net),
+    amount: asDecimal(0),
     pickup_charge: asDecimal(0),
-    delivery_charge: asDecimal(0),
+    delivery_charge: asDecimal(net),
+    has_delivery: true,
     insurance_charge: asDecimal(0),
+    base_amount: asDecimal(net),
     tax_rate: rate,
     tax_amount: asDecimal(vat),
     total_amount: asDecimal(total),
@@ -127,12 +178,12 @@ async function raiseCancellationInvoice({
     receiver_phone: invoiceRequest?.receiver_phone || customerPhone || undefined,
     service_code: invoiceRequest?.service_code || invoiceRequest?.verification?.service_code || undefined,
     notes: [
-      'Shipment cancellation fee. This invoice is the cancellation charge only. Not sent to EMPOST. 5% VAT tax invoice.',
+      'Cancelled shipment charged as domestic delivery fees. 5% VAT tax invoice.',
       reason ? `Reason: ${reason}` : '',
       quoteNo ? `Quotation ${quoteNo}` : '',
     ].filter(Boolean).join(' '),
     line_items: [{
-      description: 'Shipment cancellation fee',
+      description: DOMESTIC_DELIVERY_TEXT,
       quantity: 1,
       unit_price: asDecimal(net),
       total: asDecimal(net),
@@ -147,6 +198,8 @@ async function raiseCancellationInvoice({
     gatewayMode: hasAdvance || !wantsPayment ? undefined : paymentMode,
     quotationNumber: quoteNo,
   });
+
+  await pushCancellationToEmpost(invoice);
 
   let prepaidResult = null;
   if (gl.status === 'POSTED' && wantsPayment) {
