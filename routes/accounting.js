@@ -26,6 +26,12 @@ const {
 const crypto = require('crypto');
 const einvoicing = require('../services/einvoicing');
 const { nextJournalEntryNo, postInvoiceJournal, syncInvoiceReceipts } = require('../services/invoice-gl');
+const {
+  assertPeriodOpen,
+  nextOpenPeriodStart,
+  listPeriodsAround,
+  setPeriodStatus,
+} = require('../services/period-lock');
 
 const router = express.Router();
 
@@ -285,6 +291,67 @@ router.get('/journals/:id', auth, async (req, res) => {
   }
 });
 
+function reverseJournalLines(lines, prefix = 'Rev') {
+  return (lines || []).map((l) => ({
+    account_id: l.account_id,
+    account_code: l.account_code,
+    account_name: l.account_name,
+    description: l.description
+      ? `${prefix}: ${l.description}`
+      : `${prefix}: ${l.account_code}`,
+    debit: toNum(l.credit),
+    credit: toNum(l.debit),
+  }));
+}
+
+async function buildJournalLinesFromRaw(lines) {
+  const builtLines = [];
+  for (const raw of lines) {
+    const code = String(raw.account_code || '').trim();
+    const debit = toNum(raw.debit);
+    const credit = toNum(raw.credit);
+
+    if (!code) {
+      return { error: 'Each line needs an account_code' };
+    }
+    if (debit < 0 || credit < 0) {
+      return { error: 'Debit/credit cannot be negative' };
+    }
+    if (debit > 0 && credit > 0) {
+      return { error: `Line for ${code} cannot have both debit and credit` };
+    }
+    if (debit === 0 && credit === 0) {
+      return { error: `Line for ${code} must have a debit or credit amount` };
+    }
+
+    const account = await Account.findOne({ code, is_active: true });
+    if (!account) {
+      return { error: `Account not found: ${code}` };
+    }
+    if (account.is_postable === false) {
+      return { error: `Account ${code} is not postable` };
+    }
+
+    builtLines.push({
+      account_id: account._id,
+      account_code: account.code,
+      account_name: account.name,
+      description: String(raw.description || '').trim(),
+      debit,
+      credit,
+    });
+  }
+
+  const totalDebit = builtLines.reduce((s, l) => s + l.debit, 0);
+  const totalCredit = builtLines.reduce((s, l) => s + l.credit, 0);
+  if (Math.abs(totalDebit - totalCredit) > 0.009) {
+    return {
+      error: `Journal is not balanced. Debit ${totalDebit.toFixed(2)} vs Credit ${totalCredit.toFixed(2)}`,
+    };
+  }
+  return { builtLines, totalDebit, totalCredit };
+}
+
 router.post('/journals', auth, upload.array('documents', 5), async (req, res) => {
   try {
     const {
@@ -307,62 +374,26 @@ router.post('/journals', auth, upload.array('documents', 5), async (req, res) =>
       });
     }
 
+    const periodCheck = await assertPeriodOpen(entry_date, 'Journal date');
+    if (periodCheck.error) {
+      return res.status(400).json({
+        success: false,
+        error: periodCheck.error,
+        period_key: periodCheck.period_key,
+        locked: true,
+      });
+    }
+
     const allowedStatus = ['DRAFT', 'POSTED'];
     const finalStatus = allowedStatus.includes(status) ? status : 'POSTED';
     const allowedSources = ['MANUAL', 'INVOICE', 'INVENTORY', 'PAYMENT', 'ADJUSTMENT', 'OPENING'];
     const finalSource = allowedSources.includes(source) ? source : 'MANUAL';
 
-    const builtLines = [];
-    for (const raw of lines) {
-      const code = String(raw.account_code || '').trim();
-      const debit = toNum(raw.debit);
-      const credit = toNum(raw.credit);
-
-      if (!code) {
-        return res.status(400).json({ success: false, error: 'Each line needs an account_code' });
-      }
-      if (debit < 0 || credit < 0) {
-        return res.status(400).json({ success: false, error: 'Debit/credit cannot be negative' });
-      }
-      if (debit > 0 && credit > 0) {
-        return res.status(400).json({
-          success: false,
-          error: `Line for ${code} cannot have both debit and credit`,
-        });
-      }
-      if (debit === 0 && credit === 0) {
-        return res.status(400).json({
-          success: false,
-          error: `Line for ${code} must have a debit or credit amount`,
-        });
-      }
-
-      const account = await Account.findOne({ code, is_active: true });
-      if (!account) {
-        return res.status(400).json({ success: false, error: `Account not found: ${code}` });
-      }
-      if (account.is_postable === false) {
-        return res.status(400).json({ success: false, error: `Account ${code} is not postable` });
-      }
-
-      builtLines.push({
-        account_id: account._id,
-        account_code: account.code,
-        account_name: account.name,
-        description: String(raw.description || '').trim(),
-        debit,
-        credit,
-      });
+    const built = await buildJournalLinesFromRaw(lines);
+    if (built.error) {
+      return res.status(400).json({ success: false, error: built.error });
     }
-
-    const totalDebit = builtLines.reduce((s, l) => s + l.debit, 0);
-    const totalCredit = builtLines.reduce((s, l) => s + l.credit, 0);
-    if (Math.abs(totalDebit - totalCredit) > 0.009) {
-      return res.status(400).json({
-        success: false,
-        error: `Journal is not balanced. Debit ${totalDebit.toFixed(2)} vs Credit ${totalCredit.toFixed(2)}`,
-      });
-    }
+    const { builtLines, totalDebit, totalCredit } = built;
 
     // Generate next entry number JE-YYYY-####
     const entry_no = await nextJournalEntryNo(entry_date);
@@ -422,6 +453,247 @@ router.post('/journals', auth, upload.array('documents', 5), async (req, res) =>
       success: false,
       error: error.message || 'Failed to create journal entry',
     });
+  }
+});
+
+// Edit memo / date / lines on journals that are safe to amend (incl. stock-movement JEs).
+const EDITABLE_JOURNAL_SOURCES = new Set(['MANUAL', 'INVENTORY', 'ADJUSTMENT', 'OPENING']);
+
+router.put('/journals/:id', auth, upload.array('documents', 5), async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, error: 'Invalid journal id' });
+    }
+    const journal = await JournalEntry.findById(req.params.id);
+    if (!journal) {
+      return res.status(404).json({ success: false, error: 'Journal entry not found' });
+    }
+    if (!EDITABLE_JOURNAL_SOURCES.has(String(journal.source || '').toUpperCase()) && journal.status !== 'DRAFT') {
+      return res.status(400).json({
+        success: false,
+        error: `${journal.source || 'This'} journals cannot be edited here — reverse or adjust with a new entry`,
+      });
+    }
+
+    const { entry_date, memo, status } = req.body || {};
+    const lines = parseLines(req.body?.lines);
+    if (!entry_date) {
+      return res.status(400).json({ success: false, error: 'entry_date is required' });
+    }
+    if (!Array.isArray(lines) || lines.length < 2) {
+      return res.status(400).json({
+        success: false,
+        error: 'At least two journal lines are required',
+      });
+    }
+
+    const built = await buildJournalLinesFromRaw(lines);
+    if (built.error) {
+      return res.status(400).json({ success: false, error: built.error });
+    }
+    const { builtLines, totalDebit, totalCredit } = built;
+
+    const newDocs = (req.files || []).map((file) => ({
+      filename: file.filename,
+      original_name: file.originalname,
+      mime_type: file.mimetype,
+      size: file.size,
+      url: `/uploads/accounting/${file.filename}`,
+      uploaded_at: new Date(),
+    }));
+
+    const originalLocked = await assertPeriodOpen(journal.entry_date, 'Original journal date');
+    const lockedPeriod = Boolean(originalLocked.locked);
+
+    // Locked month: leave original untouched; post ADJUSTMENT in next open period
+    if (lockedPeriod && journal.status === 'POSTED') {
+      const nextPeriod = await nextOpenPeriodStart(journal.entry_date);
+      if (nextPeriod.error) {
+        return res.status(400).json({ success: false, error: nextPeriod.error });
+      }
+
+      const effectiveLines =
+        Array.isArray(journal.last_effective_lines) && journal.last_effective_lines.length >= 2
+          ? journal.last_effective_lines
+          : journal.lines;
+
+      const adjLines = [
+        ...reverseJournalLines(effectiveLines, `Rev ${journal.entry_no}`),
+        ...builtLines.map((l) => ({
+          ...l,
+          description: l.description || `Adj ${journal.entry_no}`,
+        })),
+      ];
+      const adjDebit = adjLines.reduce((s, l) => s + l.debit, 0);
+      const adjCredit = adjLines.reduce((s, l) => s + l.credit, 0);
+      if (Math.abs(adjDebit - adjCredit) > 0.009) {
+        return res.status(400).json({
+          success: false,
+          error: `Adjustment is not balanced. Debit ${adjDebit.toFixed(2)} vs Credit ${adjCredit.toFixed(2)}`,
+        });
+      }
+
+      const actor = actorFromReq(req);
+      const adjDate = nextPeriod.when;
+      const entry_no = await nextJournalEntryNo(adjDate);
+      const adjMemo =
+        String(memo || '').trim() ||
+        `Adjustment for ${journal.entry_no} (period ${originalLocked.period_key} locked)`;
+
+      const adjustment = await JournalEntry.create({
+        entry_no,
+        entry_date: adjDate,
+        memo: adjMemo,
+        source: 'ADJUSTMENT',
+        source_reference: journal.entry_no,
+        source_label: `Period adjustment · ${journal.entry_no}`,
+        status: 'POSTED',
+        lines: adjLines,
+        total_debit: Math.round(adjDebit * 100) / 100,
+        total_credit: Math.round(adjCredit * 100) / 100,
+        posted_at: new Date(),
+        adjusts_journal_id: journal._id,
+        adjusts_journal_no: journal.entry_no,
+        supporting_documents: newDocs,
+        ...actor,
+      });
+
+      journal.adjusted_by_journal_id = adjustment._id;
+      journal.adjusted_by_journal_no = adjustment.entry_no;
+      journal.last_effective_lines = builtLines;
+      await journal.save();
+
+      if (String(journal.source).toUpperCase() === 'INVENTORY') {
+        const txn = await InventoryTransaction.findOne({ journal_entry_id: journal._id });
+        if (txn) {
+          const absQty = Math.abs(toNum(txn.qty)) || 1;
+          txn.total_cost = Math.round(totalDebit * 100) / 100;
+          txn.unit_cost = Math.round((totalDebit / absQty) * 10000) / 10000;
+          if (adjMemo) txn.notes = adjMemo;
+          await txn.save();
+        }
+      }
+
+      return res.json({
+        success: true,
+        data: adjustment,
+        meta: {
+          adjustment: true,
+          locked_period: originalLocked.period_key,
+          adjustment_period: nextPeriod.period_key,
+          original_journal_id: String(journal._id),
+          original_journal_no: journal.entry_no,
+          message: `Period ${originalLocked.period_key} is locked. Posted adjustment ${adjustment.entry_no} in ${nextPeriod.period_key}.`,
+        },
+      });
+    }
+
+    // Open period: in-place edit
+    const dateCheck = await assertPeriodOpen(entry_date, 'Journal date');
+    if (dateCheck.error) {
+      return res.status(400).json({
+        success: false,
+        error: dateCheck.error,
+        period_key: dateCheck.period_key,
+        locked: true,
+      });
+    }
+
+    const allowedStatus = ['DRAFT', 'POSTED'];
+    const nextStatus = allowedStatus.includes(status) ? status : journal.status;
+
+    journal.entry_date = new Date(entry_date);
+    journal.memo = String(memo || '').trim();
+    journal.lines = builtLines;
+    journal.total_debit = totalDebit;
+    journal.total_credit = totalCredit;
+    journal.status = nextStatus;
+    if (nextStatus === 'POSTED' && !journal.posted_at) {
+      journal.posted_at = new Date();
+    }
+    if (newDocs.length) {
+      journal.supporting_documents = [...(journal.supporting_documents || []), ...newDocs];
+    }
+
+    await journal.save();
+
+    if (String(journal.source).toUpperCase() === 'INVENTORY') {
+      const txn = await InventoryTransaction.findOne({ journal_entry_id: journal._id });
+      if (txn) {
+        const absQty = Math.abs(toNum(txn.qty)) || 1;
+        txn.total_cost = Math.round(totalDebit * 100) / 100;
+        txn.unit_cost = Math.round((totalDebit / absQty) * 10000) / 10000;
+        txn.txn_date = journal.entry_date;
+        if (journal.memo) txn.notes = journal.memo;
+        await txn.save();
+      }
+    }
+
+    res.json({ success: true, data: journal, meta: { adjustment: false } });
+  } catch (error) {
+    console.error('Error updating journal:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to update journal entry',
+    });
+  }
+});
+
+// Accounting periods (month lock / unlock)
+router.get('/periods', auth, async (req, res) => {
+  try {
+    const monthsBack = Math.min(36, Math.max(0, Number(req.query.months_back) || 12));
+    const monthsForward = Math.min(24, Math.max(0, Number(req.query.months_forward) || 6));
+    const periods = await listPeriodsAround(new Date(), monthsBack, monthsForward);
+    res.json({ success: true, data: periods });
+  } catch (error) {
+    console.error('Error listing periods:', error);
+    res.status(500).json({ success: false, error: 'Failed to list accounting periods' });
+  }
+});
+
+router.get('/periods/:periodKey', auth, async (req, res) => {
+  try {
+    const key = String(req.params.periodKey || '').trim();
+    if (!/^\d{4}-\d{2}$/.test(key)) {
+      return res.status(400).json({ success: false, error: 'period_key must be YYYY-MM' });
+    }
+    const periods = await listPeriodsAround(
+      new Date(Number(key.slice(0, 4)), Number(key.slice(5, 7)) - 1, 1),
+      0,
+      0
+    );
+    res.json({ success: true, data: periods[0] || { period_key: key, status: 'OPEN' } });
+  } catch (error) {
+    console.error('Error fetching period:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch accounting period' });
+  }
+});
+
+router.put('/periods/:periodKey', auth, async (req, res) => {
+  try {
+    const key = String(req.params.periodKey || '').trim();
+    const { status, notes } = req.body || {};
+    if (!['OPEN', 'LOCKED'].includes(String(status || '').toUpperCase())) {
+      return res.status(400).json({ success: false, error: 'status must be OPEN or LOCKED' });
+    }
+    const actor = actorFromReq(req);
+    const result = await setPeriodStatus(
+      key,
+      String(status).toUpperCase(),
+      {
+        name: actor.created_by_name,
+        email: actor.created_by_email,
+      },
+      notes
+    );
+    if (result.error) {
+      return res.status(400).json({ success: false, error: result.error });
+    }
+    res.json({ success: true, data: result.period });
+  } catch (error) {
+    console.error('Error updating period:', error);
+    res.status(500).json({ success: false, error: 'Failed to update accounting period' });
   }
 });
 
@@ -733,6 +1005,16 @@ router.post('/inventory/transactions', auth, async (req, res) => {
     }
     if (!txn_date) {
       return res.status(400).json({ success: false, error: 'txn_date is required' });
+    }
+
+    const periodCheck = await assertPeriodOpen(txn_date, 'Transaction date');
+    if (periodCheck.error) {
+      return res.status(400).json({
+        success: false,
+        error: periodCheck.error,
+        period_key: periodCheck.period_key,
+        locked: true,
+      });
     }
 
     const itemSku = String(sku || '').trim().toUpperCase();
@@ -1190,6 +1472,40 @@ async function nextSupplierPaymentNo(paymentDate) {
     const parts = String(latest.payment_no).split('-');
     const n = parseInt(parts[parts.length - 1], 10);
     if (Number.isFinite(n)) nextNum = n + 1;
+  }
+  return `${prefix}${String(nextNum).padStart(4, '0')}`;
+}
+
+/** Customer payment receipt voucher numbers: RV-YYYY-#### */
+async function nextSalesReceiptNo(paymentDate) {
+  const year = new Date(paymentDate).getFullYear() || new Date().getFullYear();
+  const prefix = `RV-${year}-`;
+  const latest = await SalesInvoice.findOne({ 'payments.receipt_no': new RegExp(`^${prefix}`) })
+    .sort({ 'payments.receipt_no': -1 })
+    .select('payments.receipt_no')
+    .lean();
+  let nextNum = 1;
+  if (latest?.payments?.length) {
+    for (const p of latest.payments) {
+      const no = String(p.receipt_no || '');
+      if (!no.startsWith(prefix)) continue;
+      const parts = no.split('-');
+      const n = parseInt(parts[parts.length - 1], 10);
+      if (Number.isFinite(n) && n >= nextNum) nextNum = n + 1;
+    }
+  }
+  // Also scan a wider set if the top doc isn't the max (embedded array sort is imperfect)
+  const peers = await SalesInvoice.find({ 'payments.receipt_no': new RegExp(`^${prefix}`) })
+    .select('payments.receipt_no')
+    .lean();
+  for (const inv of peers) {
+    for (const p of inv.payments || []) {
+      const no = String(p.receipt_no || '');
+      if (!no.startsWith(prefix)) continue;
+      const parts = no.split('-');
+      const n = parseInt(parts[parts.length - 1], 10);
+      if (Number.isFinite(n) && n >= nextNum) nextNum = n + 1;
+    }
   }
   return `${prefix}${String(nextNum).padStart(4, '0')}`;
 }
@@ -2236,6 +2552,244 @@ router.get('/purchase-orders', auth, async (req, res) => {
   }
 });
 
+/** Statement of purchase — per-supplier invoices with paid / pending filters */
+router.get('/purchase-orders/statement', auth, async (req, res) => {
+  try {
+    const supplierId = String(req.query.supplier_id || '').trim();
+    const supplierName = String(req.query.supplier_name || '').trim();
+    const paymentStatus = String(req.query.payment_status || 'ALL').trim().toUpperCase();
+    const search = String(req.query.q || '').trim().toLowerCase();
+    const from = req.query.from ? new Date(String(req.query.from)) : null;
+    const to = req.query.to ? new Date(String(req.query.to)) : null;
+    if (from && !Number.isNaN(from.getTime())) from.setHours(0, 0, 0, 0);
+    if (to && !Number.isNaN(to.getTime())) to.setHours(23, 59, 59, 999);
+
+    if (!supplierId && !supplierName) {
+      return res.status(400).json({
+        success: false,
+        error: 'Select a supplier (supplier_id or supplier_name)',
+      });
+    }
+
+    const poFilter = {
+      status: { $nin: ['DRAFT', 'PENDING_APPROVAL', 'REJECTED', 'CANCELLED'] },
+    };
+    if (supplierId && mongoose.isValidObjectId(supplierId)) {
+      const nameForMatch = supplierName || (await Supplier.findById(supplierId).select('name').lean())?.name;
+      poFilter.$or = [{ supplier_id: supplierId }];
+      if (nameForMatch) {
+        poFilter.$or.push({ supplier_name: new RegExp(`^${escapeRegex(nameForMatch)}$`, 'i') });
+      }
+    } else {
+      poFilter.supplier_name = new RegExp(`^${escapeRegex(supplierName)}$`, 'i');
+    }
+
+    const orders = await PurchaseOrder.find(poFilter).sort({ supplier_invoice_date: -1, po_date: -1 }).lean();
+    const poIds = orders.map((po) => po._id);
+
+    const payments = await SupplierPayment.find({
+      $or: [
+        { purchase_order_id: { $in: poIds } },
+        ...(supplierName
+          ? [{ supplier_name: new RegExp(`^${escapeRegex(supplierName)}$`, 'i') }]
+          : []),
+        ...(orders[0]?.supplier_name
+          ? [{ supplier_name: new RegExp(`^${escapeRegex(orders[0].supplier_name)}$`, 'i') }]
+          : []),
+      ],
+      status: { $in: ['PENDING_APPROVAL', 'APPROVED', 'REVERSED'] },
+    })
+      .sort({ payment_date: -1, createdAt: -1 })
+      .lean();
+
+    const pendingByPo = new Map();
+    const paidByPo = new Map();
+    const paymentsByPo = new Map();
+    for (const p of payments) {
+      if (!p.purchase_order_id) continue;
+      const key = String(p.purchase_order_id);
+      if (!paymentsByPo.has(key)) paymentsByPo.set(key, []);
+      paymentsByPo.get(key).push(p);
+      if (p.status === 'PENDING_APPROVAL') {
+        pendingByPo.set(key, (pendingByPo.get(key) || 0) + toNum(p.amount));
+      }
+      if (p.status === 'APPROVED') {
+        paidByPo.set(key, (paidByPo.get(key) || 0) + toNum(p.amount));
+      }
+    }
+
+    let supplier = null;
+    if (supplierId && mongoose.isValidObjectId(supplierId)) {
+      supplier = await Supplier.findById(supplierId).lean();
+    }
+    if (!supplier && (supplierName || orders[0]?.supplier_name)) {
+      const name = supplierName || orders[0].supplier_name;
+      supplier = await Supplier.findOne({ name: new RegExp(`^${escapeRegex(name)}$`, 'i') }).lean();
+    }
+
+    const invoices = [];
+    for (const po of orders) {
+      const billed = poBilledValue(po);
+      const paid = Math.max(toNum(po.amount_paid), paidByPo.get(String(po._id)) || 0);
+      const pending = pendingByPo.get(String(po._id)) || 0;
+      const total = toNum(po.total_amount);
+      const left_to_pay = Number(Math.max(0, total - paid - pending).toFixed(2));
+      const owed_now = Number(Math.max(0, billed - paid).toFixed(2));
+
+      let pay_status = 'PENDING';
+      if (left_to_pay <= 0.009 && pending <= 0.009 && paid + 0.009 >= Math.max(total, billed) - 0.01) {
+        pay_status = 'PAID';
+      } else if (pending > 0.009 && left_to_pay <= 0.009) {
+        pay_status = 'AWAITING_CLEARANCE';
+      } else if (paid > 0.009 || pending > 0.009) {
+        pay_status = 'PARTIAL';
+      }
+
+      const invoiceDate = po.supplier_invoice_date || po.po_date;
+      if (from && !Number.isNaN(from.getTime()) && invoiceDate && new Date(invoiceDate) < from) continue;
+      if (to && !Number.isNaN(to.getTime()) && invoiceDate && new Date(invoiceDate) > to) continue;
+
+      if (paymentStatus === 'PENDING' && !['PENDING', 'PARTIAL', 'AWAITING_CLEARANCE'].includes(pay_status)) {
+        continue;
+      }
+      if (paymentStatus === 'PAID' && pay_status !== 'PAID') continue;
+      if (paymentStatus === 'PARTIAL' && pay_status !== 'PARTIAL') continue;
+      if (paymentStatus === 'AWAITING_CLEARANCE' && pay_status !== 'AWAITING_CLEARANCE') continue;
+
+      if (search) {
+        const hay = [
+          po.po_no,
+          po.supplier_invoice_no,
+          po.supplier_reference,
+          po.journal_entry_no,
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+        if (!hay.includes(search)) continue;
+      }
+
+      invoices.push({
+        _id: po._id,
+        po_no: po.po_no,
+        po_date: po.po_date,
+        supplier_invoice_no: po.supplier_invoice_no || po.supplier_reference || null,
+        supplier_invoice_date: po.supplier_invoice_date || null,
+        due_date: po.due_date || null,
+        status: po.status,
+        pay_status,
+        subtotal: toNum(po.subtotal),
+        tax_amount: toNum(po.tax_amount),
+        total_amount: total,
+        billed,
+        paid: Number(paid.toFixed(2)),
+        pending: Number(pending.toFixed(2)),
+        owed_now,
+        left_to_pay,
+        journal_entry_no: po.journal_entry_no || null,
+        payments: (paymentsByPo.get(String(po._id)) || []).map((p) => ({
+          _id: p._id,
+          payment_no: p.payment_no,
+          payment_date: p.payment_date,
+          amount: toNum(p.amount),
+          status: p.status,
+          supplier_name: p.supplier_name,
+          supplier_reference: p.supplier_reference || null,
+          description: p.description || null,
+          debit_account_code: p.debit_account_code || null,
+          debit_account_name: p.debit_account_name || null,
+          bank_cash_account_code: p.bank_cash_account_code || null,
+          bank_cash_account_name: p.bank_cash_account_name || null,
+          purchase_order_id: p.purchase_order_id || null,
+          purchase_order_no: p.purchase_order_no || po.po_no || null,
+          journal_entry_no: p.journal_entry_no || null,
+          requested_by_name: p.requested_by_name || null,
+          approved_by_name: p.approved_by_name || null,
+        })),
+      });
+    }
+
+    const summary = invoices.reduce(
+      (acc, row) => {
+        acc.invoice_count += 1;
+        acc.total_invoiced += row.total_amount;
+        acc.billed += row.billed;
+        acc.paid += row.paid;
+        acc.pending_clearance += row.pending;
+        acc.outstanding += row.owed_now;
+        if (row.pay_status === 'PAID') acc.paid_count += 1;
+        else acc.pending_count += 1;
+        return acc;
+      },
+      {
+        invoice_count: 0,
+        paid_count: 0,
+        pending_count: 0,
+        total_invoiced: 0,
+        billed: 0,
+        paid: 0,
+        pending_clearance: 0,
+        outstanding: 0,
+      }
+    );
+    Object.keys(summary).forEach((k) => {
+      if (typeof summary[k] === 'number' && !k.endsWith('_count')) {
+        summary[k] = Number(summary[k].toFixed(2));
+      }
+    });
+
+    const displayName =
+      supplier?.name || orders[0]?.supplier_name || supplierName || 'Supplier';
+
+    res.json({
+      success: true,
+      data: {
+        supplier: {
+          _id: supplier?._id || orders[0]?.supplier_id || null,
+          name: displayName,
+          trn: supplier?.trn || orders[0]?.supplier_trn || null,
+          phone: supplier?.phone || orders[0]?.supplier_phone || null,
+          email: supplier?.email || orders[0]?.supplier_email || null,
+          address: supplier?.address || orders[0]?.supplier_address || null,
+          payment_terms_days: supplier?.payment_terms_days ?? null,
+        },
+        filters: {
+          payment_status: paymentStatus,
+          from: from && !Number.isNaN(from.getTime()) ? from.toISOString().slice(0, 10) : null,
+          to: to && !Number.isNaN(to.getTime()) ? to.toISOString().slice(0, 10) : null,
+          q: search || null,
+        },
+        summary,
+        invoices,
+        payments: payments
+          .filter((p) => p.status !== 'REVERSED')
+          .map((p) => ({
+            _id: p._id,
+            payment_no: p.payment_no,
+            payment_date: p.payment_date,
+            amount: toNum(p.amount),
+            status: p.status,
+            supplier_name: p.supplier_name,
+            supplier_reference: p.supplier_reference || null,
+            description: p.description || null,
+            debit_account_code: p.debit_account_code || null,
+            debit_account_name: p.debit_account_name || null,
+            bank_cash_account_code: p.bank_cash_account_code || null,
+            bank_cash_account_name: p.bank_cash_account_name || null,
+            purchase_order_id: p.purchase_order_id || null,
+            purchase_order_no: p.purchase_order_no || null,
+            journal_entry_no: p.journal_entry_no || null,
+            requested_by_name: p.requested_by_name || null,
+            approved_by_name: p.approved_by_name || null,
+          })),
+      },
+    });
+  } catch (error) {
+    console.error('Error loading purchase statement:', error);
+    res.status(500).json({ success: false, error: 'Failed to load statement of purchase' });
+  }
+});
+
 router.get('/purchase-orders/:id', auth, async (req, res) => {
   try {
     const po = await PurchaseOrder.findById(req.params.id).lean();
@@ -3093,18 +3647,63 @@ router.post('/petty-cash/vouchers', auth, async (req, res) => {
       return res.status(500).json({ success: false, error: 'Petty cash account missing' });
     }
 
-    const amount = toNum(req.body?.amount);
     const payee = String(req.body?.payee || '').trim();
     const category = String(req.body?.category || '').trim();
     const description = String(req.body?.description || '').trim();
-    const expenseCode = String(req.body?.expense_account_code || '5100').trim();
     const voucherDate = req.body?.voucher_date ? new Date(req.body.voucher_date) : new Date();
 
     if (!payee) {
       return res.status(400).json({ success: false, error: 'Payee is required' });
     }
+
+    // Prefer multi-line payload; fall back to legacy single amount + expense_account_code
+    let rawLines = Array.isArray(req.body?.lines) ? req.body.lines : null;
+    if (!rawLines || !rawLines.length) {
+      const legacyAmount = toNum(req.body?.amount);
+      const legacyCode = String(req.body?.expense_account_code || '5100').trim();
+      if (!(legacyAmount > 0)) {
+        return res.status(400).json({ success: false, error: 'Add at least one line with an amount' });
+      }
+      rawLines = [
+        {
+          account_code: legacyCode,
+          description: description || undefined,
+          amount: legacyAmount,
+        },
+      ];
+    }
+
+    const builtLines = [];
+    for (let i = 0; i < rawLines.length; i += 1) {
+      const raw = rawLines[i] || {};
+      const code = String(raw.account_code || '').trim();
+      const lineAmount = Number(toNum(raw.amount).toFixed(2));
+      const lineDesc = String(raw.description || '').trim();
+      if (!code) {
+        return res.status(400).json({ success: false, error: `Line ${i + 1}: account (COA) is required` });
+      }
+      if (!(lineAmount > 0)) {
+        return res.status(400).json({ success: false, error: `Line ${i + 1}: amount must be greater than zero` });
+      }
+      const gl = await loadPostableAccount(code);
+      if (!gl) {
+        return res.status(400).json({
+          success: false,
+          error: `Line ${i + 1}: account ${code} not found or not postable`,
+        });
+      }
+      builtLines.push({
+        description: lineDesc || undefined,
+        account_code: gl.code,
+        account_name: gl.name,
+        amount: lineAmount,
+        account_id: gl._id,
+      });
+    }
+
+    const amount = Number(builtLines.reduce((s, l) => s + l.amount, 0).toFixed(2));
     if (!(amount > 0)) {
-      return res.status(400).json({ success: false, error: 'Amount must be greater than zero' });
+      return res.status(400).json({ success: false, error: 'Total amount must be greater than zero' });
     }
     if (toNum(wallet.current_balance) < amount) {
       return res.status(400).json({
@@ -3113,14 +3712,32 @@ router.post('/petty-cash/vouchers', auth, async (req, res) => {
       });
     }
 
-    const expenseGl = await loadPostableAccount(expenseCode);
     const pettyGl = await loadPostableAccount(wallet.gl_account_code || '1000');
-    if (!expenseGl || !pettyGl) {
-      return res.status(400).json({ success: false, error: 'GL accounts not postable' });
+    if (!pettyGl) {
+      return res.status(400).json({ success: false, error: 'Petty cash GL account is not postable' });
     }
 
     const voucher_no = await nextPettyCashVoucherNo(voucherDate);
     const entry_no = await nextJournalEntryNo(voucherDate);
+
+    const journalLines = [
+      ...builtLines.map((l) => ({
+        account_id: l.account_id,
+        account_code: l.account_code,
+        account_name: l.account_name,
+        description: l.description || `Petty cash — ${payee}`,
+        debit: l.amount,
+        credit: 0,
+      })),
+      {
+        account_id: pettyGl._id,
+        account_code: pettyGl.code,
+        account_name: pettyGl.name,
+        description: `Paid from petty cash (${voucher_no})`,
+        debit: 0,
+        credit: amount,
+      },
+    ];
 
     const journal = await JournalEntry.create({
       entry_no,
@@ -3128,24 +3745,7 @@ router.post('/petty-cash/vouchers', auth, async (req, res) => {
       memo: `Petty cash voucher ${voucher_no} — ${payee}`,
       source: 'PAYMENT',
       status: 'POSTED',
-      lines: [
-        {
-          account_id: expenseGl._id,
-          account_code: expenseGl.code,
-          account_name: expenseGl.name,
-          description: description || `Petty cash — ${payee}`,
-          debit: amount,
-          credit: 0,
-        },
-        {
-          account_id: pettyGl._id,
-          account_code: pettyGl.code,
-          account_name: pettyGl.name,
-          description: `Paid from petty cash (${voucher_no})`,
-          debit: 0,
-          credit: amount,
-        },
-      ],
+      lines: journalLines,
       total_debit: amount,
       total_credit: amount,
       posted_at: new Date(),
@@ -3157,15 +3757,24 @@ router.post('/petty-cash/vouchers', auth, async (req, res) => {
     wallet.current_balance = toNum(wallet.current_balance) - amount;
     await wallet.save();
 
+    const voucherLines = builtLines.map(({ description: d, account_code, account_name, amount: a }) => ({
+      description: d,
+      account_code,
+      account_name,
+      amount: a,
+    }));
+    const first = voucherLines[0];
+
     const voucher = await PettyCashVoucher.create({
       voucher_no,
       voucher_date: voucherDate,
       payee,
       category,
-      description,
+      description: description || voucherLines.map((l) => l.description).filter(Boolean).join('; ') || undefined,
       amount,
-      expense_account_code: expenseCode,
-      expense_account_name: expenseGl.name,
+      expense_account_code: first.account_code,
+      expense_account_name: first.account_name,
+      lines: voucherLines,
       petty_cash_account_id: wallet._id,
       petty_cash_account_code: wallet.code,
       status: 'POSTED',
@@ -4616,6 +5225,242 @@ router.get('/sales/invoices', auth, async (req, res) => {
   }
 });
 
+/** Unpaid invoice summary for customers — shipment + sales AR (Excel-ready) */
+/** Customer bill-wise statement — unpaid / paid / all with filters (PDF & Excel on frontend) */
+router.get('/sales/unpaid-summary', auth, async (req, res) => {
+  try {
+    const { Invoice } = require('../models/unified-schema');
+    const customerId = String(req.query.customer_id || '').trim();
+    const customerName = String(req.query.customer_name || '').trim();
+    const kind = String(req.query.kind || 'ALL').trim().toUpperCase(); // ALL | SHIPMENT | SALES
+    // ALL | UNPAID | PARTIAL | PAID  (default UNPAID keeps prior behaviour for callers that omit it)
+    const paymentStatus = String(req.query.payment_status || 'UNPAID').trim().toUpperCase();
+    const from = req.query.from ? new Date(String(req.query.from)) : null;
+    const to = req.query.to ? new Date(String(req.query.to)) : null;
+    if (from && !Number.isNaN(from.getTime())) from.setHours(0, 0, 0, 0);
+    if (to && !Number.isNaN(to.getTime())) to.setHours(23, 59, 59, 999);
+
+    const decimalNum = (v) => {
+      if (v == null) return 0;
+      if (typeof v === 'object' && v.$numberDecimal != null) return Number(v.$numberDecimal) || 0;
+      if (typeof v === 'object' && typeof v.toString === 'function') {
+        const n = Number(v.toString());
+        return Number.isFinite(n) ? n : 0;
+      }
+      return Number(v) || 0;
+    };
+
+    const inDateRange = (d) => {
+      if (!d) return true;
+      const dt = new Date(d);
+      if (Number.isNaN(dt.getTime())) return true;
+      if (from && !Number.isNaN(from.getTime()) && dt < from) return false;
+      if (to && !Number.isNaN(to.getTime()) && dt > to) return false;
+      return true;
+    };
+
+    const nameMatch = (name) => {
+      if (!customerName) return true;
+      return String(name || '')
+        .trim()
+        .toLowerCase()
+        .includes(customerName.trim().toLowerCase());
+    };
+
+    const matchesPaymentFilter = (payBucket) => {
+      if (paymentStatus === 'ALL') return true;
+      if (paymentStatus === 'UNPAID') return payBucket === 'UNPAID' || payBucket === 'PARTIAL';
+      if (paymentStatus === 'PARTIAL') return payBucket === 'PARTIAL';
+      if (paymentStatus === 'PAID') return payBucket === 'PAID';
+      return payBucket === 'UNPAID' || payBucket === 'PARTIAL';
+    };
+
+    const classifyOutstanding = (total, paid, outstanding) => {
+      if (outstanding <= 0.009) return 'PAID';
+      if (paid > 0.009) return 'PARTIAL';
+      return 'UNPAID';
+    };
+
+    const rows = [];
+
+    if (kind === 'ALL' || kind === 'SHIPMENT') {
+      const shipStatuses =
+        paymentStatus === 'PAID'
+          ? ['PAID']
+          : paymentStatus === 'ALL'
+            ? ['UNPAID', 'OVERDUE', 'PAID', 'COLLECTED_BY_DRIVER', 'REMITTED']
+            : ['UNPAID', 'OVERDUE', 'PAID', 'COLLECTED_BY_DRIVER', 'REMITTED'];
+      const shipFilter = {
+        status: { $in: shipStatuses },
+        is_cancellation_invoice: { $ne: true },
+      };
+      if (customerName) {
+        shipFilter.receiver_name = new RegExp(escapeRegex(customerName), 'i');
+      }
+      const shipments = await Invoice.find(shipFilter)
+        .select(
+          'invoice_id awb_number issue_date due_date status receiver_name receiver_phone total_amount amount_paid credit_notes_total debit_notes_total'
+        )
+        .sort({ issue_date: -1 })
+        .lean();
+
+      for (const inv of shipments) {
+        if (!inDateRange(inv.issue_date)) continue;
+        const total = decimalNum(inv.total_amount);
+        const paid = toNum(inv.amount_paid);
+        const credits = toNum(inv.credit_notes_total);
+        const debits = toNum(inv.debit_notes_total);
+        const outstanding = Number(Math.max(0, total - credits + debits - paid).toFixed(2));
+        const payBucket = classifyOutstanding(total, paid, outstanding);
+        if (!matchesPaymentFilter(payBucket)) continue;
+        const customer = String(inv.receiver_name || '').trim() || 'Unknown customer';
+        if (!nameMatch(customer)) continue;
+        rows.push({
+          kind: 'SHIPMENT',
+          id: String(inv._id),
+          invoice_no: inv.invoice_id || inv.awb_number || String(inv._id),
+          reference: inv.awb_number || '',
+          invoice_date: inv.issue_date,
+          due_date: inv.due_date || null,
+          customer_name: customer,
+          customer_phone: inv.receiver_phone || null,
+          status: inv.status,
+          pay_status: payBucket,
+          total_amount: Number(total.toFixed(2)),
+          amount_paid: Number(paid.toFixed(2)),
+          outstanding,
+          currency: 'AED',
+        });
+      }
+    }
+
+    if (kind === 'ALL' || kind === 'SALES') {
+      const salesStatuses =
+        paymentStatus === 'PAID'
+          ? ['PAID']
+          : paymentStatus === 'PARTIAL'
+            ? ['PARTIALLY_PAID']
+            : paymentStatus === 'UNPAID'
+              ? ['APPROVED', 'PARTIALLY_PAID']
+              : ['APPROVED', 'PARTIALLY_PAID', 'PAID'];
+      const salesFilter = {
+        status: { $in: salesStatuses },
+      };
+      if (customerId && mongoose.isValidObjectId(customerId)) {
+        salesFilter.customer_id = customerId;
+      } else if (customerName) {
+        salesFilter.customer_name = new RegExp(escapeRegex(customerName), 'i');
+      }
+      const sales = await SalesInvoice.find(salesFilter).sort({ invoice_date: -1 }).lean();
+      for (const inv of sales) {
+        if (!inDateRange(inv.invoice_date)) continue;
+        const total = toNum(inv.total_amount);
+        const paid = toNum(inv.amount_paid);
+        const outstanding = Number(Math.max(0, total - paid).toFixed(2));
+        const payBucket = classifyOutstanding(total, paid, outstanding);
+        if (!matchesPaymentFilter(payBucket)) continue;
+        const customer = String(inv.customer_name || '').trim() || 'Unknown customer';
+        if (customerId && mongoose.isValidObjectId(customerId)) {
+          if (String(inv.customer_id || '') !== customerId) continue;
+        } else if (!nameMatch(customer)) continue;
+        rows.push({
+          kind: 'SALES',
+          id: String(inv._id),
+          invoice_no: inv.invoice_no,
+          reference: inv.customer_vat_trn || '',
+          invoice_date: inv.invoice_date,
+          due_date: inv.due_date || null,
+          customer_name: customer,
+          customer_phone: null,
+          customer_trn: inv.customer_vat_trn || null,
+          status: inv.status,
+          pay_status: payBucket,
+          total_amount: total,
+          amount_paid: paid,
+          outstanding,
+          currency: inv.currency || 'AED',
+        });
+      }
+    }
+
+    rows.sort((a, b) => {
+      const byCust = String(a.customer_name).localeCompare(String(b.customer_name));
+      if (byCust !== 0) return byCust;
+      return new Date(b.invoice_date || 0).getTime() - new Date(a.invoice_date || 0).getTime();
+    });
+
+    const byCustomerMap = new Map();
+    for (const row of rows) {
+      const key = row.customer_name.toLowerCase();
+      if (!byCustomerMap.has(key)) {
+        byCustomerMap.set(key, {
+          customer_name: row.customer_name,
+          invoice_count: 0,
+          paid_count: 0,
+          unpaid_count: 0,
+          total_invoiced: 0,
+          amount_paid: 0,
+          outstanding: 0,
+          overdue_count: 0,
+        });
+      }
+      const g = byCustomerMap.get(key);
+      g.invoice_count += 1;
+      g.total_invoiced += row.total_amount;
+      g.amount_paid += row.amount_paid;
+      g.outstanding += row.outstanding;
+      if (row.pay_status === 'PAID') g.paid_count += 1;
+      else g.unpaid_count += 1;
+      if (
+        row.status === 'OVERDUE' ||
+        (row.due_date && new Date(row.due_date) < new Date() && row.outstanding > 0.009)
+      ) {
+        g.overdue_count += 1;
+      }
+    }
+
+    const by_customer = [...byCustomerMap.values()]
+      .map((g) => ({
+        ...g,
+        total_invoiced: Number(g.total_invoiced.toFixed(2)),
+        amount_paid: Number(g.amount_paid.toFixed(2)),
+        outstanding: Number(g.outstanding.toFixed(2)),
+      }))
+      .sort((a, b) => b.outstanding - a.outstanding);
+
+    const totals = {
+      invoice_count: rows.length,
+      customer_count: by_customer.length,
+      paid_count: rows.filter((r) => r.pay_status === 'PAID').length,
+      unpaid_count: rows.filter((r) => r.pay_status !== 'PAID').length,
+      total_invoiced: Number(rows.reduce((s, r) => s + r.total_amount, 0).toFixed(2)),
+      amount_paid: Number(rows.reduce((s, r) => s + r.amount_paid, 0).toFixed(2)),
+      outstanding: Number(rows.reduce((s, r) => s + r.outstanding, 0).toFixed(2)),
+    };
+
+    res.json({
+      success: true,
+      data: {
+        as_of: new Date().toISOString(),
+        filters: {
+          customer_id: customerId || null,
+          customer_name: customerName || null,
+          kind,
+          payment_status: paymentStatus,
+          from: from && !Number.isNaN(from.getTime()) ? from.toISOString().slice(0, 10) : null,
+          to: to && !Number.isNaN(to.getTime()) ? to.toISOString().slice(0, 10) : null,
+        },
+        totals,
+        by_customer,
+        invoices: rows,
+      },
+    });
+  } catch (error) {
+    console.error('Error loading unpaid summary:', error);
+    res.status(500).json({ success: false, error: 'Failed to load unpaid invoice summary' });
+  }
+});
+
 router.get('/sales/invoices/:id', auth, async (req, res) => {
   try {
     const invoice = await SalesInvoice.findById(req.params.id).lean();
@@ -4964,27 +5809,50 @@ router.post('/sales/invoices/:id/pay', auth, async (req, res) => {
     invoice.amount_paid = Number((toNum(invoice.amount_paid) + amount).toFixed(2));
     const remaining = Number((toNum(invoice.total_amount) - toNum(invoice.amount_paid)).toFixed(2));
     invoice.status = remaining <= 0.009 ? 'PAID' : 'PARTIALLY_PAID';
-    invoice.payments.push({
+    const receipt_no = await nextSalesReceiptNo(payDate);
+    const paymentRow = {
+      receipt_no,
       payment_date: payDate,
       amount,
       bank_cash_account_id: wallet?._id,
       bank_cash_account_code: wallet?.code,
       bank_cash_account_name: wallet?.name,
       receipt_account_code: receiptGl.code,
+      receipt_account_name: receiptGl.name,
+      ar_account_code: arGl.code,
+      ar_account_name: arGl.name,
       journal_entry_id: journal._id,
       journal_entry_no: journal.entry_no,
       notes: String(req.body?.notes || '').trim(),
       recorded_by_name: actor.created_by_name,
       recorded_by_email: actor.created_by_email,
       recorded_at: new Date(),
-    });
+    };
+    invoice.payments.push(paymentRow);
     await invoice.save();
+
+    const savedPayment = invoice.payments[invoice.payments.length - 1];
 
     res.json({
       success: true,
       data: {
         invoice,
         journal,
+        payment: {
+          ...((savedPayment && typeof savedPayment.toObject === 'function'
+            ? savedPayment.toObject()
+            : savedPayment) || paymentRow),
+          invoice_id: invoice._id,
+          invoice_no: invoice.invoice_no,
+          invoice_date: invoice.invoice_date,
+          due_date: invoice.due_date,
+          customer_id: invoice.customer_id,
+          customer_name: invoice.customer_name,
+          customer_vat_trn: invoice.customer_vat_trn,
+          invoice_total: toNum(invoice.total_amount),
+          invoice_amount_paid: toNum(invoice.amount_paid),
+          invoice_status: invoice.status,
+        },
         amount_applied: amount,
         remaining: Math.max(0, remaining),
       },

@@ -1769,12 +1769,21 @@ router.post('/', async (req, res) => {
     const prepaid = Boolean(prepaidMode) && isUaeToPhCode(invoice.service_code || providedServiceCode);
     const quote = invoiceRequest?.quotation_request;
     const quoteHasAdvance = remainingQuoteAdvance(invoiceRequest) > 0;
+    // Tabby/Card advance with no fee-on-top booked yet: carve VAT-inclusive gateway into the invoice JE.
+    const advanceModeKey = quote?.advance?.mode ? String(quote.advance.mode).toUpperCase() : '';
+    const advanceAlreadyBookedGateway = Number(quote?.advance?.gateway_charge) > 0.009;
+    const gatewayFromAdvance =
+      quoteHasAdvance &&
+      !advanceAlreadyBookedGateway &&
+      PAYMENT_MODES[advanceModeKey]?.rate > 0
+        ? advanceModeKey
+        : undefined;
     const gl = await postInvoiceJournal(invoice, {
       actorId: created_by,
       customerName: populatedInvoice?.client_id?.company_name,
       draftJournalId: quote?.draft_journal_id,
       quotationNumber: quote?.draft_journal_id ? quote.quotation_number : undefined,
-      gatewayMode: prepaid && !quoteHasAdvance ? prepaidMode : undefined,
+      gatewayMode: (prepaid && !quoteHasAdvance ? prepaidMode : undefined) || gatewayFromAdvance,
     });
     populatedInvoice.gl_sync = invoice.gl_sync;
     if (gl.status === 'POSTED') {

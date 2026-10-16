@@ -217,18 +217,27 @@ function scaleRevenueParts(parts, revenue) {
   return lines;
 }
 
-// Prepaid Card/Tabby: the charge is part of the total the customer paid, so it is moved out of the
-// revenue lines into gateway revenue (total and VAT unchanged).
-function carveGatewayCharge(split, revenue, rate) {
-  const gatewayNet = round2(revenue * rate);
-  if (!(gatewayNet > 0)) return { lines: split, gatewayNet: 0 };
-  const lines = split.map((l) => ({ ...l, amount: round2(l.amount * (1 - rate)) }));
-  const diff = round2(revenue - gatewayNet - lines.reduce((s, l) => s + l.amount, 0));
-  if (diff) {
+// Prepaid Card/Tabby: fee is VAT-inclusive and already inside the invoice total.
+// Example: total 377, Card 4% → gross 15.08 → Cr 4040 14.36 + Cr VAT 0.72; sales revenue reduced by 15.08.
+function carveGatewayCharge(split, revenue, rate, total) {
+  const gatewayGross = round2(Math.min(toAmount(total) * rate, revenue));
+  if (!(gatewayGross > 0)) return { lines: split, gatewayNet: 0, gatewayVat: 0, gatewayGross: 0 };
+  const gatewayNet = round2(gatewayGross / (1 + GATEWAY_VAT_RATE));
+  const gatewayVat = round2(gatewayGross - gatewayNet);
+  const remainingRevenue = round2(revenue - gatewayGross);
+  const scale = revenue > 0 ? remainingRevenue / revenue : 0;
+  const lines = split.map((l) => ({ ...l, amount: round2(l.amount * scale) }));
+  const diff = round2(remainingRevenue - lines.reduce((s, l) => s + l.amount, 0));
+  if (diff && lines.length) {
     const largest = lines.reduce((a, b) => (b.amount > a.amount ? b : a));
     largest.amount = round2(largest.amount + diff);
   }
-  return { lines: [...lines.filter((l) => l.amount > 0), { role: 'gateway', amount: gatewayNet }], gatewayNet };
+  return {
+    lines: [...lines.filter((l) => l.amount > 0), { role: 'gateway', amount: gatewayNet }],
+    gatewayNet,
+    gatewayVat,
+    gatewayGross,
+  };
 }
 
 function isUaeToPhCode(code) {
@@ -249,7 +258,8 @@ async function saveGlSync(invoice, patch) {
 /**
  * Post Dr Accounts Receivable / Cr Sales Revenue / Cr VAT Output for a generated finance invoice.
  * draftJournalId: the quotation's DRAFT journal is finalised with the invoice figures and posted instead of
- * creating a new one. gatewayMode (prepaid Card/Tabby) moves the charge out of revenue into 4040.
+ * creating a new one. gatewayMode (prepaid Card/Tabby) carves the VAT-inclusive fee from the total
+ * into Cr 4040 (net) + Cr VAT output (5%), reducing sales revenue by the gross fee.
  * Never throws: failures are recorded on invoice.gl_sync so invoice generation is not blocked.
  */
 async function postInvoiceJournal(invoice, { actorId, customerName, draftJournalId, gatewayMode, quotationNumber } = {}) {
@@ -286,14 +296,16 @@ async function postInvoiceJournal(invoice, { actorId, customerName, draftJournal
 
     const modeKey = gatewayMode ? String(gatewayMode).toUpperCase() : invoice.gl_sync?.gateway_included_mode;
     const gatewayConfig = modeKey ? PAYMENT_MODES[modeKey] : null;
-    const { lines: split, gatewayNet } = carveGatewayCharge(
+    const { lines: split, gatewayNet, gatewayVat, gatewayGross } = carveGatewayCharge(
       invoiceRevenueSplit(invoice, revenue),
       revenue,
-      gatewayConfig?.rate || 0
+      gatewayConfig?.rate || 0,
+      total
     );
+    const needsVat = tax > 0 || gatewayVat > 0;
     const [arGl, vatGl, ...revenueGls] = await Promise.all([
       resolveAccount('ar'),
-      tax > 0 ? resolveAccount('vat') : Promise.resolve(null),
+      needsVat ? resolveAccount('vat') : Promise.resolve(null),
       ...split.map((part) => resolveAccount(part.role)),
     ]);
     const ref = invoiceRef(invoice);
@@ -316,7 +328,7 @@ async function postInvoiceJournal(invoice, { actorId, customerName, draftJournal
         account_name: revenueGls[i].name,
         description:
           part.role === 'gateway'
-            ? `${gatewayConfig.label} charge ${Math.round(gatewayConfig.rate * 100)}% (included in total) ${ref}${awb}`
+            ? `${gatewayConfig.label} charge ${Math.round(gatewayConfig.rate * 100)}% VAT-inclusive (net) ${ref}${awb}`
             : `${invoice.invoice_origin === 'CANCELLATION' && part.role === 'delivery' ? 'Domestic delivery fees' : REVENUE_LINE_TEXT[part.role]} ${ref}${awb}`,
         debit: 0,
         credit: part.amount,
@@ -330,6 +342,16 @@ async function postInvoiceJournal(invoice, { actorId, customerName, draftJournal
         description: `VAT output ${invoice.tax_rate || 5}% ${ref}`,
         debit: 0,
         credit: tax,
+      });
+    }
+    if (gatewayVat > 0) {
+      lines.push({
+        account_id: vatGl._id,
+        account_code: vatGl.code,
+        account_name: vatGl.name,
+        description: `VAT 5% on ${gatewayConfig.label.toLowerCase()} charge ${ref}`,
+        debit: 0,
+        credit: gatewayVat,
       });
     }
 
@@ -376,12 +398,25 @@ async function postInvoiceJournal(invoice, { actorId, customerName, draftJournal
       journal_no: journal.entry_no,
       posted_total: total,
       posted_tax: tax,
-      ...(gatewayNet > 0
-        ? { gateway_included_mode: modeKey, gateway_included_rate: gatewayConfig.rate, gateway_included_net: gatewayNet }
+      ...(gatewayGross > 0
+        ? {
+            gateway_included_mode: modeKey,
+            gateway_included_rate: gatewayConfig.rate,
+            gateway_included_gross: gatewayGross,
+            gateway_included_net: gatewayNet,
+            gateway_included_vat: gatewayVat,
+          }
         : {}),
       last_error: undefined,
     });
-    return { status: 'POSTED', journal_id: journal._id, journal_no: journal.entry_no, gateway_net: gatewayNet };
+    return {
+      status: 'POSTED',
+      journal_id: journal._id,
+      journal_no: journal.entry_no,
+      gateway_net: gatewayNet,
+      gateway_vat: gatewayVat,
+      gateway_gross: gatewayGross,
+    };
   } catch (error) {
     console.error(`❌ GL posting failed for invoice ${invoiceRef(invoice)}:`, error.message);
     try {
@@ -417,7 +452,22 @@ async function upsertQuoteDraftJournal(request, { actorId } = {}) {
     if (total <= 0) return { status: 'SKIPPED', reason: 'Quotation total is zero' };
     const tax = round2(Math.max(0, total - (shipping + pickup + deliveryFee + insurance)));
     const revenue = round2(total - tax);
-    const split = scaleRevenueParts({ shipping: shipping + deliveryFee + insurance, pickup, delivery: 0 }, revenue);
+    const baseSplit = scaleRevenueParts({ shipping: shipping + deliveryFee + insurance, pickup, delivery: 0 }, revenue);
+
+    // Tabby/Card advance already recorded (fee not booked on the advance JE): preview the VAT-inclusive
+    // carve on this draft so Payment Gateway Revenue shows before the invoice is generated.
+    const adv = q.advance;
+    const advanceModeKey = adv?.mode ? String(adv.mode).toUpperCase() : '';
+    const advanceGatewayConfig =
+      adv?.journal_id && !adv?.void_journal_id && !(Number(adv?.gateway_charge) > 0.009)
+        ? PAYMENT_MODES[advanceModeKey]
+        : null;
+    const { lines: split, gatewayNet, gatewayVat, gatewayGross } = carveGatewayCharge(
+      baseSplit,
+      revenue,
+      advanceGatewayConfig?.rate || 0,
+      total
+    );
 
     const awb = request.tracking_code || request.awb_number || '';
     const awbText = awb ? ` · AWB ${awb}` : '';
@@ -430,11 +480,15 @@ async function upsertQuoteDraftJournal(request, { actorId } = {}) {
       shipping: `Shipping ${q.quotation_chargeable_weight || 0} kg × AED ${q.quotation_rate_per_kg || 0}/kg${extras.length ? ` (incl. ${extras.join(', ')})` : ''}${awbText}`,
       pickup: `Pickup charge (${PICKUP_LOCATION_TEXT[q.quotation_pickup_location] || 'pickup'})${awbText}`,
       delivery: `Delivery fee${awbText}`,
+      gateway: advanceGatewayConfig
+        ? `${advanceGatewayConfig.label} charge ${Math.round(advanceGatewayConfig.rate * 100)}% VAT-inclusive (net) ${qno}${awbText}`
+        : `Payment gateway charge ${qno}${awbText}`,
     };
 
+    const needsVat = tax > 0 || gatewayVat > 0;
     const [arGl, vatGl, ...revenueGls] = await Promise.all([
       resolveAccount('ar'),
-      tax > 0 ? resolveAccount('vat') : Promise.resolve(null),
+      needsVat ? resolveAccount('vat') : Promise.resolve(null),
       ...split.map((part) => resolveAccount(part.role)),
     ]);
     const lines = [
@@ -450,7 +504,7 @@ async function upsertQuoteDraftJournal(request, { actorId } = {}) {
         account_id: revenueGls[i]._id,
         account_code: revenueGls[i].code,
         account_name: revenueGls[i].name,
-        description: lineText[part.role],
+        description: lineText[part.role] || `${part.role} ${qno}${awbText}`,
         debit: 0,
         credit: part.amount,
       })),
@@ -463,6 +517,16 @@ async function upsertQuoteDraftJournal(request, { actorId } = {}) {
         description: `VAT output 5% on pickup ${qno}`,
         debit: 0,
         credit: tax,
+      });
+    }
+    if (gatewayVat > 0 && advanceGatewayConfig) {
+      lines.push({
+        account_id: vatGl._id,
+        account_code: vatGl.code,
+        account_name: vatGl.name,
+        description: `VAT 5% on ${advanceGatewayConfig.label.toLowerCase()} charge ${qno}`,
+        debit: 0,
+        credit: gatewayVat,
       });
     }
 
@@ -928,8 +992,12 @@ async function recordInvoicePayment(
     line(config.debitRole, collected, 0, `${config.label} received ${ref}${refText}`),
     line('ar', 0, applied, `Clear AR ${ref}${type === 'PARTIAL' ? ' (partial)' : ''}`),
   ];
-  if (gatewayNet > 0) lines.push(line('gateway', 0, gatewayNet, `${config.label} charge ${ref}`));
-  if (gatewayVat > 0) lines.push(line('vat', 0, gatewayVat, `VAT 5% on ${config.label.toLowerCase()} charge ${ref}`));
+  if (gatewayNet > 0) {
+    lines.push(line('gateway', 0, gatewayNet, `${config.label} charge ${Math.round(config.rate * 100)}% VAT-inclusive (net) ${ref}`));
+  }
+  if (gatewayVat > 0) {
+    lines.push(line('vat', 0, gatewayVat, `VAT 5% on ${config.label.toLowerCase()} charge ${ref}`));
+  }
 
   const journal = await createJournalWithNextNo(when, {
     memo: `${type === 'FULL' ? 'Payment' : 'Partial payment'} ${ref} via ${config.label}`,
@@ -1052,41 +1120,60 @@ async function recordQuoteAdvance(
   const quoteTotal = round2(Number(quote.quotation_total) || 0);
   const collected = round2(Number(amountCollected) || quoteTotal);
   if (!(collected > 0)) return { error: 'Enter the advance amount' };
-  if (quoteTotal > 0 && collected > quoteTotal + 0.009) {
-    return { error: `Advance cannot be more than the quotation total AED ${quoteTotal.toFixed(2)}` };
+  const maxWithGateway = round2(quoteTotal * (1 + (config.rate || 0)));
+  if (quoteTotal > 0 && collected > maxWithGateway + 0.009) {
+    return {
+      error: config.rate
+        ? `Advance cannot be more than AED ${maxWithGateway.toFixed(2)} (quotation + ${Math.round(config.rate * 100)}% ${config.label} charges)`
+        : `Advance cannot be more than the quotation total AED ${quoteTotal.toFixed(2)}`,
+    };
   }
+  // Fee-on-top (Card/Tabby): amount above the quotation total is the VAT-inclusive gateway charge.
+  // If they enter exactly the quotation total with Tabby/Card, gateway is carved later on the invoice /
+  // draft JE (fee treated as included in the quoted price).
+  let applied = collected;
+  let gatewayCharge = 0;
+  if (config.rate > 0 && quoteTotal > 0 && collected > quoteTotal + 0.009) {
+    applied = quoteTotal;
+    gatewayCharge = round2(collected - applied);
+  }
+  const gatewayNet = gatewayCharge > 0 ? round2(gatewayCharge / (1 + GATEWAY_VAT_RATE)) : 0;
+  const gatewayVat = gatewayCharge > 0 ? round2(gatewayCharge - gatewayNet) : 0;
+
   const dated = assertPaymentDate(collectedAt || new Date());
   if (dated.error) return dated;
   const when = dated.when;
   const actor = await resolveActor(actorId);
-  const [debitGl, advanceGl] = await Promise.all([
-    resolveAccount(config.debitRole),
-    resolveAccount('customerAdvance'),
-  ]);
+  const roles = [config.debitRole, 'customerAdvance'];
+  if (gatewayNet > 0) roles.push('gateway');
+  if (gatewayVat > 0) roles.push('vat');
+  const accounts = {};
+  for (const role of roles) accounts[role] = await resolveAccount(role);
   const quoteNo = quote.quotation_number || 'quotation';
   const refText = reference ? ` · ${String(reference).trim()}` : '';
+  const line = (role, debit, credit, description) => ({
+    account_id: accounts[role]._id,
+    account_code: accounts[role].code,
+    account_name: accounts[role].name,
+    description,
+    debit,
+    credit,
+  });
+  const lines = [
+    line(config.debitRole, collected, 0, `${config.label} advance ${quoteNo}${refText}`),
+    line('customerAdvance', 0, applied, `Customer Payment Due ${quoteNo}`),
+  ];
+  if (gatewayNet > 0) {
+    lines.push(line('gateway', 0, gatewayNet, `${config.label} charge ${Math.round(config.rate * 100)}% VAT-inclusive (net) ${quoteNo}`));
+  }
+  if (gatewayVat > 0) {
+    lines.push(line('vat', 0, gatewayVat, `VAT 5% on ${config.label.toLowerCase()} charge ${quoteNo}`));
+  }
   const journal = await createJournalWithNextNo(when, {
     memo: `Advance on ${quoteNo} via ${config.label}`,
     source: 'PAYMENT',
     status: 'POSTED',
-    lines: [
-      {
-        account_id: debitGl._id,
-        account_code: debitGl.code,
-        account_name: debitGl.name,
-        description: `${config.label} advance ${quoteNo}${refText}`,
-        debit: collected,
-        credit: 0,
-      },
-      {
-        account_id: advanceGl._id,
-        account_code: advanceGl.code,
-        account_name: advanceGl.name,
-        description: `Customer Payment Due ${quoteNo}`,
-        debit: 0,
-        credit: collected,
-      },
-    ],
+    lines,
     total_debit: collected,
     total_credit: collected,
     posted_at: when,
@@ -1099,7 +1186,7 @@ async function recordQuoteAdvance(
   await adjustWalletBalances(journal.lines);
 
   const advance = {
-    amount: collected,
+    amount: applied,
     mode: modeKey,
     reference: reference ? String(reference).trim() : undefined,
     collected_at: when,
@@ -1107,6 +1194,14 @@ async function recordQuoteAdvance(
     recorded_by_name: actor.created_by_name,
     journal_id: journal._id,
     journal_no: journal.entry_no,
+    ...(gatewayCharge > 0
+      ? {
+          amount_collected: collected,
+          gateway_charge: gatewayCharge,
+          gateway_net: gatewayNet,
+          gateway_vat: gatewayVat,
+        }
+      : {}),
   };
   invoiceRequest.quotation_request.advance = advance;
   invoiceRequest.markModified('quotation_request');
@@ -1118,6 +1213,10 @@ async function recordQuoteAdvance(
     } catch (_) {
       /* quotation copy is optional */
     }
+  }
+  // Refresh the UAE→PH draft invoice JE so Tabby/Card (fee included in quote total) shows 4040 immediately.
+  if (config.rate > 0 && !(gatewayCharge > 0)) {
+    await upsertQuoteDraftJournal(invoiceRequest, { actorId });
   }
   return { journal, advance };
 }

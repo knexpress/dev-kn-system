@@ -1,6 +1,6 @@
 {
   "name": "knex-finance-backend",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "KNEX Finance Management System Backend API",
   "main": "server.js",
   "scripts": {

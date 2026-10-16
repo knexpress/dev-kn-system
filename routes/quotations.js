@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const { ManualQuotation, InvoiceRequest } = require('../models');
 const auth = require('../middleware/auth');
 const { upsertQuoteDraftJournal, recordManualQuotationAdvance } = require('../services/invoice-gl');
+const { quoteDetailFields } = require('../utils/quotation-request-sync');
 
 const router = express.Router();
 
@@ -276,21 +277,6 @@ router.post('/', auth, async (req, res) => {
   }
 });
 
-// Prices copied onto the linked invoice request so verification and invoice generation use them
-function quotePriceFields(quotation) {
-  return {
-    'quotation_request.quotation_total': quotation.total_amount,
-    'quotation_request.quotation_rate_per_kg': quotation.rate_per_kg,
-    'quotation_request.quotation_chargeable_weight': quotation.chargeable_weight_kg,
-    'quotation_request.quotation_shipping_amount': quotation.shipping_amount,
-    'quotation_request.quotation_pickup_location': quotation.pickup_location,
-    'quotation_request.quotation_pickup_charge': quotation.pickup_charge,
-    'quotation_request.quotation_pickup_vat': quotation.pickup_vat,
-    'quotation_request.quotation_delivery_charge': quotation.delivery_charge,
-    'quotation_request.quotation_insurance_charge': quotation.insurance_charge,
-  };
-}
-
 // Finance generates the quotation for an Operations request. Marks the request QUOTED and keeps it
 // with Finance (download / send to customer / edit). Finance later moves it to IN_PROGRESS via
 // PUT /invoice-requests/:id/status so the existing EMPOST/status flow runs unchanged.
@@ -335,7 +321,7 @@ router.post('/from-request/:invoiceRequestId', auth, async (req, res) => {
           'quotation_request.stage': 'QUOTED',
           'quotation_request.quotation_id': quotation._id,
           'quotation_request.quotation_number': quotation.quotation_number,
-          ...quotePriceFields(quotation),
+          ...quoteDetailFields(quotation),
           'quotation_request.quoted_at': new Date(),
           'quotation_request.quoted_by_name': req.user?.employee?.full_name || req.user?.email || 'Unknown',
         },
@@ -407,7 +393,7 @@ router.put('/:id', auth, async (req, res) => {
       return res.status(404).json({ success: false, error: 'Quotation not found' });
     }
 
-    // Keep the linked request's prices in step until it is invoiced
+    // Keep the linked request's quote details (weights, boxes, items, prices) in step until invoiced
     let linkedRequestUpdated = false;
     if (quotation.invoice_request_id) {
       const synced = await InvoiceRequest.updateOne(
@@ -416,7 +402,7 @@ router.put('/:id', auth, async (req, res) => {
           'quotation_request.quotation_id': quotation._id,
           status: { $nin: ['COMPLETED', 'CANCELLED'] },
         },
-        { $set: quotePriceFields(quotation) }
+        { $set: quoteDetailFields(quotation) }
       );
       linkedRequestUpdated = synced.modifiedCount > 0;
       if (global.awbCache) global.awbCache.clear();
@@ -474,7 +460,15 @@ router.delete('/:id', auth, async (req, res) => {
               'quotation_request.quotation_number': '',
               'quotation_request.quoted_at': '',
               'quotation_request.quoted_by_name': '',
-              ...Object.fromEntries(Object.keys(quotePriceFields({})).map((key) => [key, ''])),
+              'quotation_request.quotation_total': '',
+              'quotation_request.quotation_rate_per_kg': '',
+              'quotation_request.quotation_chargeable_weight': '',
+              'quotation_request.quotation_shipping_amount': '',
+              'quotation_request.quotation_pickup_location': '',
+              'quotation_request.quotation_pickup_charge': '',
+              'quotation_request.quotation_pickup_vat': '',
+              'quotation_request.quotation_delivery_charge': '',
+              'quotation_request.quotation_insurance_charge': '',
             },
           }
         );

@@ -87,6 +87,30 @@ const journalEntrySchema = new mongoose.Schema(
         uploaded_at: { type: Date, default: Date.now },
       },
     ],
+    // Period-lock corrections: adjustment JE that corrects a locked-period entry
+    adjusts_journal_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'JournalEntry',
+      required: false,
+    },
+    adjusts_journal_no: { type: String, required: false },
+    adjusted_by_journal_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'JournalEntry',
+      required: false,
+    },
+    adjusted_by_journal_no: { type: String, required: false },
+    // Latest intended lines after locked-period adjustments (for chaining corrections)
+    last_effective_lines: [
+      {
+        account_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Account' },
+        account_code: { type: String },
+        account_name: { type: String },
+        description: { type: String },
+        debit: { type: Number, default: 0 },
+        credit: { type: Number, default: 0 },
+      },
+    ],
   },
   { timestamps: true }
 );
@@ -94,6 +118,30 @@ const journalEntrySchema = new mongoose.Schema(
 journalEntrySchema.index({ entry_date: -1 });
 journalEntrySchema.index({ status: 1, entry_date: -1 });
 journalEntrySchema.index({ 'lines.account_code': 1 });
+
+const accountingPeriodSchema = new mongoose.Schema(
+  {
+    period_key: { type: String, required: true, unique: true, trim: true }, // YYYY-MM
+    year: { type: Number, required: true },
+    month: { type: Number, required: true, min: 1, max: 12 },
+    status: {
+      type: String,
+      enum: ['OPEN', 'LOCKED'],
+      default: 'OPEN',
+    },
+    locked_at: { type: Date, required: false },
+    locked_by_name: { type: String, required: false },
+    locked_by_email: { type: String, required: false },
+    unlocked_at: { type: Date, required: false },
+    unlocked_by_name: { type: String, required: false },
+    unlocked_by_email: { type: String, required: false },
+    notes: { type: String, required: false },
+  },
+  { timestamps: true }
+);
+
+accountingPeriodSchema.index({ year: -1, month: -1 });
+accountingPeriodSchema.index({ status: 1 });
 
 const inventoryItemSchema = new mongoose.Schema(
   {
@@ -155,6 +203,8 @@ inventoryTransactionSchema.index({ type: 1 });
 const Account = mongoose.models.Account || mongoose.model('Account', accountSchema);
 const JournalEntry =
   mongoose.models.JournalEntry || mongoose.model('JournalEntry', journalEntrySchema);
+const AccountingPeriod =
+  mongoose.models.AccountingPeriod || mongoose.model('AccountingPeriod', accountingPeriodSchema);
 const InventoryItem =
   mongoose.models.InventoryItem || mongoose.model('InventoryItem', inventoryItemSchema);
 const InventoryTransaction =
@@ -410,6 +460,16 @@ const SupplierPayment =
 const PurchaseOrder =
   mongoose.models.PurchaseOrder || mongoose.model('PurchaseOrder', purchaseOrderSchema);
 
+const pettyCashVoucherLineSchema = new mongoose.Schema(
+  {
+    description: { type: String, required: false, trim: true },
+    account_code: { type: String, required: true, trim: true },
+    account_name: { type: String, required: false, trim: true },
+    amount: { type: Number, required: true, min: 0.01 },
+  },
+  { _id: false }
+);
+
 const pettyCashVoucherSchema = new mongoose.Schema(
   {
     voucher_no: { type: String, required: true, unique: true },
@@ -419,8 +479,13 @@ const pettyCashVoucherSchema = new mongoose.Schema(
     description: { type: String, required: false, trim: true },
     amount: { type: Number, required: true, min: 0.01 },
     currency: { type: String, default: 'AED' },
+    // Kept for older single-line vouchers; multi-line uses `lines` and these mirror the first line / totals
     expense_account_code: { type: String, required: true, default: '5100' },
     expense_account_name: { type: String, required: false },
+    lines: {
+      type: [pettyCashVoucherLineSchema],
+      default: undefined,
+    },
     petty_cash_account_id: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'BankCashAccount',
@@ -704,6 +769,7 @@ const salesInvoiceLineSchema = new mongoose.Schema(
 
 const salesInvoicePaymentSchema = new mongoose.Schema(
   {
+    receipt_no: { type: String, required: false, trim: true },
     payment_date: { type: Date, required: true },
     amount: { type: Number, required: true, min: 0.01 },
     bank_cash_account_id: {
@@ -714,6 +780,9 @@ const salesInvoicePaymentSchema = new mongoose.Schema(
     bank_cash_account_code: { type: String, required: false },
     bank_cash_account_name: { type: String, required: false },
     receipt_account_code: { type: String, required: true },
+    receipt_account_name: { type: String, required: false },
+    ar_account_code: { type: String, required: false },
+    ar_account_name: { type: String, required: false },
     journal_entry_id: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'JournalEntry',
@@ -1090,6 +1159,7 @@ const BankReconciliation =
 module.exports = {
   Account,
   JournalEntry,
+  AccountingPeriod,
   InventoryItem,
   InventoryTransaction,
   BankCashAccount,

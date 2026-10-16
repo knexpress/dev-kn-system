@@ -1,12 +1,13 @@
 const express = require('express');
 const mongoose = require('mongoose');
-const { InvoiceRequest, Employee, Collections, AuditReport, Booking, Department } = require('../models');
+const { InvoiceRequest, Employee, Collections, AuditReport, Booking, Department, ManualQuotation } = require('../models');
 const { DeliveryAssignment, Invoice, Client } = require('../models/unified-schema');
 const { createNotificationsForAllUsers, createNotificationsForDepartment } = require('./notifications');
 const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/id-generators');
 const { sanitizeRegex } = require('../middleware/security');
 const { cleanupBookingIdentityDocumentsForDeliveredInvoiceRequest } = require('../utils/booking-identity-cleanup');
+const { applyQuoteDetailsToRequest } = require('../utils/quotation-request-sync');
 const auth = require('../middleware/auth');
 const jwt = require('jsonwebtoken');
 const {
@@ -1595,8 +1596,16 @@ router.put('/:id/status', async (req, res) => {
       Boolean(invoiceRequest.quotation_request?.quotation_id);
     const sender = sentToOperations ? await optionalUser(req) : null;
     if (sentToOperations) {
+      // Re-sync the latest Finance quotation onto quotation_request so Ops verify matches what was sent
+      try {
+        const quotation = await ManualQuotation.findById(invoiceRequest.quotation_request.quotation_id);
+        if (quotation) applyQuoteDetailsToRequest(invoiceRequest, quotation);
+      } catch (syncError) {
+        console.error('Failed to sync quotation details on send to Operations:', syncError.message);
+      }
       invoiceRequest.quotation_request.sent_to_operations_at = new Date();
       invoiceRequest.quotation_request.sent_to_operations_by_name = sender?.full_name || sender?.email || undefined;
+      if (global.awbCache) global.awbCache.clear();
     }
 
     if (status === 'COMPLETED') {
@@ -1716,6 +1725,8 @@ router.put('/:id/status', async (req, res) => {
       if (draftJournal.status === 'DRAFT') {
         invoiceRequest.quotation_request.draft_journal_id = draftJournal.journal_id;
         invoiceRequest.quotation_request.draft_journal_no = draftJournal.journal_no;
+        invoiceRequest.markModified('quotation_request');
+        await invoiceRequest.save();
       }
     }
 

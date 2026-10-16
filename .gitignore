@@ -31,6 +31,10 @@ build/
 # Script exports (may contain customer data)
 exports/
 
+# Uploaded files / local data dumps
+uploads/
+*.xlsx
+
 # Temporary files and results
 *.pdf
 empost-*.json
