@@ -1,0 +1,55 @@
+{
+  "name": "knex-finance-backend",
+  "version": "2.0.0",
+  "description": "KNEX Finance Management System Backend API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --max-old-space-size=4096 server.js",
+    "dev": "nodemon --exec \"node --max-old-space-size=4096\" server.js",
+    "build": "echo \"no build step\"",
+    "seed": "node --max-old-space-size=4096 scripts/seed.js",
+    "seed:manager": "node scripts/seed-manager-user.js",
+    "seed:sales": "node scripts/seed-sales-user.js",
+    "seed:finance": "node scripts/seed-finance-user.js",
+    "seed:invoices": "node scripts/seed-invoices.js",
+    "pdfs:to-drive": "node scripts/batch-pdfs-to-drive.js",
+    "pdfs:reupload-missing": "node scripts/reupload-missing-drive-pdfs.js",
+    "google-drive:auth": "node scripts/google-drive-oauth-setup.js",
+    "google-drive:auth:write-env": "node scripts/google-drive-oauth-setup.js --write-env",
+    "setup": "node setup-env.js",
+    "test": "node scripts/test-connection.js",
+    "test:finance-setup": "node --test tests/finance-setup/*.test.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "csv-parser": "^3.2.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.5",
+    "express-validator": "^7.0.1",
+    "googleapis": "^128.0.0",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "jspdf": "^2.5.2",
+    "mongoose": "^8.0.3",
+    "multer": "^2.0.2",
+    "node-cron": "^4.2.1",
+    "pg": "^8.16.3",
+    "pdfkit": "^0.17.2",
+    "ws": "^8.16.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "keywords": [
+    "finance",
+    "logistics",
+    "api",
+    "mongodb"
+  ],
+  "author": "KNEX Team",
+  "license": "MIT"
+}

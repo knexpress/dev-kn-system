@@ -1,0 +1,1582 @@
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+
+// Department Schema
+const departmentSchema = new mongoose.Schema({
+  name: {
+    type: String,
+    required: true,
+    unique: true,
+  },
+  description: {
+    type: String,
+    required: true,
+  },
+}, {
+  timestamps: true,
+});
+
+// name index is automatically created by unique: true
+
+// Employee Schema
+const employeeSchema = new mongoose.Schema({
+  full_name: {
+    type: String,
+    required: true,
+  },
+  email: {
+    type: String,
+    required: true,
+    unique: true,
+  },
+  department_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Department',
+    required: true,
+  },
+}, {
+  timestamps: true,
+});
+
+// email index is automatically created by unique: true
+employeeSchema.index({ department_id: 1 });
+
+// User Schema
+const userSchema = new mongoose.Schema({
+  email: {
+    type: String,
+    required: true,
+    unique: true,
+  },
+  password: {
+    type: String,
+    required: true,
+  },
+  full_name: {
+    type: String,
+    required: true,
+  },
+  department_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Department',
+    required: true,
+  },
+  employee_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Employee',
+    required: false,
+  },
+  role: {
+    type: String,
+    required: true,
+    enum: ['SUPERADMIN', 'ADMIN', 'USER'],
+    default: 'USER',
+  },
+  isActive: {
+    type: Boolean,
+    default: true,
+  },
+  lastLogin: {
+    type: Date,
+  },
+  must_change_password: {
+    type: Boolean,
+    default: false,
+  },
+  password_changed_at: {
+    type: Date,
+    required: false,
+  },
+  finance_capabilities: {
+    type: mongoose.Schema.Types.Mixed,
+    required: false,
+  },
+}, {
+  timestamps: true,
+});
+
+userSchema.set('toJSON', {
+  transform(_doc, ret) {
+    delete ret.password;
+    return ret;
+  },
+});
+userSchema.set('toObject', {
+  transform(_doc, ret) {
+    delete ret.password;
+    return ret;
+  },
+});
+
+// Hash password before saving
+userSchema.pre('save', async function(next) {
+  if (!this.isModified('password')) return next();
+  
+  try {
+    // Check if password is already a bcrypt hash (starts with $2a$, $2b$, or $2y$)
+    // This prevents double-hashing when password is already hashed
+    if (this.password && /^\$2[ayb]\$.{56}$/.test(this.password)) {
+      // Password is already hashed, skip hashing
+      return next();
+    }
+    
+    const salt = await bcrypt.genSalt(10);
+    this.password = await bcrypt.hash(this.password, salt);
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Method to compare password
+userSchema.methods.comparePassword = async function(candidatePassword) {
+  return bcrypt.compare(candidatePassword, this.password);
+};
+
+// email index is automatically created by unique: true
+userSchema.index({ department_id: 1 });
+userSchema.index({ role: 1 });
+
+// Client Schema
+const clientSchema = new mongoose.Schema({
+  company_name: {
+    type: String,
+    required: true,
+  },
+  contact_name: {
+    type: String,
+    required: true,
+  },
+  address: {
+    type: String,
+    required: true,
+  },
+}, {
+  timestamps: true,
+});
+
+// Invoice Embedded Schema
+const invoiceEmbeddedSchema = new mongoose.Schema({
+  status: {
+    type: String,
+    required: true,
+    enum: ['DRAFT', 'SENT', 'PAID', 'OVERDUE'],
+    default: 'DRAFT',
+  },
+  amount: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: true,
+  },
+  base_rate: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: true,
+  },
+  issuedAt: {
+    type: Date,
+    required: true,
+  },
+}, { _id: false });
+
+// Chat Message Schema
+const chatMessageSchema = new mongoose.Schema({
+  employee_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Employee',
+    required: true,
+  },
+  message: {
+    type: String,
+    required: true,
+  },
+  sentAt: {
+    type: Date,
+    required: true,
+    default: Date.now,
+  },
+}, { _id: false });
+
+// Request Schema
+const requestSchema = new mongoose.Schema({
+  client_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Client',
+    required: true,
+  },
+  status: {
+    type: String,
+    required: true,
+    enum: ['PENDING', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED'],
+    default: 'PENDING',
+  },
+  awb_number: {
+    type: String,
+    required: true,
+    unique: true,
+  },
+  delivery_status: {
+    type: String,
+    required: true,
+    enum: ['SHIPPED', 'IN_TRANSIT', 'DELIVERED', 'FAILED'],
+    default: 'SHIPPED',
+  },
+  assigned_to_employee_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Employee',
+    required: true,
+  },
+  invoice: invoiceEmbeddedSchema,
+  chatHistory: [chatMessageSchema],
+}, {
+  timestamps: true,
+});
+
+requestSchema.index({ client_id: 1 });
+requestSchema.index({ status: 1 });
+// awb_number index is automatically created by unique: true
+requestSchema.index({ assigned_to_employee_id: 1 });
+
+// Ticket Schema
+const ticketSchema = new mongoose.Schema({
+  title: {
+    type: String,
+    required: true,
+  },
+  description: {
+    type: String,
+    required: true,
+  },
+  status: {
+    type: String,
+    required: true,
+    enum: ['OPEN', 'IN_PROGRESS', 'CLOSED'],
+    default: 'OPEN',
+  },
+  reported_by_employee_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Employee',
+    required: true,
+  },
+  assigned_to_employee_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Employee',
+    required: true,
+  },
+  closedAt: {
+    type: Date,
+  },
+}, {
+  timestamps: true,
+});
+
+ticketSchema.index({ status: 1 });
+ticketSchema.index({ reported_by_employee_id: 1 });
+ticketSchema.index({ assigned_to_employee_id: 1 });
+
+// Report Schema
+const reportSchema = new mongoose.Schema({
+  title: {
+    type: String,
+    required: true,
+  },
+  generated_by_employee_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Employee',
+    required: false,
+  },
+  generated_by_employee_name: {
+    type: String,
+    required: false,
+  },
+  report_data: {
+    type: mongoose.Schema.Types.Mixed,
+    required: true,
+  },
+  generatedAt: {
+    type: Date,
+    required: true,
+    default: Date.now,
+  },
+}, {
+  timestamps: true,
+});
+
+
+
+// Invoice Request Schema
+const invoiceRequestSchema = new mongoose.Schema({
+  // Invoice & Tracking Information
+  invoice_number: {
+    type: String,
+    required: false,
+  },
+  tracking_code: {
+    type: String,
+    required: false,
+  },
+  service_code: {
+    type: String,
+    required: false,
+  },
+  
+  // Shipment Details
+  amount: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: false,
+  },
+  weight_kg: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: false,
+  },
+  volume_cbm: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: false,
+  },
+  
+  // Customer Information
+  customer_name: {
+    type: String,
+    required: true,
+  },
+  customer_phone: {
+    type: String,
+    required: false,
+  },
+  receiver_name: {
+    type: String,
+    required: true,
+  },
+  receiver_address: {
+    type: String,
+    required: false,
+  },
+  receiver_phone: {
+    type: String,
+    required: false,
+  },
+  receiver_company: {
+    type: String,
+    required: false,
+  },
+  
+  // Full booking snapshot for auditing/debugging
+  booking_snapshot: {
+    type: mongoose.Schema.Types.Mixed,
+    required: false,
+  },
+
+  // Complete booking data (excluding identityDocuments) for EMPOST API and other integrations
+  booking_data: {
+    type: mongoose.Schema.Types.Mixed,
+    required: false,
+  },
+
+  // Identity documents and customer images
+  identityDocuments: {
+    type: mongoose.Schema.Types.Mixed,
+    required: false,
+    default: {},
+  },
+  customerImage: {
+    type: String,
+    required: false,
+  },
+  customerImages: [{
+    type: String,
+    required: false,
+  }],
+  
+  // Delivery Options (from booking)
+  sender_delivery_option: {
+    type: String,
+    required: false,
+    enum: ['pickup', 'delivery', 'warehouse'],
+  },
+  receiver_delivery_option: {
+    type: String,
+    required: false,
+    enum: ['pickup', 'delivery', 'warehouse'],
+  },
+  
+  // Location Information
+  origin_place: {
+    type: String,
+    required: true,
+  },
+  destination_place: {
+    type: String,
+    required: true,
+  },
+  
+  // Shipment Details
+  shipment_type: {
+    type: String,
+    required: true,
+    enum: ['DOCUMENT', 'NON_DOCUMENT'],
+  },
+  
+  // Status and Processing
+  delivery_status: {
+    type: String,
+    required: true,
+    enum: ['PENDING', 'PICKED_UP', 'IN_TRANSIT', 'DELIVERED', 'FAILED', 'CANCELLED'],
+    default: 'PENDING',
+  },
+  
+  // Weight (added by operations)
+  weight: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: false,
+  },
+  
+  // Tax Information
+  is_leviable: {
+    type: Boolean,
+    required: true,
+    default: true,
+  },
+  
+  // Insurance Information (from booking)
+  insured: {
+    type: Boolean,
+    required: false,
+    default: false,
+  },
+  declaredAmount: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: false,
+  },
+  
+  // Request Management
+  status: {
+    type: String,
+    required: true,
+    enum: ['DRAFT', 'SUBMITTED', 'QUOTATION_REQUEST', 'IN_PROGRESS', 'VERIFIED', 'COMPLETED', 'CANCELLED'],
+    default: 'DRAFT',
+  },
+
+  // Operations → Finance quotation step (status QUOTATION_REQUEST). Never synced to EMPOST.
+  quotation_request: {
+    stage: {
+      type: String,
+      enum: ['PENDING_DETAILS', 'REQUESTED', 'QUOTED'],
+      required: false,
+    },
+    actual_weight: { type: Number, required: false },
+    volumetric_weight: { type: Number, required: false },
+    number_of_boxes: { type: Number, required: false },
+    items: {
+      type: [{
+        _id: false,
+        box_number: { type: String, required: false },
+        name: { type: String, required: true },
+        quantity: { type: Number, required: true, min: 1 },
+      }],
+      default: undefined,
+    },
+    notes: { type: String, required: false },
+    started_at: { type: Date, required: false },
+    started_by_name: { type: String, required: false },
+    requested_at: { type: Date, required: false },
+    requested_by_name: { type: String, required: false },
+    requested_by_email: { type: String, required: false },
+    quotation_id: { type: mongoose.Schema.Types.ObjectId, ref: 'ManualQuotation', required: false },
+    quotation_number: { type: String, required: false },
+    quotation_total: { type: Number, required: false },
+    quotation_rate_per_kg: { type: Number, required: false },
+    quotation_chargeable_weight: { type: Number, required: false },
+    quotation_shipping_amount: { type: Number, required: false },
+    quotation_pickup_location: { type: String, required: false },
+    quotation_pickup_charge: { type: Number, required: false },
+    quotation_pickup_vat: { type: Number, required: false },
+    quotation_delivery_charge: { type: Number, required: false },
+    quotation_insurance_charge: { type: Number, required: false },
+    quoted_at: { type: Date, required: false },
+    quoted_by_name: { type: String, required: false },
+    // UAE→PH: DRAFT journal raised when Finance sends the quote to Operations; posted on invoice generation
+    draft_journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
+    draft_journal_no: { type: String, required: false },
+    sent_to_operations_at: { type: Date, required: false },
+    sent_to_operations_by_name: { type: String, required: false },
+    cancelled_at: { type: Date, required: false },
+    cancelled_by_name: { type: String, required: false },
+    cancellation_reason: { type: String, required: false },
+    cancellation_charged: { type: Boolean, required: false },
+    cancellation_amount: { type: Number, required: false },
+    cancellation_invoice_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice', required: false },
+    cancellation_invoice_no: { type: String, required: false },
+    cancellation_journal_no: { type: String, required: false },
+    cancellation_payment_mode: { type: String, required: false },
+    advance: {
+      amount: { type: Number, required: false },
+      mode: { type: String, required: false },
+      reference: { type: String, required: false },
+      collected_at: { type: Date, required: false },
+      recorded_at: { type: Date, required: false },
+      recorded_by_name: { type: String, required: false },
+      journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
+      journal_no: { type: String, required: false },
+      applied_invoice_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice', required: false },
+      applied_journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
+      applied_journal_no: { type: String, required: false },
+      applied_amount: { type: Number, required: false },
+      void_journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
+      void_journal_no: { type: String, required: false },
+    },
+  },
+  
+  // Employee References
+  created_by_employee_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Employee',
+    required: true,
+  },
+  
+  assigned_to_employee_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Employee',
+    required: false,
+  },
+  
+  // Additional Information
+  notes: {
+    type: String,
+    required: false,
+  },
+  
+  // Verification Fields (Operations Team)
+  verification: {
+    invoice_number: {
+      type: String,
+      required: false,
+    },
+    tracking_code: {
+      type: String,
+      required: false,
+    },
+    service_code: {
+      type: String,
+      required: false,
+    },
+    amount: {
+      type: mongoose.Schema.Types.Decimal128,
+      required: false,
+    },
+    volume_cbm: {
+      type: mongoose.Schema.Types.Decimal128,
+      required: false,
+    },
+    receiver_address: {
+      type: String,
+      required: false,
+    },
+    receiver_phone: {
+      type: String,
+      required: false,
+    },
+    declared_value: {
+      type: mongoose.Schema.Types.Decimal128,
+      required: false,
+    },
+    insured: {
+      type: Boolean,
+      default: false,
+    },
+    agents_name: {
+      type: String,
+      required: false,
+    },
+    listed_commodities: {
+      type: String,
+      required: false,
+    },
+    boxes: [{
+      items: {
+        type: String,
+        required: false,
+      },
+        quantity: {
+          type: Number,
+          required: false,
+        },
+      length: {
+        type: mongoose.Schema.Types.Decimal128,
+        required: false,
+      },
+      width: {
+        type: mongoose.Schema.Types.Decimal128,
+        required: false,
+      },
+      height: {
+        type: mongoose.Schema.Types.Decimal128,
+        required: false,
+      },
+      vm: {
+        type: mongoose.Schema.Types.Decimal128,
+        required: false,
+      },
+      classification: {
+        type: String,
+          enum: ['FLOMIC', 'COMMERCIAL', 'PERSONAL', 'GENERAL', 'Flomic', 'Commercial', 'Personal', 'General', 'flomic', 'commercial', 'personal', 'general'],
+        required: false,
+      },
+    }],
+      shipment_classification: {
+        type: String,
+        enum: ['FLOMIC', 'COMMERCIAL', 'PERSONAL', 'GENERAL', 'Flomic', 'Commercial', 'Personal', 'General', 'flomic', 'commercial', 'personal', 'general'],
+        required: false,
+      },
+    total_vm: {
+      type: mongoose.Schema.Types.Decimal128,
+      required: false,
+    },
+    actual_weight: {
+      type: mongoose.Schema.Types.Decimal128,
+      required: false,
+    },
+    volumetric_weight: {
+      type: mongoose.Schema.Types.Decimal128,
+      required: false,
+    },
+    chargeable_weight: {
+      type: mongoose.Schema.Types.Decimal128,
+      required: false,
+    },
+    rate_bracket: {
+      type: String,
+      required: false,
+    },
+    calculated_rate: {
+      type: mongoose.Schema.Types.Decimal128,
+      required: false,
+    },
+    shipment_classification: {
+      type: String,
+      enum: ['FLOMIC', 'COMMERCIAL', 'PERSONAL', 'GENERAL'],
+      required: false,
+    },
+    weight_type: {
+      type: String,
+      enum: ['ACTUAL', 'VOLUMETRIC'],
+      required: false,
+    },
+    cargo_service: {
+      type: String,
+      enum: ['SEA', 'AIR'],
+      required: false,
+    },
+    sender_details_complete: {
+      type: Boolean,
+      default: false,
+    },
+    receiver_details_complete: {
+      type: Boolean,
+      default: false,
+    },
+    number_of_boxes: {
+      type: Number,
+      required: false,
+    },
+    total_kg: {
+      type: mongoose.Schema.Types.Decimal128,
+      required: false,
+    },
+    verified_by_employee_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Employee',
+      required: false,
+    },
+    verified_at: {
+      type: Date,
+      required: false,
+    },
+    verification_notes: {
+      type: String,
+      required: false,
+    },
+  },
+  
+  // Invoice Details (populated when invoice is generated)
+  invoice_amount: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: false,
+  },
+  
+  invoice_generated_at: {
+    type: Date,
+    required: false,
+  },
+  
+  // Booking Reference
+  booking_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Booking',
+    required: false,
+  },
+  
+  // Shipment Status History (copied from booking when invoice request is created)
+  shipment_status_history: {
+    type: String,
+    required: false,
+  },
+  
+  // EMPOST Integration
+  empost_uhawb: {
+    type: String,
+    required: false,
+    default: 'N/A',
+  },
+  // Tracks EmPost push state so ops can continue when EmPost is down
+  empost_sync: {
+    shipment_status: {
+      type: String,
+      enum: ['pending', 'ok', 'failed'],
+      required: false,
+    },
+    invoice_status: {
+      type: String,
+      enum: ['pending', 'ok', 'failed', 'n/a'],
+      required: false,
+    },
+    pending_type: {
+      type: String,
+      enum: ['shipment_creation', 'invoice'],
+      required: false,
+    },
+    last_error: {
+      type: String,
+      required: false,
+    },
+    last_attempt_at: {
+      type: Date,
+      required: false,
+    },
+  },
+}, {
+  timestamps: true,
+});
+
+function stripBookingSnapshotIdentityDocuments(payload) {
+  if (!payload || typeof payload !== 'object') return;
+  if (payload.identityDocuments !== undefined) {
+    delete payload.identityDocuments;
+  }
+  if (
+    payload.booking_snapshot &&
+    typeof payload.booking_snapshot === 'object' &&
+    payload.booking_snapshot.identityDocuments !== undefined
+  ) {
+    delete payload.booking_snapshot.identityDocuments;
+  }
+}
+
+invoiceRequestSchema.pre('save', function stripOnSave(next) {
+  stripBookingSnapshotIdentityDocuments(this);
+  next();
+});
+
+invoiceRequestSchema.pre(['updateOne', 'updateMany', 'findOneAndUpdate'], function stripOnUpdate(next) {
+  const update = this.getUpdate() || {};
+
+  // Replacement-style updates
+  stripBookingSnapshotIdentityDocuments(update);
+
+  if (update.$set && typeof update.$set === 'object') {
+    stripBookingSnapshotIdentityDocuments(update.$set);
+    delete update.$set.identityDocuments;
+    delete update.$set['booking_snapshot.identityDocuments'];
+  }
+  if (update.$setOnInsert && typeof update.$setOnInsert === 'object') {
+    stripBookingSnapshotIdentityDocuments(update.$setOnInsert);
+    delete update.$setOnInsert.identityDocuments;
+    delete update.$setOnInsert['booking_snapshot.identityDocuments'];
+  }
+  if (update.$unset && typeof update.$unset === 'object') {
+    update.$unset.identityDocuments = 1;
+    update.$unset['booking_snapshot.identityDocuments'] = 1;
+  } else {
+    update.$unset = {
+      ...(update.$unset || {}),
+      identityDocuments: 1,
+      'booking_snapshot.identityDocuments': 1,
+    };
+  }
+
+  this.setUpdate(update);
+  next();
+});
+
+invoiceRequestSchema.index({ status: 1 });
+invoiceRequestSchema.index({ created_by_employee_id: 1 });
+invoiceRequestSchema.index({ assigned_to_employee_id: 1 });
+invoiceRequestSchema.index({ delivery_status: 1 });
+// Indexes for search and pagination performance
+invoiceRequestSchema.index({ customer_name: 1 });
+invoiceRequestSchema.index({ receiver_name: 1 });
+invoiceRequestSchema.index({ tracking_code: 1 });
+invoiceRequestSchema.index({ invoice_number: 1 });
+invoiceRequestSchema.index({ createdAt: -1 });
+// Compound indexes for common query patterns
+invoiceRequestSchema.index({ status: 1, createdAt: -1 }); // For Operations (IN_PROGRESS) and general status queries
+invoiceRequestSchema.index({ customer_name: 1, status: 1 });
+invoiceRequestSchema.index({ shipment_type: 1 });
+// Compound index for Finance department queries (VERIFIED status, exclude CANCELLED)
+// This index optimizes queries filtering by status='VERIFIED' and delivery_status != 'CANCELLED'
+// Sort order matches the index for optimal performance
+invoiceRequestSchema.index({ status: 1, delivery_status: 1, createdAt: -1 });
+// Text index for full-text search across multiple fields (much faster than regex)
+invoiceRequestSchema.index({ 
+  customer_name: 'text', 
+  receiver_name: 'text', 
+  tracking_code: 'text', 
+  invoice_number: 'text' 
+}, { 
+  name: 'invoiceRequest_text_search',
+  weights: {
+    tracking_code: 10,      // Highest priority
+    invoice_number: 10,      // Highest priority
+    customer_name: 5,        // Medium priority
+    receiver_name: 3        // Lower priority
+  }
+});
+
+// Collections Schema
+const collectionsSchema = new mongoose.Schema({
+  invoice_id: {
+    type: String,
+    required: true,
+    unique: true,
+  },
+  client_name: {
+    type: String,
+    required: true,
+  },
+  amount: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: true,
+  },
+  due_date: {
+    type: Date,
+    required: true,
+  },
+  status: {
+    type: String,
+    required: true,
+    enum: ['not_paid', 'paid', 'delayed', 'cancelled'],
+    default: 'not_paid',
+  },
+  payment_method: {
+    type: String,
+    enum: ['bank_transfer', 'bank_payment'],
+    required: false,
+  },
+  paid_at: {
+    type: Date,
+    required: false,
+  },
+  invoice_request_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'InvoiceRequest',
+    required: true,
+  },
+}, {
+  timestamps: true,
+});
+
+// invoice_id index is automatically created by unique: true
+collectionsSchema.index({ status: 1 });
+collectionsSchema.index({ due_date: 1 });
+collectionsSchema.index({ client_name: 1 });
+
+// Export models
+const Department = mongoose.models.Department || mongoose.model('Department', departmentSchema);
+const Employee = mongoose.models.Employee || mongoose.model('Employee', employeeSchema);
+const User = mongoose.models.User || mongoose.model('User', userSchema);
+const Client = mongoose.models.Client || mongoose.model('Client', clientSchema);
+const Request = mongoose.models.Request || mongoose.model('Request', requestSchema);
+const Ticket = mongoose.models.Ticket || mongoose.model('Ticket', ticketSchema);
+const Report = mongoose.models.Report || mongoose.model('Report', reportSchema);
+const InvoiceRequest = mongoose.models.InvoiceRequest || mongoose.model('InvoiceRequest', invoiceRequestSchema);
+const Collections = mongoose.models.Collections || mongoose.model('Collections', collectionsSchema);
+
+// Performance Metrics Schema
+const performanceMetricsSchema = new mongoose.Schema({
+  department_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Department',
+    required: true,
+  },
+  period: {
+    type: String,
+    required: true,
+    enum: ['daily', 'weekly', 'monthly', 'quarterly', 'yearly'],
+    default: 'monthly',
+  },
+  period_start: {
+    type: Date,
+    required: true,
+  },
+  period_end: {
+    type: Date,
+    required: true,
+  },
+  metrics: {
+    // Sales Metrics
+    total_revenue: { type: Number, default: 0 },
+    new_clients: { type: Number, default: 0 },
+    conversion_rate: { type: Number, default: 0 },
+    client_satisfaction: { type: Number, default: 0 },
+    
+    // Operations Metrics
+    total_shipments: { type: Number, default: 0 },
+    on_time_delivery_rate: { type: Number, default: 0 },
+    error_rate: { type: Number, default: 0 },
+    average_processing_time: { type: Number, default: 0 },
+    
+    // Finance Metrics
+    total_collections: { type: Number, default: 0 },
+    collections_rate: { type: Number, default: 0 },
+    outstanding_invoices: { type: Number, default: 0 },
+    average_payment_time: { type: Number, default: 0 },
+    
+    // HR Metrics
+    employee_count: { type: Number, default: 0 },
+    attendance_rate: { type: Number, default: 0 },
+    employee_satisfaction: { type: Number, default: 0 },
+    training_completion_rate: { type: Number, default: 0 },
+    
+    // IT Metrics
+    system_uptime: { type: Number, default: 0 },
+    tickets_resolved: { type: Number, default: 0 },
+    average_resolution_time: { type: Number, default: 0 },
+    system_performance: { type: Number, default: 0 },
+    
+    // Auditor Metrics
+    audits_completed: { type: Number, default: 0 },
+    compliance_rate: { type: Number, default: 0 },
+    risk_score: { type: Number, default: 0 },
+    findings_count: { type: Number, default: 0 },
+    
+    // Management Metrics (Company-wide)
+    total_company_revenue: { type: Number, default: 0 },
+    total_company_shipments: { type: Number, default: 0 },
+    customer_satisfaction: { type: Number, default: 0 },
+    operational_efficiency: { type: Number, default: 0 },
+    employee_productivity: { type: Number, default: 0 },
+    profit_margin: { type: Number, default: 0 },
+    market_share: { type: Number, default: 0 },
+    risk_assessment: { type: Number, default: 0 },
+  },
+  calculated_at: {
+    type: Date,
+    default: Date.now,
+  },
+}, {
+  timestamps: true,
+});
+
+// Create indexes for efficient querying
+performanceMetricsSchema.index({ department_id: 1, period: 1, period_start: 1 });
+performanceMetricsSchema.index({ period_start: 1, period_end: 1 });
+
+const PerformanceMetrics = mongoose.models.PerformanceMetrics || mongoose.model('PerformanceMetrics', performanceMetricsSchema);
+
+
+// Booking Schema - Flexible schema to work with existing Bookings collection
+// Adding review_status field with default 'not reviewed'
+const bookingSchema = new mongoose.Schema({
+  // Review status field - will be added to existing documents
+  review_status: {
+    type: String,
+    enum: ['not reviewed', 'reviewed', 'rejected'],
+    default: 'not reviewed',
+  },
+  
+  // Review information
+  reviewed_by_employee_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Employee',
+    required: false,
+  },
+  reviewed_at: {
+    type: Date,
+    required: false,
+  },
+  
+  // Rejection reason (required when review_status is 'rejected')
+  reason: {
+    type: String,
+    required: false,
+  },
+  
+  // Reference to converted invoice request
+  converted_to_invoice_request_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'InvoiceRequest',
+    required: false,
+  },
+
+  // When true, booking is excluded from auto-review batch (Invoice Requests sales form)
+  skip_auto_review: {
+    type: Boolean,
+    default: false,
+  },
+  
+  // Cargo Status Management
+  shipment_status: {
+    type: String,
+    enum: [
+      // New simplified statuses (primary)
+      'Shipment Received',
+      'Shipment Processing',
+      'Shipment Departed',
+      'Shipment Arrived',
+      'Shipment Delivered',
+      // Legacy statuses (for backward compatibility)
+      'SHIPMENT_RECEIVED',
+      'SHIPMENT_PROCESSING',
+      'DEPARTED_FROM_MANILA',
+      'IN_TRANSIT_TO_DUBAI',
+      'ARRIVED_AT_DUBAI',
+      'SHIPMENT_CLEARANCE',
+      'OUT_FOR_DELIVERY',
+      'DELIVERED'
+    ],
+    default: null,
+    required: false,
+  },
+  
+  batch_no: {
+    type: String,
+    default: null,
+    required: false,
+  },
+  
+  shipment_status_history: [{
+    status: {
+      type: String,
+      required: true,
+    },
+    updated_at: {
+      type: Date,
+      required: true,
+      default: Date.now,
+    },
+    updated_by: {
+      type: String,
+      required: true,
+    },
+    notes: {
+      type: String,
+      required: false,
+    },
+  }],
+  
+  // Shipment Type: Document or Non-Document
+  shipmentType: {
+    type: String,
+    enum: ['document', 'non_document'],
+    required: false, // Optional for backward compatibility, will default to 'non_document'
+    default: 'non_document',
+  },
+  
+  // All other fields from existing Bookings collection are allowed
+}, {
+  timestamps: true,
+  strict: false, // Allow fields not defined in schema
+});
+
+// Single field indexes
+bookingSchema.index({ review_status: 1 });
+bookingSchema.index({ createdAt: -1 });
+bookingSchema.index({ shipment_status: 1 });
+bookingSchema.index({ batch_no: 1 });
+// Indexes for review-related fields (used in review-requests queries)
+bookingSchema.index({ reviewed_at: 1 });
+bookingSchema.index({ reviewed_by_employee_id: 1 });
+
+// Compound indexes for common query patterns
+// Most common: filter by review_status and sort by createdAt (used in review-requests page)
+bookingSchema.index({ review_status: 1, createdAt: -1 });
+// For "not reviewed" queries that check both reviewed_at and reviewed_by_employee_id
+bookingSchema.index({ reviewed_at: 1, reviewed_by_employee_id: 1 });
+// Alternative compound index for review_status queries with different sort orders
+bookingSchema.index({ review_status: 1, reviewed_at: -1 });
+
+// Indexes for AWB search performance
+bookingSchema.index({ awb: 1 });
+bookingSchema.index({ tracking_code: 1 });
+bookingSchema.index({ awb_number: 1 });
+
+// Indexes for name-based search performance
+bookingSchema.index({ 'sender.firstName': 1, 'sender.lastName': 1 });
+bookingSchema.index({ 'receiver.firstName': 1, 'receiver.lastName': 1 });
+bookingSchema.index({ 'sender.fullName': 1 });
+bookingSchema.index({ 'receiver.fullName': 1 });
+// Case-insensitive equality search (Booking Forms)
+bookingSchema.index(
+  { 'sender.firstName': 1, 'sender.lastName': 1 },
+  { name: 'sender_name_ci', collation: { locale: 'en', strength: 2 } }
+);
+bookingSchema.index(
+  { 'receiver.firstName': 1, 'receiver.lastName': 1 },
+  { name: 'receiver_name_ci', collation: { locale: 'en', strength: 2 } }
+);
+bookingSchema.index(
+  { 'sender.fullName': 1 },
+  { name: 'sender_fullname_ci', collation: { locale: 'en', strength: 2 } }
+);
+bookingSchema.index(
+  { 'receiver.fullName': 1 },
+  { name: 'receiver_fullname_ci', collation: { locale: 'en', strength: 2 } }
+);
+// Broad text index for Booking Forms / AWB-by-name search (one text index per collection)
+bookingSchema.index(
+  {
+    'sender.fullName': 'text',
+    'sender.name': 'text',
+    'sender.firstName': 'text',
+    'sender.lastName': 'text',
+    'receiver.fullName': 'text',
+    'receiver.name': 'text',
+    'receiver.firstName': 'text',
+    'receiver.lastName': 'text',
+    customer_name: 'text',
+    name: 'text',
+  },
+  {
+    name: 'bookings_party_name_text',
+    weights: {
+      'sender.fullName': 10,
+      'receiver.fullName': 10,
+      'sender.name': 8,
+      'receiver.name': 8,
+      customer_name: 8,
+      'sender.firstName': 5,
+      'sender.lastName': 5,
+      'receiver.firstName': 5,
+      'receiver.lastName': 5,
+      name: 3,
+    },
+    default_language: 'none',
+  }
+);
+
+const Booking = mongoose.models.Booking || mongoose.model('Booking', bookingSchema);
+
+// Singleton system settings (admin-controlled)
+const systemSettingsSchema = new mongoose.Schema({
+  key: {
+    type: String,
+    required: true,
+    unique: true,
+    default: 'global',
+  },
+  booking_auto_review_enabled: {
+    type: Boolean,
+    default: false,
+  },
+  booking_auto_review_reviewer_employee_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Employee',
+    required: false,
+  },
+  booking_auto_review_updated_by: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: false,
+  },
+  booking_auto_review_updated_at: {
+    type: Date,
+    required: false,
+  },
+  google_drive_refresh_token: {
+    type: String,
+    required: false,
+    default: '',
+  },
+  google_drive_refresh_token_updated_by: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: false,
+  },
+  google_drive_refresh_token_updated_at: {
+    type: Date,
+    required: false,
+  },
+}, {
+  timestamps: true,
+});
+
+const SystemSettings =
+  mongoose.models.SystemSettings || mongoose.model('SystemSettings', systemSettingsSchema);
+
+// Audit Report Schema for tracking cancellations and deletions
+const auditReportSchema = new mongoose.Schema({
+  report_type: {
+    type: String,
+    required: true,
+    enum: ['invoice_request_cancellation', 'invoice_generation', 'delivery_assignment_cancellation', 'other'],
+    default: 'other'
+  },
+  invoice_request_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'InvoiceRequest',
+    required: false,
+  },
+  invoice_request_data: {
+    type: mongoose.Schema.Types.Mixed,
+    required: false,
+  },
+  related_invoice_data: {
+    type: mongoose.Schema.Types.Mixed,
+    required: false,
+  },
+  related_delivery_assignments: [{
+    assignment_id: String,
+    data: mongoose.Schema.Types.Mixed
+  }],
+  cancellation_reason: {
+    type: String,
+    required: false,
+  },
+  cancelled_by: {
+    employee_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Employee',
+      required: false,
+    },
+    employee_name: {
+      type: String,
+      required: false,
+    },
+    department: {
+      type: String,
+      required: false,
+    },
+  },
+  cancelled_at: {
+    type: Date,
+    required: false,
+  },
+  preserved_for_audit: {
+    type: Boolean,
+    default: true,
+  },
+}, {
+  timestamps: true,
+});
+
+auditReportSchema.index({ report_type: 1 });
+auditReportSchema.index({ invoice_request_id: 1 });
+auditReportSchema.index({ 'cancelled_by.employee_id': 1 });
+auditReportSchema.index({ cancelled_at: -1 });
+auditReportSchema.index({ createdAt: -1 });
+
+const AuditReport = mongoose.models.AuditReport || mongoose.model('AuditReport', auditReportSchema);
+
+// Client quotation. Either standalone, or generated by Finance from an Operations
+// quotation request (invoice_request_id set). Never sent to Empost.
+const manualQuotationSchema = new mongoose.Schema({
+  invoice_request_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'InvoiceRequest',
+    required: false,
+  },
+  awb: {
+    type: String,
+    required: false,
+    trim: true,
+  },
+  quotation_number: {
+    type: String,
+    required: true,
+    unique: true,
+  },
+  sender_name: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  sender_phone: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  sender_address: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  customer_name: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  customer_phone: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  customer_address: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  route: {
+    type: String,
+    required: true,
+    enum: ['PH_TO_UAE', 'UAE_TO_PH'],
+  },
+  actual_weight_kg: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  volumetric_weight_kg: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  chargeable_weight_kg: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  weight_type: {
+    type: String,
+    required: true,
+    enum: ['ACTUAL', 'VOLUMETRIC'],
+  },
+  number_of_boxes: {
+    type: Number,
+    required: false,
+    min: 1,
+  },
+  items: [{
+    box_number: { type: String, required: false, trim: true },
+    name: { type: String, required: true, trim: true },
+    quantity: { type: Number, required: true, min: 1 },
+  }],
+  rate_per_kg: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  rate_bracket: {
+    type: String,
+    required: false,
+  },
+  shipping_amount: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  pickup_location: {
+    type: String,
+    required: true,
+    enum: ['INSIDE_DUBAI', 'OUTSIDE_DUBAI', 'DROP_OFF'],
+  },
+  pickup_charge: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  pickup_vat: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  delivery_charge: {
+    type: Number,
+    required: true,
+    min: 0,
+    default: 0,
+  },
+  insurance_charge: {
+    type: Number,
+    required: true,
+    min: 0,
+    default: 0,
+  },
+  total_amount: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  currency: {
+    type: String,
+    default: 'AED',
+  },
+  notes: {
+    type: String,
+    required: false,
+    default: '',
+  },
+  advance: {
+    amount: { type: Number, required: false },
+    mode: { type: String, required: false },
+    reference: { type: String, required: false },
+    collected_at: { type: Date, required: false },
+    recorded_at: { type: Date, required: false },
+    recorded_by_name: { type: String, required: false },
+    journal_id: { type: mongoose.Schema.Types.ObjectId, required: false },
+    journal_no: { type: String, required: false },
+    applied_invoice_id: { type: mongoose.Schema.Types.ObjectId, required: false },
+    applied_journal_id: { type: mongoose.Schema.Types.ObjectId, required: false },
+    applied_journal_no: { type: String, required: false },
+    applied_amount: { type: Number, required: false },
+    void_journal_id: { type: mongoose.Schema.Types.ObjectId, required: false },
+    void_journal_no: { type: String, required: false },
+  },
+}, {
+  timestamps: true,
+});
+
+manualQuotationSchema.index({ createdAt: -1 });
+manualQuotationSchema.index({ customer_name: 1 });
+manualQuotationSchema.index({ customer_phone: 1 });
+
+const ManualQuotation = mongoose.models.ManualQuotation || mongoose.model('ManualQuotation', manualQuotationSchema);
+
+// Chat room / inter-department messages (from origin)
+const chatRoomSchema = new mongoose.Schema({
+  name: {
+    type: String,
+    required: false,
+  },
+  description: {
+    type: String,
+    required: false,
+  },
+  room_type: {
+    type: String,
+    enum: ['department', 'direct'],
+    default: 'direct',
+  },
+  department_ids: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Department',
+    required: false,
+  }],
+  participants: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Employee',
+    required: false,
+  }],
+  user_ids: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: false,
+  }],
+  is_active: {
+    type: Boolean,
+    default: true,
+  },
+  created_by: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Employee',
+    required: false,
+  },
+}, {
+  timestamps: true,
+});
+
+chatRoomSchema.index({ name: 1 });
+chatRoomSchema.index({ department_ids: 1 });
+chatRoomSchema.index({ participants: 1 });
+chatRoomSchema.index({ user_ids: 1 });
+chatRoomSchema.index({ room_type: 1 });
+chatRoomSchema.index({ is_active: 1 });
+chatRoomSchema.index({ room_type: 1, user_ids: 1 }, {
+  unique: true,
+  sparse: true,
+  partialFilterExpression: { room_type: 'direct', user_ids: { $size: 2 } },
+});
+
+const interDepartmentChatMessageSchema = new mongoose.Schema({
+  room_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'ChatRoom',
+    required: true,
+  },
+  sender_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Employee',
+    required: true,
+  },
+  sender_department_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Department',
+    required: true,
+  },
+  message: {
+    type: String,
+    required: true,
+  },
+  message_type: {
+    type: String,
+    enum: ['text', 'file', 'image', 'system'],
+    default: 'text',
+  },
+  file_url: {
+    type: String,
+    required: false,
+  },
+  file_name: {
+    type: String,
+    required: false,
+  },
+  file_size: {
+    type: Number,
+    required: false,
+  },
+  is_read: {
+    type: Boolean,
+    default: false,
+  },
+  read_by: [{
+    employee_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Employee',
+    },
+    read_at: {
+      type: Date,
+      default: Date.now,
+    },
+  }],
+  reply_to: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'InterDepartmentChatMessage',
+    required: false,
+  },
+}, {
+  timestamps: true,
+});
+
+interDepartmentChatMessageSchema.index({ room_id: 1, createdAt: -1 });
+interDepartmentChatMessageSchema.index({ sender_id: 1 });
+interDepartmentChatMessageSchema.index({ sender_department_id: 1 });
+interDepartmentChatMessageSchema.index({ is_read: 1 });
+interDepartmentChatMessageSchema.index({ message: 'text' });
+
+const ChatRoom = mongoose.models.ChatRoom || mongoose.model('ChatRoom', chatRoomSchema);
+const ChatMessage = mongoose.models.ChatMessage || mongoose.model('ChatMessage', interDepartmentChatMessageSchema);
+
+module.exports = {
+  Department,
+  Employee,
+  User,
+  Client,
+  Request,
+  Ticket,
+  Report,
+  InvoiceRequest,
+  Collections,
+  PerformanceMetrics,
+  Booking,
+  SystemSettings,
+  ChatRoom,
+  ChatMessage,
+  AuditReport,
+  ManualQuotation,
+};

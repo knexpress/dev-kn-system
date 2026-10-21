@@ -1,0 +1,257 @@
+const STEP_KEYS = [
+  'users_permissions',
+  'business_profile',
+  'accounting_foundations',
+  'chart_of_accounts',
+  'bank_cash',
+  'customers_suppliers',
+  'pricing_tax',
+  'opening_balances',
+  'approval_controls',
+  'integrations',
+  'workflow_validation',
+  'go_live',
+];
+
+const STEP_META = {
+  users_permissions: {
+    title: 'Finance users and permissions',
+    letter: 'A',
+    optional: false,
+    depends_on: [],
+    href: '/dashboard/users',
+    href_label: 'Open user management',
+  },
+  business_profile: {
+    title: 'Business profile',
+    letter: 'B',
+    optional: false,
+    depends_on: ['users_permissions'],
+    href: null,
+    href_label: null,
+  },
+  accounting_foundations: {
+    title: 'Accounting foundations',
+    letter: 'C',
+    optional: false,
+    depends_on: ['business_profile'],
+    href: '/dashboard/accounting/periods',
+    href_label: 'Open period lock',
+  },
+  chart_of_accounts: {
+    title: 'Chart of accounts',
+    letter: 'D',
+    optional: false,
+    depends_on: ['accounting_foundations'],
+    href: '/dashboard/accounting/chart-of-accounts',
+    href_label: 'Open chart of accounts',
+  },
+  bank_cash: {
+    title: 'Bank, cash, and clearing',
+    letter: 'E',
+    optional: false,
+    depends_on: ['chart_of_accounts'],
+    href: '/dashboard/accounting/bank-cash',
+    href_label: 'Open bank & cash',
+  },
+  customers_suppliers: {
+    title: 'Customers and suppliers',
+    letter: 'F',
+    optional: true,
+    depends_on: ['chart_of_accounts'],
+    href: '/dashboard/accounting/sales',
+    href_label: 'Open sales customers',
+  },
+  pricing_tax: {
+    title: 'Pricing, charges, and tax',
+    letter: 'G',
+    optional: true,
+    depends_on: ['chart_of_accounts'],
+    href: '/dashboard/price-brackets',
+    href_label: 'Open price brackets',
+  },
+  opening_balances: {
+    title: 'Opening balances and migration',
+    letter: 'H',
+    optional: true,
+    depends_on: ['bank_cash', 'chart_of_accounts'],
+    href: null,
+    href_label: null,
+  },
+  approval_controls: {
+    title: 'Approval controls',
+    letter: 'I',
+    optional: false,
+    depends_on: ['users_permissions'],
+    href: '/dashboard/accounting/periods',
+    href_label: 'Open period lock',
+  },
+  integrations: {
+    title: 'Integrations and document storage',
+    letter: 'J',
+    optional: true,
+    depends_on: ['users_permissions'],
+    href: '/dashboard/users',
+    href_label: 'Open Drive token (Super Admin)',
+  },
+  workflow_validation: {
+    title: 'Workflow validation',
+    letter: 'K',
+    optional: false,
+    depends_on: ['chart_of_accounts', 'bank_cash', 'approval_controls'],
+    href: null,
+    href_label: null,
+  },
+  go_live: {
+    title: 'Go-live review',
+    letter: 'L',
+    optional: false,
+    depends_on: [
+      'users_permissions',
+      'business_profile',
+      'accounting_foundations',
+      'chart_of_accounts',
+      'bank_cash',
+      'opening_balances',
+      'approval_controls',
+      'workflow_validation',
+    ],
+    href: null,
+    href_label: null,
+  },
+};
+
+const CAPABILITIES = [
+  'view',
+  'create',
+  'approve',
+  'post',
+  'pay',
+  'reverse',
+  'export',
+  'manage_setup',
+  'unlock_period',
+];
+
+const DEFAULT_PERMISSION_MATRIX = {
+  SUPERADMIN: {
+    view: true,
+    create: true,
+    approve: true,
+    post: true,
+    pay: true,
+    reverse: true,
+    export: true,
+    manage_setup: true,
+    unlock_period: true,
+  },
+  ADMIN: {
+    view: true,
+    create: true,
+    approve: true,
+    post: true,
+    pay: true,
+    reverse: true,
+    export: true,
+    manage_setup: true,
+    unlock_period: true,
+  },
+  USER: {
+    view: true,
+    create: true,
+    approve: false,
+    post: true,
+    pay: true,
+    reverse: false,
+    export: true,
+    manage_setup: false,
+    unlock_period: false,
+  },
+};
+
+const REQUIRED_COA_ROLES = [
+  { role: 'cash', label: 'Cash in hand' },
+  { role: 'bank', label: 'Bank' },
+  { role: 'ar', label: 'Accounts receivable' },
+  { role: 'ap', label: 'Accounts payable' },
+  { role: 'shipping', label: 'Shipping revenue' },
+  { role: 'pickup', label: 'Pickup revenue' },
+  { role: 'delivery', label: 'Delivery revenue' },
+  { role: 'gateway', label: 'Gateway charges' },
+  { role: 'customerAdvance', label: 'Customer advances' },
+  { role: 'driverCash', label: 'Cash held by drivers' },
+  { role: 'vat', label: 'Output VAT' },
+  { role: 'vatInput', label: 'Input VAT' },
+  { role: 'inventory', label: 'Inventory' },
+];
+
+const DEFAULT_APPROVAL_POLICIES = {
+  journals: { require_separate_approver: false, roles: ['SUPERADMIN', 'ADMIN'] },
+  payments: { require_separate_approver: true, roles: ['SUPERADMIN', 'ADMIN'] },
+  discounts: { require_separate_approver: true, roles: ['SUPERADMIN', 'ADMIN'] },
+  refunds: { require_separate_approver: true, roles: ['SUPERADMIN', 'ADMIN'] },
+  credit_notes: { require_separate_approver: true, roles: ['SUPERADMIN', 'ADMIN'] },
+  reversals: { require_separate_approver: true, roles: ['SUPERADMIN', 'ADMIN'] },
+  period_changes: { require_separate_approver: true, roles: ['SUPERADMIN', 'ADMIN'] },
+};
+
+const WORKFLOW_CHECKS = [
+  {
+    key: 'booking_to_invoice',
+    title: 'Booking → review → invoice → ledger',
+    automated: true,
+  },
+  {
+    key: 'customer_payment',
+    title: 'Customer payment → outstanding balance',
+    automated: true,
+  },
+  {
+    key: 'driver_remittance',
+    title: 'Driver collection → remittance → cash/bank',
+    automated: true,
+  },
+  {
+    key: 'supplier_payment',
+    title: 'Supplier bill → payment',
+    automated: true,
+  },
+  {
+    key: 'credit_note_reversal',
+    title: 'Credit note / refund / reversal',
+    automated: true,
+  },
+  {
+    key: 'period_lock',
+    title: 'Period locking blocks unauthorized posting',
+    automated: true,
+  },
+];
+
+function emptyStepState() {
+  return {
+    status: 'not_started',
+    missing: [],
+    errors: [],
+    warnings: [],
+    evidence: {},
+    responsible_name: '',
+    responsible_user_id: null,
+    updated_at: null,
+    reviewer_name: '',
+    reviewed_at: null,
+    not_applicable: false,
+    na_reason: '',
+  };
+}
+
+module.exports = {
+  STEP_KEYS,
+  STEP_META,
+  CAPABILITIES,
+  DEFAULT_PERMISSION_MATRIX,
+  REQUIRED_COA_ROLES,
+  DEFAULT_APPROVAL_POLICIES,
+  WORKFLOW_CHECKS,
+  emptyStepState,
+};

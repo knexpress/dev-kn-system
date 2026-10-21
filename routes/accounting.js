@@ -1,0 +1,6974 @@
+const express = require('express');
+const mongoose = require('mongoose');
+const path = require('path');
+const fs = require('fs');
+const multer = require('multer');
+const auth = require('../middleware/auth');
+const requireAdmin = require('../middleware/roleAuth');
+const {
+  Account,
+  JournalEntry,
+  InventoryItem,
+  InventoryTransaction,
+  BankCashAccount,
+  SupplierPayment,
+  PurchaseOrder,
+  Supplier,
+  PettyCashVoucher,
+  PettyCashReplenishment,
+  Budget,
+  FixedAsset,
+  FixedAssetDepreciation,
+  SalesCustomer,
+  SalesInvoice,
+  Vat201Return,
+  EInvoice,
+} = require('../models/accounting');
+const crypto = require('crypto');
+const einvoicing = require('../services/einvoicing');
+const { nextJournalEntryNo, postInvoiceJournal, syncInvoiceReceipts } = require('../services/invoice-gl');
+const {
+  assertPeriodOpen,
+  nextOpenPeriodStart,
+  listPeriodsAround,
+  setPeriodStatus,
+} = require('../services/period-lock');
+const {
+  glCode,
+  useFiveDigitCoa,
+  isValidAccountCode,
+  accountCodeError,
+  ensureKnexChartOfAccounts,
+  systemCodes,
+} = require('../services/coa-codes');
+const { upsertAccountToPostgres, suggestNextCode } = require('../services/pg-coa');
+
+const router = express.Router();
+
+const accountingUploadDir = path.join(__dirname, '..', 'uploads', 'accounting');
+if (!fs.existsSync(accountingUploadDir)) {
+  fs.mkdirSync(accountingUploadDir, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, accountingUploadDir),
+  filename: (_req, file, cb) => {
+    const safe = String(file.originalname || 'document')
+      .replace(/[^a-zA-Z0-9._-]/g, '_')
+      .slice(0, 80);
+    cb(null, `${Date.now()}-${Math.round(Math.random() * 1e6)}-${safe}`);
+  },
+});
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024, files: 5 },
+  fileFilter: (_req, file, cb) => {
+    const allowed = [
+      'application/pdf',
+      'image/jpeg',
+      'image/png',
+      'image/webp',
+      'image/gif',
+      'application/msword',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.ms-excel',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    ];
+    if (allowed.includes(file.mimetype)) return cb(null, true);
+    return cb(new Error('Unsupported file type. Use PDF, image, Word, or Excel.'));
+  },
+});
+
+function toNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function parseLines(rawLines) {
+  if (Array.isArray(rawLines)) return rawLines;
+  if (typeof rawLines === 'string') {
+    try {
+      const parsed = JSON.parse(rawLines);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  }
+  return [];
+}
+
+async function loadPostableAccount(code) {
+  const account = await Account.findOne({ code: String(code || '').trim(), is_active: true });
+  if (!account) return null;
+  if (account.is_postable === false) return null;
+  return account;
+}
+
+function actorFromReq(req) {
+  return {
+    created_by_name: req.user?.employee?.full_name || req.user?.email || 'User',
+    created_by_email: req.user?.email || '',
+    created_by_user_id: req.user?.id || undefined,
+  };
+}
+
+// Chart of Accounts
+router.get('/accounts', auth, async (req, res) => {
+  try {
+    await ensureKnexChartOfAccounts(actorFromReq(req));
+    const accounts = await Account.find({}).sort({ code: 1 }).lean();
+    res.json({ success: true, data: accounts, meta: { five_digit: useFiveDigitCoa(), system: systemCodes() } });
+  } catch (error) {
+    console.error('Error fetching accounts:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch accounts' });
+  }
+});
+
+router.get('/accounts/next-code', auth, async (req, res) => {
+  try {
+    await ensureKnexChartOfAccounts(actorFromReq(req));
+    const type = String(req.query.type || 'Asset').trim();
+    const subtype = String(req.query.subtype || '').trim();
+    const existing = await Account.find({}).select('code').lean();
+    const suggested = suggestNextCode(
+      existing.map((a) => a.code),
+      type,
+      subtype
+    );
+    res.json({ success: true, data: { suggested, type, subtype } });
+  } catch (error) {
+    console.error('Error suggesting next account code:', error);
+    res.status(500).json({ success: false, error: 'Failed to suggest account code' });
+  }
+});
+
+router.get('/accounts/system-codes', auth, async (req, res) => {
+  try {
+    await ensureKnexChartOfAccounts(actorFromReq(req));
+    res.json({
+      success: true,
+      data: {
+        five_digit: useFiveDigitCoa(),
+        codes: systemCodes(),
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching system account codes:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch system account codes' });
+  }
+});
+
+router.post('/accounts', auth, async (req, res) => {
+  try {
+    const {
+      code,
+      name,
+      type,
+      subtype = '',
+      parent_code = '',
+      description = '',
+      is_active = true,
+      is_postable = true,
+    } = req.body || {};
+
+    const accountCode = String(code || '').trim();
+    const accountName = String(name || '').trim();
+    const accountType = String(type || '').trim();
+    const allowedTypes = ['Asset', 'Liability', 'Equity', 'Revenue', 'Expense'];
+
+    if (!accountCode) {
+      return res.status(400).json({ success: false, error: 'Account code is required' });
+    }
+    if (!isValidAccountCode(accountCode)) {
+      return res.status(400).json({
+        success: false,
+        error: accountCodeError(),
+      });
+    }
+    if (!accountName) {
+      return res.status(400).json({ success: false, error: 'Account name is required' });
+    }
+    if (!allowedTypes.includes(accountType)) {
+      return res.status(400).json({
+        success: false,
+        error: `Type must be one of: ${allowedTypes.join(', ')}`,
+      });
+    }
+
+    const parentCode = String(parent_code || '').trim();
+    if (parentCode) {
+      if (parentCode === accountCode) {
+        return res.status(400).json({
+          success: false,
+          error: 'Parent code cannot be the same as the account code',
+        });
+      }
+      const parent = await Account.findOne({ code: parentCode }).lean();
+      if (!parent) {
+        return res.status(400).json({
+          success: false,
+          error: `Parent account not found: ${parentCode}`,
+        });
+      }
+    }
+
+    const existing = await Account.findOne({ code: accountCode }).lean();
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        error: `Account code ${accountCode} already exists`,
+      });
+    }
+
+    const createdByName =
+      req.user?.employee?.full_name ||
+      req.user?.email ||
+      'User';
+    const createdByEmail = req.user?.email || '';
+    const createdByUserId = req.user?.id || undefined;
+
+    const account = await Account.create({
+      code: accountCode,
+      name: accountName,
+      type: accountType,
+      subtype: String(subtype || '').trim() || undefined,
+      parent_code: parentCode || undefined,
+      description: String(description || '').trim() || undefined,
+      is_active: is_active !== false && is_active !== 'false',
+      is_postable: is_postable !== false && is_postable !== 'false',
+      created_by_name: createdByName,
+      created_by_email: createdByEmail,
+      created_by_user_id: createdByUserId,
+    });
+
+    try {
+      await upsertAccountToPostgres(account.toObject ? account.toObject() : account);
+    } catch (pgError) {
+      console.warn('Could not sync new account to staging Postgres:', pgError.message);
+    }
+
+    res.status(201).json({ success: true, data: account });
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(409).json({
+        success: false,
+        error: 'Account code already exists',
+      });
+    }
+    console.error('Error creating account:', error);
+    res.status(500).json({ success: false, error: 'Failed to create account' });
+  }
+});
+
+router.get('/accounts/:code/ledger', auth, async (req, res) => {
+  try {
+    const code = String(req.params.code || '').trim();
+    const account = await Account.findOne({ code }).lean();
+    if (!account) {
+      return res.status(404).json({ success: false, error: 'Account not found' });
+    }
+
+    const entries = await JournalEntry.find({
+      status: 'POSTED',
+      'lines.account_code': code,
+    })
+      .sort({ entry_date: 1, entry_no: 1 })
+      .lean();
+
+    let balance = 0;
+    const isDebitNormal = ['Asset', 'Expense'].includes(account.type);
+    const rows = [];
+
+    for (const entry of entries) {
+      for (const line of entry.lines || []) {
+        if (line.account_code !== code) continue;
+        const debit = toNum(line.debit);
+        const credit = toNum(line.credit);
+        if (isDebitNormal) {
+          balance += debit - credit;
+        } else {
+          balance += credit - debit;
+        }
+        rows.push({
+          date: entry.entry_date,
+          entry_no: entry.entry_no,
+          description: line.description || entry.memo || '',
+          debit,
+          credit,
+          balance,
+          journal_id: entry._id,
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        account,
+        rows,
+        closing_balance: balance,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching account ledger:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch account ledger' });
+  }
+});
+
+// Journal entries
+router.get('/journals', auth, async (req, res) => {
+  try {
+    const journals = await JournalEntry.find({})
+      .sort({ entry_date: -1, entry_no: -1 })
+      .lean();
+    res.json({ success: true, data: journals });
+  } catch (error) {
+    console.error('Error fetching journals:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch journals' });
+  }
+});
+
+router.get('/journals/:id', auth, async (req, res) => {
+  try {
+    const journal = await JournalEntry.findById(req.params.id).lean();
+    if (!journal) {
+      return res.status(404).json({ success: false, error: 'Journal entry not found' });
+    }
+    res.json({ success: true, data: journal });
+  } catch (error) {
+    console.error('Error fetching journal:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch journal entry' });
+  }
+});
+
+function reverseJournalLines(lines, prefix = 'Rev') {
+  return (lines || []).map((l) => ({
+    account_id: l.account_id,
+    account_code: l.account_code,
+    account_name: l.account_name,
+    description: l.description
+      ? `${prefix}: ${l.description}`
+      : `${prefix}: ${l.account_code}`,
+    debit: toNum(l.credit),
+    credit: toNum(l.debit),
+  }));
+}
+
+async function buildJournalLinesFromRaw(lines) {
+  const builtLines = [];
+  for (const raw of lines) {
+    const code = String(raw.account_code || '').trim();
+    const debit = toNum(raw.debit);
+    const credit = toNum(raw.credit);
+
+    if (!code) {
+      return { error: 'Each line needs an account_code' };
+    }
+    if (debit < 0 || credit < 0) {
+      return { error: 'Debit/credit cannot be negative' };
+    }
+    if (debit > 0 && credit > 0) {
+      return { error: `Line for ${code} cannot have both debit and credit` };
+    }
+    if (debit === 0 && credit === 0) {
+      return { error: `Line for ${code} must have a debit or credit amount` };
+    }
+
+    const account = await Account.findOne({ code, is_active: true });
+    if (!account) {
+      return { error: `Account not found: ${code}` };
+    }
+    if (account.is_postable === false) {
+      return { error: `Account ${code} is not postable` };
+    }
+
+    builtLines.push({
+      account_id: account._id,
+      account_code: account.code,
+      account_name: account.name,
+      description: String(raw.description || '').trim(),
+      debit,
+      credit,
+    });
+  }
+
+  const totalDebit = builtLines.reduce((s, l) => s + l.debit, 0);
+  const totalCredit = builtLines.reduce((s, l) => s + l.credit, 0);
+  if (Math.abs(totalDebit - totalCredit) > 0.009) {
+    return {
+      error: `Journal is not balanced. Debit ${totalDebit.toFixed(2)} vs Credit ${totalCredit.toFixed(2)}`,
+    };
+  }
+  return { builtLines, totalDebit, totalCredit };
+}
+
+router.post('/journals', auth, upload.array('documents', 5), async (req, res) => {
+  try {
+    const {
+      entry_date,
+      memo,
+      source = 'MANUAL',
+      status = 'POSTED',
+      source_reference = '',
+      source_label = '',
+    } = req.body || {};
+    const lines = parseLines(req.body?.lines);
+
+    if (!entry_date) {
+      return res.status(400).json({ success: false, error: 'entry_date is required' });
+    }
+    if (!Array.isArray(lines) || lines.length < 2) {
+      return res.status(400).json({
+        success: false,
+        error: 'At least two journal lines are required',
+      });
+    }
+
+    const periodCheck = await assertPeriodOpen(entry_date, 'Journal date');
+    if (periodCheck.error) {
+      return res.status(400).json({
+        success: false,
+        error: periodCheck.error,
+        period_key: periodCheck.period_key,
+        locked: true,
+      });
+    }
+
+    const allowedStatus = ['DRAFT', 'POSTED'];
+    const finalStatus = allowedStatus.includes(status) ? status : 'POSTED';
+    const allowedSources = ['MANUAL', 'INVOICE', 'INVENTORY', 'PAYMENT', 'ADJUSTMENT', 'OPENING'];
+    const finalSource = allowedSources.includes(source) ? source : 'MANUAL';
+
+    const built = await buildJournalLinesFromRaw(lines);
+    if (built.error) {
+      return res.status(400).json({ success: false, error: built.error });
+    }
+    const { builtLines, totalDebit, totalCredit } = built;
+
+    // Generate next entry number JE-YYYY-####
+    const entry_no = await nextJournalEntryNo(entry_date);
+
+    const { created_by_name: createdByName, created_by_email: createdByEmail, created_by_user_id: createdByUserId } =
+      actorFromReq(req);
+
+    const sourceLabels = {
+      MANUAL: 'Manual journal entry',
+      INVOICE: 'Invoice posting',
+      INVENTORY: 'Inventory movement',
+      PAYMENT: 'Payment / remittance',
+      ADJUSTMENT: 'Adjustment entry',
+      OPENING: 'Opening balance',
+    };
+
+    const supporting_documents = (req.files || []).map((file) => ({
+      filename: file.filename,
+      original_name: file.originalname,
+      mime_type: file.mimetype,
+      size: file.size,
+      url: `/uploads/accounting/${file.filename}`,
+      uploaded_at: new Date(),
+    }));
+
+    const journal = await JournalEntry.create({
+      entry_no,
+      entry_date: new Date(entry_date),
+      memo: String(memo || '').trim(),
+      source: finalSource,
+      source_reference: String(source_reference || '').trim() || undefined,
+      source_label:
+        String(source_label || '').trim() ||
+        sourceLabels[finalSource] ||
+        finalSource,
+      status: finalStatus,
+      lines: builtLines,
+      total_debit: totalDebit,
+      total_credit: totalCredit,
+      posted_at: finalStatus === 'POSTED' ? new Date() : undefined,
+      created_by_name: createdByName,
+      created_by_email: createdByEmail,
+      created_by_user_id: createdByUserId,
+      supporting_documents,
+    });
+
+    res.status(201).json({ success: true, data: journal });
+  } catch (error) {
+    console.error('Error creating journal:', error);
+    if (error?.code === 11000) {
+      return res.status(409).json({
+        success: false,
+        error: 'Entry number conflict. Please try again.',
+      });
+    }
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to create journal entry',
+    });
+  }
+});
+
+// Edit memo / date / lines on journals that are safe to amend (incl. stock-movement JEs).
+const EDITABLE_JOURNAL_SOURCES = new Set(['MANUAL', 'INVENTORY', 'ADJUSTMENT', 'OPENING']);
+
+router.put('/journals/:id', auth, upload.array('documents', 5), async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, error: 'Invalid journal id' });
+    }
+    const journal = await JournalEntry.findById(req.params.id);
+    if (!journal) {
+      return res.status(404).json({ success: false, error: 'Journal entry not found' });
+    }
+    if (!EDITABLE_JOURNAL_SOURCES.has(String(journal.source || '').toUpperCase()) && journal.status !== 'DRAFT') {
+      return res.status(400).json({
+        success: false,
+        error: `${journal.source || 'This'} journals cannot be edited here — reverse or adjust with a new entry`,
+      });
+    }
+
+    const { entry_date, memo, status } = req.body || {};
+    const lines = parseLines(req.body?.lines);
+    if (!entry_date) {
+      return res.status(400).json({ success: false, error: 'entry_date is required' });
+    }
+    if (!Array.isArray(lines) || lines.length < 2) {
+      return res.status(400).json({
+        success: false,
+        error: 'At least two journal lines are required',
+      });
+    }
+
+    const built = await buildJournalLinesFromRaw(lines);
+    if (built.error) {
+      return res.status(400).json({ success: false, error: built.error });
+    }
+    const { builtLines, totalDebit, totalCredit } = built;
+
+    const newDocs = (req.files || []).map((file) => ({
+      filename: file.filename,
+      original_name: file.originalname,
+      mime_type: file.mimetype,
+      size: file.size,
+      url: `/uploads/accounting/${file.filename}`,
+      uploaded_at: new Date(),
+    }));
+
+    const originalLocked = await assertPeriodOpen(journal.entry_date, 'Original journal date');
+    const lockedPeriod = Boolean(originalLocked.locked);
+
+    // Locked month: leave original untouched; post ADJUSTMENT in next open period
+    if (lockedPeriod && journal.status === 'POSTED') {
+      const nextPeriod = await nextOpenPeriodStart(journal.entry_date);
+      if (nextPeriod.error) {
+        return res.status(400).json({ success: false, error: nextPeriod.error });
+      }
+
+      const effectiveLines =
+        Array.isArray(journal.last_effective_lines) && journal.last_effective_lines.length >= 2
+          ? journal.last_effective_lines
+          : journal.lines;
+
+      const adjLines = [
+        ...reverseJournalLines(effectiveLines, `Rev ${journal.entry_no}`),
+        ...builtLines.map((l) => ({
+          ...l,
+          description: l.description || `Adj ${journal.entry_no}`,
+        })),
+      ];
+      const adjDebit = adjLines.reduce((s, l) => s + l.debit, 0);
+      const adjCredit = adjLines.reduce((s, l) => s + l.credit, 0);
+      if (Math.abs(adjDebit - adjCredit) > 0.009) {
+        return res.status(400).json({
+          success: false,
+          error: `Adjustment is not balanced. Debit ${adjDebit.toFixed(2)} vs Credit ${adjCredit.toFixed(2)}`,
+        });
+      }
+
+      const actor = actorFromReq(req);
+      const adjDate = nextPeriod.when;
+      const entry_no = await nextJournalEntryNo(adjDate);
+      const adjMemo =
+        String(memo || '').trim() ||
+        `Adjustment for ${journal.entry_no} (period ${originalLocked.period_key} locked)`;
+
+      const adjustment = await JournalEntry.create({
+        entry_no,
+        entry_date: adjDate,
+        memo: adjMemo,
+        source: 'ADJUSTMENT',
+        source_reference: journal.entry_no,
+        source_label: `Period adjustment · ${journal.entry_no}`,
+        status: 'POSTED',
+        lines: adjLines,
+        total_debit: Math.round(adjDebit * 100) / 100,
+        total_credit: Math.round(adjCredit * 100) / 100,
+        posted_at: new Date(),
+        adjusts_journal_id: journal._id,
+        adjusts_journal_no: journal.entry_no,
+        supporting_documents: newDocs,
+        ...actor,
+      });
+
+      journal.adjusted_by_journal_id = adjustment._id;
+      journal.adjusted_by_journal_no = adjustment.entry_no;
+      journal.last_effective_lines = builtLines;
+      await journal.save();
+
+      if (String(journal.source).toUpperCase() === 'INVENTORY') {
+        const txn = await InventoryTransaction.findOne({ journal_entry_id: journal._id });
+        if (txn) {
+          const absQty = Math.abs(toNum(txn.qty)) || 1;
+          txn.total_cost = Math.round(totalDebit * 100) / 100;
+          txn.unit_cost = Math.round((totalDebit / absQty) * 10000) / 10000;
+          if (adjMemo) txn.notes = adjMemo;
+          await txn.save();
+        }
+      }
+
+      return res.json({
+        success: true,
+        data: adjustment,
+        meta: {
+          adjustment: true,
+          locked_period: originalLocked.period_key,
+          adjustment_period: nextPeriod.period_key,
+          original_journal_id: String(journal._id),
+          original_journal_no: journal.entry_no,
+          message: `Period ${originalLocked.period_key} is locked. Posted adjustment ${adjustment.entry_no} in ${nextPeriod.period_key}.`,
+        },
+      });
+    }
+
+    // Open period: in-place edit
+    const dateCheck = await assertPeriodOpen(entry_date, 'Journal date');
+    if (dateCheck.error) {
+      return res.status(400).json({
+        success: false,
+        error: dateCheck.error,
+        period_key: dateCheck.period_key,
+        locked: true,
+      });
+    }
+
+    const allowedStatus = ['DRAFT', 'POSTED'];
+    const nextStatus = allowedStatus.includes(status) ? status : journal.status;
+
+    journal.entry_date = new Date(entry_date);
+    journal.memo = String(memo || '').trim();
+    journal.lines = builtLines;
+    journal.total_debit = totalDebit;
+    journal.total_credit = totalCredit;
+    journal.status = nextStatus;
+    if (nextStatus === 'POSTED' && !journal.posted_at) {
+      journal.posted_at = new Date();
+    }
+    if (newDocs.length) {
+      journal.supporting_documents = [...(journal.supporting_documents || []), ...newDocs];
+    }
+
+    await journal.save();
+
+    if (String(journal.source).toUpperCase() === 'INVENTORY') {
+      const txn = await InventoryTransaction.findOne({ journal_entry_id: journal._id });
+      if (txn) {
+        const absQty = Math.abs(toNum(txn.qty)) || 1;
+        txn.total_cost = Math.round(totalDebit * 100) / 100;
+        txn.unit_cost = Math.round((totalDebit / absQty) * 10000) / 10000;
+        txn.txn_date = journal.entry_date;
+        if (journal.memo) txn.notes = journal.memo;
+        await txn.save();
+      }
+    }
+
+    res.json({ success: true, data: journal, meta: { adjustment: false } });
+  } catch (error) {
+    console.error('Error updating journal:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to update journal entry',
+    });
+  }
+});
+
+// Accounting periods (month lock / unlock)
+router.get('/periods', auth, async (req, res) => {
+  try {
+    const monthsBack = Math.min(36, Math.max(0, Number(req.query.months_back) || 12));
+    const monthsForward = Math.min(24, Math.max(0, Number(req.query.months_forward) || 6));
+    const periods = await listPeriodsAround(new Date(), monthsBack, monthsForward);
+    res.json({ success: true, data: periods });
+  } catch (error) {
+    console.error('Error listing periods:', error);
+    res.status(500).json({ success: false, error: 'Failed to list accounting periods' });
+  }
+});
+
+router.get('/periods/:periodKey', auth, async (req, res) => {
+  try {
+    const key = String(req.params.periodKey || '').trim();
+    if (!/^\d{4}-\d{2}$/.test(key)) {
+      return res.status(400).json({ success: false, error: 'period_key must be YYYY-MM' });
+    }
+    const periods = await listPeriodsAround(
+      new Date(Number(key.slice(0, 4)), Number(key.slice(5, 7)) - 1, 1),
+      0,
+      0
+    );
+    res.json({ success: true, data: periods[0] || { period_key: key, status: 'OPEN' } });
+  } catch (error) {
+    console.error('Error fetching period:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch accounting period' });
+  }
+});
+
+router.put('/periods/:periodKey', auth, requireAdmin, async (req, res) => {
+  try {
+    const key = String(req.params.periodKey || '').trim();
+    const { status, notes, reason } = req.body || {};
+    if (!['OPEN', 'LOCKED'].includes(String(status || '').toUpperCase())) {
+      return res.status(400).json({ success: false, error: 'status must be OPEN or LOCKED' });
+    }
+    const nextStatus = String(status).toUpperCase();
+    const unlockReason = String(reason || notes || '').trim();
+    if (nextStatus === 'OPEN' && unlockReason.length < 8) {
+      return res.status(400).json({
+        success: false,
+        error: 'Unlocking a period requires a written reason of at least 8 characters.',
+      });
+    }
+    const actor = actorFromReq(req);
+    const result = await setPeriodStatus(
+      key,
+      nextStatus,
+      {
+        name: actor.created_by_name,
+        email: actor.created_by_email,
+      },
+      unlockReason
+    );
+    if (result.error) {
+      return res.status(400).json({ success: false, error: result.error });
+    }
+    res.json({ success: true, data: result.period });
+  } catch (error) {
+    console.error('Error updating period:', error);
+    res.status(500).json({ success: false, error: 'Failed to update accounting period' });
+  }
+});
+
+// Inventory
+router.get('/inventory/items', auth, async (req, res) => {
+  try {
+    const items = await InventoryItem.find({}).sort({ sku: 1 }).lean();
+    res.json({ success: true, data: items });
+  } catch (error) {
+    console.error('Error fetching inventory items:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch inventory items' });
+  }
+});
+
+router.get('/inventory/items/:sku', auth, async (req, res) => {
+  try {
+    const sku = String(req.params.sku || '')
+      .trim()
+      .toUpperCase();
+    const item = await InventoryItem.findOne({ sku }).lean();
+    if (!item) {
+      return res.status(404).json({ success: false, error: 'Inventory item not found' });
+    }
+
+    const movements = await InventoryTransaction.find({ sku })
+      .sort({ txn_date: 1, createdAt: 1 })
+      .lean();
+
+    const journalIds = [
+      ...new Set(
+        movements
+          .map((m) => (m.journal_entry_id ? String(m.journal_entry_id) : null))
+          .filter(Boolean)
+      ),
+    ];
+
+    const journals = journalIds.length
+      ? await JournalEntry.find({ _id: { $in: journalIds } }).lean()
+      : [];
+    const journalById = new Map(journals.map((j) => [String(j._id), j]));
+
+    const movementsWithJournal = movements.map((m) => ({
+      ...m,
+      journal: m.journal_entry_id ? journalById.get(String(m.journal_entry_id)) || null : null,
+    }));
+
+    res.json({
+      success: true,
+      data: {
+        item,
+        movements: movementsWithJournal,
+        stock_value: Math.round((item.qty_on_hand || 0) * (item.avg_cost || 0) * 100) / 100,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching inventory item detail:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch inventory item' });
+  }
+});
+
+router.post('/inventory/items', auth, async (req, res) => {
+  try {
+    const {
+      sku,
+      name,
+      unit = 'PCS',
+      qty_on_hand = 0,
+      avg_cost = 0,
+      reorder_level = 0,
+      asset_account_code = '1200',
+      cogs_account_code = '5000',
+      income_account_code = '4000',
+      is_active = true,
+    } = req.body || {};
+
+    const itemSku = String(sku || '')
+      .trim()
+      .toUpperCase();
+    const itemName = String(name || '').trim();
+    const itemUnit = String(unit || 'PCS').trim().toUpperCase() || 'PCS';
+
+    if (!itemSku) {
+      return res.status(400).json({ success: false, error: 'SKU is required' });
+    }
+    if (!/^[A-Z0-9][A-Z0-9._-]{1,31}$/.test(itemSku)) {
+      return res.status(400).json({
+        success: false,
+        error: 'SKU must be 2–32 characters (letters, numbers, . _ -)',
+      });
+    }
+    if (!itemName) {
+      return res.status(400).json({ success: false, error: 'Item name is required' });
+    }
+
+    const qty = toNum(qty_on_hand);
+    const cost = toNum(avg_cost);
+    const reorder = toNum(reorder_level);
+    if (qty < 0 || cost < 0 || reorder < 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Quantity, average cost, and reorder level cannot be negative',
+      });
+    }
+
+    const assetCode = String(asset_account_code || glCode('1200')).trim();
+    const cogsCode = String(cogs_account_code || glCode('5000')).trim();
+    const incomeCode = String(income_account_code || glCode('4000')).trim();
+
+    for (const [label, code] of [
+      ['Asset', assetCode],
+      ['COGS', cogsCode],
+      ['Income', incomeCode],
+    ]) {
+      const account = await Account.findOne({ code }).lean();
+      if (!account) {
+        return res.status(400).json({
+          success: false,
+          error: `${label} account not found: ${code}`,
+        });
+      }
+    }
+
+    const existing = await InventoryItem.findOne({ sku: itemSku }).lean();
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        error: `SKU ${itemSku} already exists`,
+      });
+    }
+
+    const createdByName =
+      req.user?.employee?.full_name ||
+      req.user?.email ||
+      'User';
+    const createdByEmail = req.user?.email || '';
+    const createdByUserId = req.user?.id || undefined;
+
+    const item = await InventoryItem.create({
+      sku: itemSku,
+      name: itemName,
+      unit: itemUnit,
+      qty_on_hand: qty,
+      avg_cost: cost,
+      reorder_level: reorder,
+      asset_account_code: assetCode,
+      cogs_account_code: cogsCode,
+      income_account_code: incomeCode,
+      is_active: is_active !== false && is_active !== 'false',
+      created_by_name: createdByName,
+      created_by_email: createdByEmail,
+      created_by_user_id: createdByUserId,
+    });
+
+    res.status(201).json({ success: true, data: item });
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(409).json({
+        success: false,
+        error: 'SKU already exists',
+      });
+    }
+    console.error('Error creating inventory item:', error);
+    res.status(500).json({ success: false, error: 'Failed to create inventory item' });
+  }
+});
+
+// Items with stock movements keep SKU, quantity and cost: those are carried by posted journals.
+router.put('/inventory/items/:id', auth, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, error: 'Invalid item id' });
+    }
+    const item = await InventoryItem.findById(req.params.id);
+    if (!item) {
+      return res.status(404).json({ success: false, error: 'Inventory item not found' });
+    }
+    const movementCount = await InventoryTransaction.countDocuments({ item_id: item._id });
+    const body = req.body || {};
+
+    if (body.name !== undefined) {
+      const itemName = String(body.name || '').trim();
+      if (!itemName) return res.status(400).json({ success: false, error: 'Item name is required' });
+      item.name = itemName;
+    }
+    if (body.unit !== undefined) {
+      item.unit = String(body.unit || 'PCS').trim().toUpperCase() || 'PCS';
+    }
+    if (body.reorder_level !== undefined) {
+      const reorder = toNum(body.reorder_level);
+      if (reorder < 0) return res.status(400).json({ success: false, error: 'Reorder level cannot be negative' });
+      item.reorder_level = reorder;
+    }
+    if (body.is_active !== undefined) {
+      item.is_active = body.is_active !== false && body.is_active !== 'false';
+    }
+    for (const [field, label] of [
+      ['asset_account_code', 'Asset'],
+      ['cogs_account_code', 'COGS'],
+      ['income_account_code', 'Income'],
+    ]) {
+      if (body[field] === undefined) continue;
+      const code = String(body[field] || '').trim();
+      if (!(await Account.exists({ code }))) {
+        return res.status(400).json({ success: false, error: `${label} account not found: ${code}` });
+      }
+      item[field] = code;
+    }
+
+    const lockedChange = [
+      body.sku !== undefined && String(body.sku).trim().toUpperCase() !== item.sku,
+      body.qty_on_hand !== undefined && toNum(body.qty_on_hand) !== item.qty_on_hand,
+      body.avg_cost !== undefined && toNum(body.avg_cost) !== item.avg_cost,
+    ].some(Boolean);
+    if (lockedChange && movementCount > 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'This item has stock movements — change quantity or cost with a stock movement, and the SKU cannot be renamed',
+      });
+    }
+    if (movementCount === 0) {
+      if (body.sku !== undefined) {
+        const itemSku = String(body.sku || '').trim().toUpperCase();
+        if (!/^[A-Z0-9][A-Z0-9._-]{1,31}$/.test(itemSku)) {
+          return res.status(400).json({ success: false, error: 'SKU must be 2–32 characters (letters, numbers, . _ -)' });
+        }
+        if (itemSku !== item.sku && (await InventoryItem.exists({ sku: itemSku, _id: { $ne: item._id } }))) {
+          return res.status(409).json({ success: false, error: `SKU ${itemSku} already exists` });
+        }
+        item.sku = itemSku;
+      }
+      if (body.qty_on_hand !== undefined || body.avg_cost !== undefined) {
+        const qty = body.qty_on_hand !== undefined ? toNum(body.qty_on_hand) : item.qty_on_hand;
+        const cost = body.avg_cost !== undefined ? toNum(body.avg_cost) : item.avg_cost;
+        if (qty < 0 || cost < 0) {
+          return res.status(400).json({ success: false, error: 'Quantity and average cost cannot be negative' });
+        }
+        item.qty_on_hand = qty;
+        item.avg_cost = cost;
+      }
+    }
+
+    await item.save();
+    res.json({ success: true, data: { ...item.toObject(), movement_count: movementCount } });
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(409).json({ success: false, error: 'SKU already exists' });
+    }
+    console.error('Error updating inventory item:', error);
+    res.status(500).json({ success: false, error: 'Failed to update inventory item' });
+  }
+});
+
+router.delete('/inventory/items/:id', auth, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, error: 'Invalid item id' });
+    }
+    const item = await InventoryItem.findById(req.params.id);
+    if (!item) {
+      return res.status(404).json({ success: false, error: 'Inventory item not found' });
+    }
+    const movementCount = await InventoryTransaction.countDocuments({ item_id: item._id });
+    if (movementCount > 0) {
+      return res.status(400).json({
+        success: false,
+        error: `${item.sku} has ${movementCount} stock movement${movementCount === 1 ? '' : 's'} posted to the ledger — mark it inactive instead`,
+      });
+    }
+    await InventoryItem.deleteOne({ _id: item._id });
+    res.json({ success: true, data: { _id: item._id, sku: item.sku } });
+  } catch (error) {
+    console.error('Error deleting inventory item:', error);
+    res.status(500).json({ success: false, error: 'Failed to delete inventory item' });
+  }
+});
+
+router.get('/inventory/transactions', auth, async (req, res) => {
+  try {
+    const txns = await InventoryTransaction.find({})
+      .sort({ txn_date: -1, createdAt: -1 })
+      .lean();
+    res.json({ success: true, data: txns });
+  } catch (error) {
+    console.error('Error fetching inventory transactions:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch inventory transactions' });
+  }
+});
+
+router.post('/inventory/transactions', auth, async (req, res) => {
+  try {
+    const {
+      txn_date,
+      type,
+      sku,
+      qty,
+      unit_cost,
+      notes = '',
+      offset_account_code = '',
+      post_journal = true,
+    } = req.body || {};
+
+    const allowedTypes = ['RECEIPT', 'ISSUE', 'ADJUSTMENT'];
+    const txnType = String(type || '').toUpperCase();
+    if (!allowedTypes.includes(txnType)) {
+      return res.status(400).json({
+        success: false,
+        error: 'type must be RECEIPT, ISSUE, or ADJUSTMENT',
+      });
+    }
+    if (!txn_date) {
+      return res.status(400).json({ success: false, error: 'txn_date is required' });
+    }
+
+    const periodCheck = await assertPeriodOpen(txn_date, 'Transaction date');
+    if (periodCheck.error) {
+      return res.status(400).json({
+        success: false,
+        error: periodCheck.error,
+        period_key: periodCheck.period_key,
+        locked: true,
+      });
+    }
+
+    const itemSku = String(sku || '').trim().toUpperCase();
+    if (!itemSku) {
+      return res.status(400).json({ success: false, error: 'sku is required' });
+    }
+
+    const item = await InventoryItem.findOne({ sku: itemSku, is_active: true });
+    if (!item) {
+      return res.status(404).json({ success: false, error: `Active item not found: ${itemSku}` });
+    }
+
+    let qtyRaw = toNum(qty);
+    if (txnType === 'ADJUSTMENT') {
+      if (qtyRaw === 0) {
+        return res.status(400).json({ success: false, error: 'Adjustment quantity cannot be zero' });
+      }
+    } else {
+      qtyRaw = Math.abs(qtyRaw);
+      if (qtyRaw <= 0) {
+        return res.status(400).json({ success: false, error: 'Quantity must be greater than zero' });
+      }
+    }
+
+    let unitCost = toNum(unit_cost);
+    if (unitCost < 0) {
+      return res.status(400).json({ success: false, error: 'Unit cost cannot be negative' });
+    }
+
+    const oldQty = toNum(item.qty_on_hand);
+    const oldAvg = toNum(item.avg_cost);
+    let newQty = oldQty;
+    let newAvg = oldAvg;
+    let signedQty = qtyRaw;
+
+    if (txnType === 'RECEIPT') {
+      if (unitCost <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Unit cost is required for receipts',
+        });
+      }
+      signedQty = Math.abs(qtyRaw);
+      newQty = oldQty + signedQty;
+      newAvg = newQty > 0 ? (oldQty * oldAvg + signedQty * unitCost) / newQty : unitCost;
+    } else if (txnType === 'ISSUE') {
+      signedQty = Math.abs(qtyRaw);
+      if (signedQty > oldQty + 0.0001) {
+        return res.status(400).json({
+          success: false,
+          error: `Insufficient stock. On hand: ${oldQty}, requested: ${signedQty}`,
+        });
+      }
+      if (unitCost <= 0) unitCost = oldAvg;
+      newQty = oldQty - signedQty;
+      newAvg = oldAvg;
+    } else {
+      // ADJUSTMENT — signed qty
+      signedQty = qtyRaw;
+      const nextQty = oldQty + signedQty;
+      if (nextQty < -0.0001) {
+        return res.status(400).json({
+          success: false,
+          error: `Adjustment would make quantity negative (on hand ${oldQty})`,
+        });
+      }
+      if (signedQty > 0) {
+        if (unitCost <= 0) unitCost = oldAvg || 0;
+        if (unitCost <= 0) {
+          return res.status(400).json({
+            success: false,
+            error: 'Unit cost is required when increasing stock via adjustment',
+          });
+        }
+        newQty = nextQty;
+        newAvg = newQty > 0 ? (oldQty * oldAvg + signedQty * unitCost) / newQty : unitCost;
+      } else {
+        if (unitCost <= 0) unitCost = oldAvg;
+        newQty = nextQty;
+        newAvg = oldAvg;
+      }
+    }
+
+    const absQty = Math.abs(signedQty);
+    const totalCost = Math.round(absQty * unitCost * 100) / 100;
+    const shouldPostJournal =
+      post_journal !== false &&
+      post_journal !== 'false' &&
+      totalCost > 0.009;
+
+    const actor = actorFromReq(req);
+    let journal = null;
+
+    if (shouldPostJournal) {
+      const invAcct = await loadPostableAccount(item.asset_account_code || glCode('1200'));
+      const cogsAcct = await loadPostableAccount(item.cogs_account_code || glCode('5000'));
+      if (!invAcct) {
+        return res.status(400).json({
+          success: false,
+          error: `Inventory asset account not found: ${item.asset_account_code}`,
+        });
+      }
+      if (!cogsAcct) {
+        return res.status(400).json({
+          success: false,
+          error: `COGS account not found: ${item.cogs_account_code}`,
+        });
+      }
+
+      let offsetAcct = null;
+      let debitLine;
+      let creditLine;
+      const desc = `${txnType} ${item.sku}`;
+
+      if (txnType === 'RECEIPT') {
+        const offsetCode = String(offset_account_code || glCode('2000')).trim();
+        offsetAcct = await loadPostableAccount(offsetCode);
+        if (!offsetAcct) {
+          return res.status(400).json({
+            success: false,
+            error: `Offset account not found: ${offsetCode}`,
+          });
+        }
+        debitLine = {
+          account_id: invAcct._id,
+          account_code: invAcct.code,
+          account_name: invAcct.name,
+          description: desc,
+          debit: totalCost,
+          credit: 0,
+        };
+        creditLine = {
+          account_id: offsetAcct._id,
+          account_code: offsetAcct.code,
+          account_name: offsetAcct.name,
+          description: desc,
+          debit: 0,
+          credit: totalCost,
+        };
+      } else if (txnType === 'ISSUE') {
+        debitLine = {
+          account_id: cogsAcct._id,
+          account_code: cogsAcct.code,
+          account_name: cogsAcct.name,
+          description: desc,
+          debit: totalCost,
+          credit: 0,
+        };
+        creditLine = {
+          account_id: invAcct._id,
+          account_code: invAcct.code,
+          account_name: invAcct.name,
+          description: desc,
+          debit: 0,
+          credit: totalCost,
+        };
+      } else if (signedQty > 0) {
+        // Adjustment increase — same as receipt against COGS/expense recovery or offset
+        const offsetCode = String(offset_account_code || item.cogs_account_code || glCode('5000')).trim();
+        offsetAcct = await loadPostableAccount(offsetCode);
+        if (!offsetAcct) {
+          return res.status(400).json({
+            success: false,
+            error: `Offset account not found: ${offsetCode}`,
+          });
+        }
+        debitLine = {
+          account_id: invAcct._id,
+          account_code: invAcct.code,
+          account_name: invAcct.name,
+          description: desc,
+          debit: totalCost,
+          credit: 0,
+        };
+        creditLine = {
+          account_id: offsetAcct._id,
+          account_code: offsetAcct.code,
+          account_name: offsetAcct.name,
+          description: desc,
+          debit: 0,
+          credit: totalCost,
+        };
+      } else {
+        // Adjustment decrease — Dr COGS, Cr Inventory
+        debitLine = {
+          account_id: cogsAcct._id,
+          account_code: cogsAcct.code,
+          account_name: cogsAcct.name,
+          description: desc,
+          debit: totalCost,
+          credit: 0,
+        };
+        creditLine = {
+          account_id: invAcct._id,
+          account_code: invAcct.code,
+          account_name: invAcct.name,
+          description: desc,
+          debit: 0,
+          credit: totalCost,
+        };
+      }
+
+      const entry_no = await nextJournalEntryNo(txn_date);
+      const memo =
+        String(notes || '').trim() ||
+        `Inventory ${txnType.toLowerCase()} — ${item.sku} ${item.name} × ${absQty}`;
+
+      journal = await JournalEntry.create({
+        entry_no,
+        entry_date: new Date(txn_date),
+        memo,
+        source: 'INVENTORY',
+        source_reference: item.sku,
+        source_label: `Inventory ${txnType.toLowerCase()}`,
+        status: 'POSTED',
+        lines: [debitLine, creditLine],
+        total_debit: totalCost,
+        total_credit: totalCost,
+        posted_at: new Date(),
+        ...actor,
+      });
+    }
+
+    const txn = await InventoryTransaction.create({
+      txn_date: new Date(txn_date),
+      type: txnType,
+      item_id: item._id,
+      sku: item.sku,
+      item_name: item.name,
+      qty: signedQty,
+      unit_cost: unitCost,
+      total_cost: totalCost,
+      notes: String(notes || '').trim() || undefined,
+      journal_entry_id: journal?._id,
+      journal_entry_no: journal?.entry_no,
+      ...actor,
+    });
+
+    item.qty_on_hand = Math.round(newQty * 1000) / 1000;
+    item.avg_cost = Math.round(newAvg * 10000) / 10000;
+    await item.save();
+
+    res.status(201).json({
+      success: true,
+      data: {
+        transaction: txn,
+        item,
+        journal,
+      },
+    });
+  } catch (error) {
+    console.error('Error recording inventory movement:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to record inventory movement',
+    });
+  }
+});
+
+// Reports (from posted journals)
+router.get('/reports/trial-balance', auth, async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    const dateFilter = { status: 'POSTED' };
+    if (from || to) {
+      dateFilter.entry_date = {};
+      if (from) dateFilter.entry_date.$gte = new Date(from);
+      if (to) dateFilter.entry_date.$lte = new Date(`${to}T23:59:59.999Z`);
+    }
+
+    const [accounts, journals] = await Promise.all([
+      Account.find({ is_active: true }).sort({ code: 1 }).lean(),
+      JournalEntry.find(dateFilter).lean(),
+    ]);
+
+    const totals = new Map();
+    for (const a of accounts) {
+      totals.set(a.code, { code: a.code, name: a.name, type: a.type, debit: 0, credit: 0 });
+    }
+
+    for (const j of journals) {
+      for (const line of j.lines || []) {
+        const row = totals.get(line.account_code);
+        if (!row) continue;
+        row.debit += toNum(line.debit);
+        row.credit += toNum(line.credit);
+      }
+    }
+
+    const rows = [...totals.values()].filter((r) => r.debit > 0 || r.credit > 0);
+    const totalDebit = rows.reduce((s, r) => s + r.debit, 0);
+    const totalCredit = rows.reduce((s, r) => s + r.credit, 0);
+
+    res.json({
+      success: true,
+      data: { rows, total_debit: totalDebit, total_credit: totalCredit },
+    });
+  } catch (error) {
+    console.error('Error building trial balance:', error);
+    res.status(500).json({ success: false, error: 'Failed to build trial balance' });
+  }
+});
+
+router.get('/reports/profit-loss', auth, async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    const dateFilter = { status: 'POSTED' };
+    if (from || to) {
+      dateFilter.entry_date = {};
+      if (from) dateFilter.entry_date.$gte = new Date(from);
+      if (to) dateFilter.entry_date.$lte = new Date(`${to}T23:59:59.999Z`);
+    }
+
+    const [accounts, journals] = await Promise.all([
+      Account.find({ type: { $in: ['Revenue', 'Expense'] }, is_active: true }).lean(),
+      JournalEntry.find(dateFilter).lean(),
+    ]);
+
+    const byCode = new Map(accounts.map((a) => [a.code, { ...a, amount: 0 }]));
+
+    for (const j of journals) {
+      for (const line of j.lines || []) {
+        const acc = byCode.get(line.account_code);
+        if (!acc) continue;
+        const debit = toNum(line.debit);
+        const credit = toNum(line.credit);
+        if (acc.type === 'Revenue') acc.amount += credit - debit;
+        else acc.amount += debit - credit;
+      }
+    }
+
+    const revenue = [...byCode.values()]
+      .filter((a) => a.type === 'Revenue')
+      .map((a) => ({ code: a.code, name: a.name, amount: a.amount }));
+    const expenses = [...byCode.values()]
+      .filter((a) => a.type === 'Expense')
+      .map((a) => ({ code: a.code, name: a.name, amount: a.amount }));
+
+    const totalRevenue = revenue.reduce((s, r) => s + r.amount, 0);
+    const totalExpenses = expenses.reduce((s, r) => s + r.amount, 0);
+
+    res.json({
+      success: true,
+      data: {
+        revenue,
+        expenses,
+        total_revenue: totalRevenue,
+        total_expenses: totalExpenses,
+        net_profit: totalRevenue - totalExpenses,
+      },
+    });
+  } catch (error) {
+    console.error('Error building P&L:', error);
+    res.status(500).json({ success: false, error: 'Failed to build profit and loss' });
+  }
+});
+
+router.get('/reports/balance-sheet', auth, async (req, res) => {
+  try {
+    const { to } = req.query;
+    const dateFilter = { status: 'POSTED' };
+    if (to) {
+      dateFilter.entry_date = { $lte: new Date(`${to}T23:59:59.999Z`) };
+    }
+
+    const [accounts, journals] = await Promise.all([
+      Account.find({
+        type: { $in: ['Asset', 'Liability', 'Equity'] },
+        is_active: true,
+      })
+        .sort({ code: 1 })
+        .lean(),
+      JournalEntry.find(dateFilter).lean(),
+    ]);
+
+    const byCode = new Map(
+      accounts.map((a) => [a.code, { code: a.code, name: a.name, type: a.type, amount: 0 }])
+    );
+
+    for (const j of journals) {
+      for (const line of j.lines || []) {
+        const acc = byCode.get(line.account_code);
+        if (!acc) continue;
+        const debit = toNum(line.debit);
+        const credit = toNum(line.credit);
+        if (acc.type === 'Asset') acc.amount += debit - credit;
+        else acc.amount += credit - debit;
+      }
+    }
+
+    const assets = [...byCode.values()].filter((a) => a.type === 'Asset');
+    const liabilities = [...byCode.values()].filter((a) => a.type === 'Liability');
+    const equity = [...byCode.values()].filter((a) => a.type === 'Equity');
+
+    // Include current period net profit into equity presentation
+    const pnlAccounts = await Account.find({
+      type: { $in: ['Revenue', 'Expense'] },
+      is_active: true,
+    }).lean();
+    const pnlMap = new Map(pnlAccounts.map((a) => [a.code, { type: a.type, amount: 0 }]));
+    for (const j of journals) {
+      for (const line of j.lines || []) {
+        const acc = pnlMap.get(line.account_code);
+        if (!acc) continue;
+        const debit = toNum(line.debit);
+        const credit = toNum(line.credit);
+        if (acc.type === 'Revenue') acc.amount += credit - debit;
+        else acc.amount += debit - credit;
+      }
+    }
+    let netProfit = 0;
+    for (const acc of pnlMap.values()) {
+      if (acc.type === 'Revenue') netProfit += acc.amount;
+      else netProfit -= acc.amount;
+    }
+    if (Math.abs(netProfit) > 0.0001) {
+      equity.push({
+        code: '3900',
+        name: 'Current Period Earnings',
+        type: 'Equity',
+        amount: netProfit,
+      });
+    }
+
+    const totalAssets = assets.reduce((s, a) => s + a.amount, 0);
+    const totalLiabilities = liabilities.reduce((s, a) => s + a.amount, 0);
+    const totalEquity = equity.reduce((s, a) => s + a.amount, 0);
+
+    res.json({
+      success: true,
+      data: {
+        assets,
+        liabilities,
+        equity,
+        total_assets: totalAssets,
+        total_liabilities: totalLiabilities,
+        total_equity: totalEquity,
+      },
+    });
+  } catch (error) {
+    console.error('Error building balance sheet:', error);
+    res.status(500).json({ success: false, error: 'Failed to build balance sheet' });
+  }
+});
+
+async function nextSupplierPaymentNo(paymentDate) {
+  const year = new Date(paymentDate).getFullYear() || new Date().getFullYear();
+  const prefix = `SP-${year}-`;
+  const latest = await SupplierPayment.findOne({ payment_no: new RegExp(`^${prefix}`) })
+    .sort({ payment_no: -1 })
+    .select('payment_no')
+    .lean();
+  let nextNum = 1;
+  if (latest?.payment_no) {
+    const parts = String(latest.payment_no).split('-');
+    const n = parseInt(parts[parts.length - 1], 10);
+    if (Number.isFinite(n)) nextNum = n + 1;
+  }
+  return `${prefix}${String(nextNum).padStart(4, '0')}`;
+}
+
+/** Customer payment receipt voucher numbers: RV-YYYY-#### */
+async function nextSalesReceiptNo(paymentDate) {
+  const year = new Date(paymentDate).getFullYear() || new Date().getFullYear();
+  const prefix = `RV-${year}-`;
+  const latest = await SalesInvoice.findOne({ 'payments.receipt_no': new RegExp(`^${prefix}`) })
+    .sort({ 'payments.receipt_no': -1 })
+    .select('payments.receipt_no')
+    .lean();
+  let nextNum = 1;
+  if (latest?.payments?.length) {
+    for (const p of latest.payments) {
+      const no = String(p.receipt_no || '');
+      if (!no.startsWith(prefix)) continue;
+      const parts = no.split('-');
+      const n = parseInt(parts[parts.length - 1], 10);
+      if (Number.isFinite(n) && n >= nextNum) nextNum = n + 1;
+    }
+  }
+  // Also scan a wider set if the top doc isn't the max (embedded array sort is imperfect)
+  const peers = await SalesInvoice.find({ 'payments.receipt_no': new RegExp(`^${prefix}`) })
+    .select('payments.receipt_no')
+    .lean();
+  for (const inv of peers) {
+    for (const p of inv.payments || []) {
+      const no = String(p.receipt_no || '');
+      if (!no.startsWith(prefix)) continue;
+      const parts = no.split('-');
+      const n = parseInt(parts[parts.length - 1], 10);
+      if (Number.isFinite(n) && n >= nextNum) nextNum = n + 1;
+    }
+  }
+  return `${prefix}${String(nextNum).padStart(4, '0')}`;
+}
+
+async function ensureDefaultBankCashAccounts(actor = {}) {
+  if (useFiveDigitCoa()) {
+    await ensureKnexChartOfAccounts(actor);
+    return;
+  }
+
+  const count = await BankCashAccount.countDocuments();
+  if (count > 0) return;
+
+  const existingAp = await Account.findOne({ code: glCode('2000') });
+  if (!existingAp) {
+    await Account.create({
+      code: glCode('2000'),
+      name: 'Accounts Payable',
+      type: 'Liability',
+      subtype: 'Payables',
+      is_active: true,
+      is_postable: true,
+      ...actor,
+    });
+  }
+
+  const defaults = [
+    {
+      code: 'CASH-MAIN',
+      name: 'Petty Cash',
+      account_type: 'CASH',
+      gl_account_code: glCode('1000'),
+      opening_balance: 0,
+      current_balance: 0,
+      notes: 'Default cash account',
+    },
+    {
+      code: 'BANK-MAIN',
+      name: 'Operating Bank Account',
+      account_type: 'BANK',
+      bank_name: 'Primary Bank',
+      account_number_masked: '****0001',
+      gl_account_code: glCode('1100'),
+      opening_balance: 0,
+      current_balance: 0,
+      notes: 'Default bank account',
+    },
+  ];
+
+  for (const row of defaults) {
+    const existingGl = await Account.findOne({ code: row.gl_account_code });
+    if (!existingGl) {
+      await Account.create({
+        code: row.gl_account_code,
+        name: row.account_type === 'CASH' ? 'Cash on Hand' : 'Cash at Bank',
+        type: 'Asset',
+        subtype: row.account_type === 'CASH' ? 'Cash' : 'Bank',
+        is_active: true,
+        is_postable: true,
+        ...actor,
+      });
+    }
+    await BankCashAccount.create({ ...row, ...actor });
+  }
+}
+
+// Bank & Cash — overview
+router.get('/bank-cash/overview', auth, async (req, res) => {
+  try {
+    await ensureDefaultBankCashAccounts(actorFromReq(req));
+
+    const accounts = await BankCashAccount.find({ is_active: true }).sort({ account_type: 1, code: 1 }).lean();
+    const pending = await SupplierPayment.find({ status: 'PENDING_APPROVAL' })
+      .sort({ createdAt: -1 })
+      .lean();
+    const recent = await SupplierPayment.find({})
+      .sort({ createdAt: -1 })
+      .limit(12)
+      .lean();
+
+    const bankAccounts = accounts.filter((a) => a.account_type === 'BANK');
+    const cashAccounts = accounts.filter((a) => a.account_type === 'CASH');
+    const totalBank = bankAccounts.reduce((s, a) => s + toNum(a.current_balance), 0);
+    const totalCash = cashAccounts.reduce((s, a) => s + toNum(a.current_balance), 0);
+    const pendingTotal = pending.reduce((s, p) => s + toNum(p.amount), 0);
+
+    res.json({
+      success: true,
+      data: {
+        totals: {
+          bank: totalBank,
+          cash: totalCash,
+          combined: totalBank + totalCash,
+          pending_approval_count: pending.length,
+          pending_approval_amount: pendingTotal,
+        },
+        bank_accounts: bankAccounts,
+        cash_accounts: cashAccounts,
+        pending_payments: pending,
+        recent_payments: recent,
+      },
+    });
+  } catch (error) {
+    console.error('Error loading bank-cash overview:', error);
+    res.status(500).json({ success: false, error: 'Failed to load bank & cash overview' });
+  }
+});
+
+router.get('/bank-cash/accounts', auth, async (req, res) => {
+  try {
+    await ensureDefaultBankCashAccounts(actorFromReq(req));
+    const accounts = await BankCashAccount.find({}).sort({ account_type: 1, code: 1 }).lean();
+    res.json({ success: true, data: accounts });
+  } catch (error) {
+    console.error('Error fetching bank-cash accounts:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch bank & cash accounts' });
+  }
+});
+
+router.post('/bank-cash/accounts', auth, async (req, res) => {
+  try {
+    const {
+      code,
+      name,
+      account_type,
+      currency = 'AED',
+      bank_name = '',
+      account_number_masked = '',
+      gl_account_code,
+      opening_balance = 0,
+      notes = '',
+    } = req.body || {};
+
+    const accountCode = String(code || '').trim().toUpperCase();
+    const accountName = String(name || '').trim();
+    const type = String(account_type || '').trim().toUpperCase();
+    const glCode = String(gl_account_code || '').trim();
+    const opening = toNum(opening_balance);
+
+    if (!accountCode) {
+      return res.status(400).json({ success: false, error: 'Account code is required' });
+    }
+    if (!accountName) {
+      return res.status(400).json({ success: false, error: 'Account name is required' });
+    }
+    if (!['BANK', 'CASH'].includes(type)) {
+      return res.status(400).json({ success: false, error: 'account_type must be BANK or CASH' });
+    }
+    if (!glCode) {
+      return res.status(400).json({ success: false, error: 'GL account code is required' });
+    }
+
+    const gl = await loadPostableAccount(glCode);
+    if (!gl) {
+      return res.status(400).json({
+        success: false,
+        error: `GL account ${glCode} not found or not postable`,
+      });
+    }
+
+    const created = await BankCashAccount.create({
+      code: accountCode,
+      name: accountName,
+      account_type: type,
+      currency: String(currency || 'AED').trim() || 'AED',
+      bank_name: String(bank_name || '').trim(),
+      account_number_masked: String(account_number_masked || '').trim(),
+      gl_account_code: glCode,
+      opening_balance: opening,
+      current_balance: opening,
+      notes: String(notes || '').trim(),
+      ...actorFromReq(req),
+    });
+
+    res.status(201).json({ success: true, data: created });
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(400).json({ success: false, error: 'Bank/cash account code already exists' });
+    }
+    console.error('Error creating bank-cash account:', error);
+    res.status(500).json({ success: false, error: 'Failed to create bank & cash account' });
+  }
+});
+
+router.get('/bank-cash/payments', auth, async (req, res) => {
+  try {
+    const status = String(req.query.status || '').trim().toUpperCase();
+    const filter = {};
+    if (status && status !== 'ALL') {
+      filter.status = status;
+    }
+    const payments = await SupplierPayment.find(filter).sort({ createdAt: -1 }).lean();
+    res.json({ success: true, data: payments });
+  } catch (error) {
+    console.error('Error fetching supplier payments:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch supplier payments' });
+  }
+});
+
+router.post('/bank-cash/payments', auth, async (req, res) => {
+  try {
+    const {
+      payment_date,
+      supplier_name,
+      supplier_reference = '',
+      description = '',
+      amount,
+      bank_cash_account_id,
+      debit_account_code = '2000',
+      currency = 'AED',
+      purchase_order_id = '',
+    } = req.body || {};
+
+    let supplierName = String(supplier_name || '').trim();
+    const payAmount = Number(toNum(amount).toFixed(2));
+    let debitCode = String(debit_account_code || glCode('2000')).trim();
+    const payDate = payment_date ? new Date(payment_date) : new Date();
+
+    let linkedPo = null;
+    if (purchase_order_id) {
+      linkedPo = await PurchaseOrder.findById(purchase_order_id);
+      if (!linkedPo) {
+        return res.status(400).json({ success: false, error: 'Purchase order not found' });
+      }
+      if (!['APPROVED', 'PARTIALLY_RECEIVED', 'RECEIVED'].includes(linkedPo.status)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Payments can only be created for approved or received purchase orders',
+        });
+      }
+      const pendingOnPo = await pendingPaymentsTotal(linkedPo._id);
+      const available = Number(
+        (toNum(linkedPo.total_amount) - toNum(linkedPo.amount_paid) - pendingOnPo).toFixed(2)
+      );
+      if (payAmount > available + 0.009) {
+        return res.status(400).json({
+          success: false,
+          error: `Amount exceeds what is left to pay on ${linkedPo.po_no}: AED ${Math.max(0, available).toFixed(2)}${
+            pendingOnPo > 0 ? ` (AED ${pendingOnPo.toFixed(2)} already awaiting clearance)` : ''
+          }`,
+        });
+      }
+      supplierName = linkedPo.supplier_name;
+      debitCode = linkedPo.credit_account_code || glCode('2000');
+    }
+
+    if (!supplierName) {
+      return res.status(400).json({ success: false, error: 'Supplier name is required' });
+    }
+    if (!(payAmount > 0)) {
+      return res.status(400).json({ success: false, error: 'Amount must be greater than zero' });
+    }
+    if (!bank_cash_account_id) {
+      return res.status(400).json({ success: false, error: 'Bank/cash account is required' });
+    }
+
+    const wallet = await BankCashAccount.findById(bank_cash_account_id);
+    if (!wallet || !wallet.is_active) {
+      return res.status(400).json({ success: false, error: 'Bank/cash account not found or inactive' });
+    }
+
+    const debitAccount = await loadPostableAccount(debitCode);
+    if (!debitAccount) {
+      return res.status(400).json({
+        success: false,
+        error: `Debit account ${debitCode} not found or not postable`,
+      });
+    }
+
+    const creditAccount = await loadPostableAccount(wallet.gl_account_code);
+    if (!creditAccount) {
+      return res.status(400).json({
+        success: false,
+        error: `Linked GL ${wallet.gl_account_code} is not postable`,
+      });
+    }
+
+    const actor = actorFromReq(req);
+    const payment_no = await nextSupplierPaymentNo(payDate);
+    const entry_no = await nextJournalEntryNo(payDate);
+
+    const journal = await JournalEntry.create({
+      entry_no,
+      entry_date: payDate,
+      memo: linkedPo
+        ? `Supplier payment draft ${payment_no} for ${linkedPo.po_no} — ${supplierName}`
+        : `Supplier payment draft ${payment_no} — ${supplierName}`,
+      source: 'PAYMENT',
+      status: 'DRAFT',
+      lines: [
+        {
+          account_id: debitAccount._id,
+          account_code: debitAccount.code,
+          account_name: debitAccount.name,
+          description: linkedPo
+            ? `Pay supplier ${supplierName} (${linkedPo.po_no})`
+            : `Pay supplier ${supplierName}`,
+          debit: payAmount,
+          credit: 0,
+        },
+        {
+          account_id: creditAccount._id,
+          account_code: creditAccount.code,
+          account_name: creditAccount.name,
+          description: `Paid from ${wallet.name}`,
+          debit: 0,
+          credit: payAmount,
+        },
+      ],
+      total_debit: payAmount,
+      total_credit: payAmount,
+      source_reference: linkedPo ? linkedPo.po_no : payment_no,
+      source_label: linkedPo ? 'Supplier payment draft (PO)' : 'Supplier payment draft',
+      ...actor,
+    });
+
+    const payment = await SupplierPayment.create({
+      payment_no,
+      payment_date: payDate,
+      supplier_name: supplierName,
+      supplier_reference:
+        String(supplier_reference || '').trim() || linkedPo?.supplier_invoice_no || linkedPo?.po_no || '',
+      description: String(description || '').trim(),
+      amount: payAmount,
+      currency: String(currency || 'AED').trim() || 'AED',
+      bank_cash_account_id: wallet._id,
+      bank_cash_account_code: wallet.code,
+      bank_cash_account_name: wallet.name,
+      debit_account_code: debitCode,
+      debit_account_name: debitAccount.name,
+      status: 'PENDING_APPROVAL',
+      journal_entry_id: journal._id,
+      journal_entry_no: journal.entry_no,
+      purchase_order_id: linkedPo?._id,
+      purchase_order_no: linkedPo?.po_no,
+      requested_by_name: actor.created_by_name,
+      requested_by_email: actor.created_by_email,
+      requested_by_user_id: actor.created_by_user_id,
+    });
+
+    if (linkedPo) {
+      linkedPo.payment_ids = [...(linkedPo.payment_ids || []), payment._id];
+      await linkedPo.save();
+    }
+
+    res.status(201).json({
+      success: true,
+      data: {
+        payment,
+        journal,
+      },
+    });
+  } catch (error) {
+    console.error('Error creating supplier payment:', error);
+    res.status(500).json({ success: false, error: 'Failed to create supplier payment' });
+  }
+});
+
+router.post('/bank-cash/payments/:id/approve', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({ success: false, error: 'Only Finance Manager / Admin can clear supplier payments' });
+    }
+    const payment = await SupplierPayment.findById(req.params.id);
+    if (!payment) {
+      return res.status(404).json({ success: false, error: 'Payment not found' });
+    }
+    if (payment.status !== 'PENDING_APPROVAL') {
+      return res.status(400).json({
+        success: false,
+        error: `Payment is ${payment.status} and cannot be cleared`,
+      });
+    }
+
+    const wallet = await BankCashAccount.findById(payment.bank_cash_account_id);
+    if (!wallet || !wallet.is_active) {
+      return res.status(400).json({ success: false, error: 'Bank/cash account not found or inactive' });
+    }
+    if (toNum(wallet.current_balance) < toNum(payment.amount)) {
+      return res.status(400).json({
+        success: false,
+        error: `Insufficient balance in ${wallet.name} (available ${toNum(wallet.current_balance).toFixed(2)})`,
+      });
+    }
+
+    let journal = payment.journal_entry_id
+      ? await JournalEntry.findById(payment.journal_entry_id)
+      : null;
+
+    // Backfill: older payments created before draft-journal flow
+    if (!journal) {
+      const debitAccount = await loadPostableAccount(payment.debit_account_code);
+      const creditAccount = await loadPostableAccount(wallet.gl_account_code);
+      if (!debitAccount || !creditAccount) {
+        return res.status(400).json({ success: false, error: 'Linked GL accounts are not postable' });
+      }
+      const actor = actorFromReq(req);
+      const amount = toNum(payment.amount);
+      const entry_no = await nextJournalEntryNo(payment.payment_date);
+      journal = await JournalEntry.create({
+        entry_no,
+        entry_date: payment.payment_date,
+        memo: `Supplier payment ${payment.payment_no} — ${payment.supplier_name}`,
+        source: 'PAYMENT',
+        status: 'DRAFT',
+        lines: [
+          {
+            account_id: debitAccount._id,
+            account_code: debitAccount.code,
+            account_name: debitAccount.name,
+            description: `Pay supplier ${payment.supplier_name}`,
+            debit: amount,
+            credit: 0,
+          },
+          {
+            account_id: creditAccount._id,
+            account_code: creditAccount.code,
+            account_name: creditAccount.name,
+            description: `Paid from ${wallet.name}`,
+            debit: 0,
+            credit: amount,
+          },
+        ],
+        total_debit: amount,
+        total_credit: amount,
+        source_reference: payment.payment_no,
+        source_label: 'Supplier payment draft',
+        ...actor,
+      });
+      payment.journal_entry_id = journal._id;
+      payment.journal_entry_no = journal.entry_no;
+    }
+
+    if (journal.status === 'POSTED') {
+      return res.status(400).json({
+        success: false,
+        error: 'Journal is already posted for this payment',
+      });
+    }
+    if (journal.status === 'VOID') {
+      return res.status(400).json({
+        success: false,
+        error: 'Journal was voided and cannot be cleared',
+      });
+    }
+
+    const actor = actorFromReq(req);
+    const amount = toNum(payment.amount);
+
+    // Clear payment: post debit/credit so the journal hits ledgers
+    journal.status = 'POSTED';
+    journal.posted_at = new Date();
+    journal.memo = `Supplier payment ${payment.payment_no} — ${payment.supplier_name} (cleared)`;
+    journal.source_label = 'Supplier payment cleared';
+    await journal.save();
+
+    wallet.current_balance = toNum(wallet.current_balance) - amount;
+    await wallet.save();
+
+    payment.status = 'APPROVED';
+    payment.approved_at = new Date();
+    payment.approved_by_name = actor.created_by_name;
+    payment.approved_by_email = actor.created_by_email;
+    payment.approved_by_user_id = actor.created_by_user_id;
+    payment.journal_entry_id = journal._id;
+    payment.journal_entry_no = journal.entry_no;
+    await payment.save();
+
+    if (payment.purchase_order_id) {
+      const po = await PurchaseOrder.findById(payment.purchase_order_id);
+      if (po) {
+        po.amount_paid = toNum(po.amount_paid) + amount;
+        if (toNum(po.amount_paid) + 0.009 >= toNum(po.total_amount) && po.status === 'RECEIVED') {
+          po.status = 'CLOSED';
+        }
+        await po.save();
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        payment,
+        journal,
+        bank_cash_account: wallet,
+      },
+    });
+  } catch (error) {
+    console.error('Error clearing supplier payment:', error);
+    res.status(500).json({ success: false, error: 'Failed to clear supplier payment' });
+  }
+});
+
+router.post('/bank-cash/payments/:id/reject', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({ success: false, error: 'Only Finance Manager / Admin can reject supplier payments' });
+    }
+    const payment = await SupplierPayment.findById(req.params.id);
+    if (!payment) {
+      return res.status(404).json({ success: false, error: 'Payment not found' });
+    }
+    if (payment.status !== 'PENDING_APPROVAL') {
+      return res.status(400).json({
+        success: false,
+        error: `Payment is ${payment.status} and cannot be rejected`,
+      });
+    }
+
+    const actor = actorFromReq(req);
+
+    if (payment.journal_entry_id) {
+      const journal = await JournalEntry.findById(payment.journal_entry_id);
+      if (journal && journal.status === 'DRAFT') {
+        journal.status = 'VOID';
+        journal.memo = `${journal.memo || ''} (voided — payment rejected)`.trim();
+        await journal.save();
+      } else if (journal && journal.status === 'POSTED') {
+        return res.status(400).json({
+          success: false,
+          error: 'Cannot reject a payment whose journal is already posted',
+        });
+      }
+    }
+
+    payment.status = 'REJECTED';
+    payment.rejection_reason = String(req.body?.reason || req.body?.rejection_reason || '').trim();
+    payment.approved_at = new Date();
+    payment.approved_by_name = actor.created_by_name;
+    payment.approved_by_email = actor.created_by_email;
+    payment.approved_by_user_id = actor.created_by_user_id;
+    await payment.save();
+
+    res.json({ success: true, data: payment });
+  } catch (error) {
+    console.error('Error rejecting supplier payment:', error);
+    res.status(500).json({ success: false, error: 'Failed to reject supplier payment' });
+  }
+});
+
+// Undo a cleared payment (bounced cheque, wrong supplier): reversing JE, cash back, PO reopened.
+router.post('/bank-cash/payments/:id/reverse', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({ success: false, error: 'Only Finance Manager / Admin can reverse supplier payments' });
+    }
+    const payment = await SupplierPayment.findById(req.params.id);
+    if (!payment) return res.status(404).json({ success: false, error: 'Payment not found' });
+    if (payment.status !== 'APPROVED') {
+      return res.status(400).json({ success: false, error: `Only cleared payments can be reversed (this one is ${payment.status})` });
+    }
+    const original = payment.journal_entry_id ? await JournalEntry.findById(payment.journal_entry_id).lean() : null;
+    if (!original || original.status !== 'POSTED') {
+      return res.status(400).json({ success: false, error: 'The payment journal is not posted, so there is nothing to reverse' });
+    }
+
+    const reason = String(req.body?.reason || '').trim();
+    const actor = actorFromReq(req);
+    const amount = toNum(payment.amount);
+    const reversalDate = new Date();
+    const entry_no = await nextJournalEntryNo(reversalDate);
+    const reversal = await JournalEntry.create({
+      entry_no,
+      entry_date: reversalDate,
+      memo: `Reversal of ${original.entry_no} — supplier payment ${payment.payment_no} (${payment.supplier_name})${reason ? ` — ${reason}` : ''}`,
+      source: 'ADJUSTMENT',
+      status: 'POSTED',
+      lines: original.lines.map((l) => ({
+        account_id: l.account_id,
+        account_code: l.account_code,
+        account_name: l.account_name,
+        description: `Reverse: ${l.description || ''}`.trim(),
+        debit: l.credit,
+        credit: l.debit,
+      })),
+      total_debit: original.total_credit,
+      total_credit: original.total_debit,
+      posted_at: new Date(),
+      source_reference: payment.purchase_order_no || payment.payment_no,
+      source_label: 'Supplier payment reversal',
+      ...actor,
+    });
+
+    const wallet = await BankCashAccount.findById(payment.bank_cash_account_id);
+    if (wallet) {
+      wallet.current_balance = Number((toNum(wallet.current_balance) + amount).toFixed(2));
+      await wallet.save();
+    }
+
+    let po = null;
+    if (payment.purchase_order_id) {
+      po = await PurchaseOrder.findById(payment.purchase_order_id);
+      if (po) {
+        po.amount_paid = Math.max(0, Number((toNum(po.amount_paid) - amount).toFixed(2)));
+        if (po.status === 'CLOSED') po.status = 'RECEIVED';
+        await po.save();
+      }
+    }
+
+    payment.status = 'REVERSED';
+    payment.reversed_at = new Date();
+    payment.reversed_by_name = actor.created_by_name;
+    payment.reversed_by_email = actor.created_by_email;
+    payment.reversal_reason = reason;
+    payment.reversal_journal_id = reversal._id;
+    payment.reversal_journal_no = reversal.entry_no;
+    await payment.save();
+
+    res.json({ success: true, data: { payment, journal: reversal, bank_cash_account: wallet, purchase_order: po } });
+  } catch (error) {
+    console.error('Error reversing supplier payment:', error);
+    res.status(500).json({ success: false, error: 'Failed to reverse supplier payment' });
+  }
+});
+
+// Payables: what each supplier has billed (goods received → AP), been paid, and is still owed.
+router.get('/payables/summary', auth, async (req, res) => {
+  try {
+    const [orders, payments, apAccount] = await Promise.all([
+      PurchaseOrder.find({ status: { $nin: ['DRAFT', 'PENDING_APPROVAL', 'REJECTED', 'CANCELLED'] } })
+        .sort({ po_date: -1 })
+        .lean(),
+      SupplierPayment.find({ status: { $in: ['PENDING_APPROVAL', 'APPROVED'] } }).lean(),
+      Account.findOne({ code: glCode('2000') }).lean(),
+    ]);
+
+    const pendingByPo = new Map();
+    payments
+      .filter((p) => p.status === 'PENDING_APPROVAL' && p.purchase_order_id)
+      .forEach((p) => {
+        const key = String(p.purchase_order_id);
+        pendingByPo.set(key, (pendingByPo.get(key) || 0) + toNum(p.amount));
+      });
+
+    const bySupplier = new Map();
+    const supplierRow = (name) => {
+      const key = String(name || 'Unknown').trim().toLowerCase();
+      if (!bySupplier.has(key)) {
+        bySupplier.set(key, {
+          supplier_name: String(name || 'Unknown').trim(),
+          ordered: 0,
+          billed: 0,
+          paid: 0,
+          pending: 0,
+          open_pos: 0,
+        });
+      }
+      return bySupplier.get(key);
+    };
+
+    const purchase_orders = orders.map((po) => {
+      const billed = poBilledValue(po);
+      const paid = toNum(po.amount_paid);
+      const pending = pendingByPo.get(String(po._id)) || 0;
+      const row = supplierRow(po.supplier_name);
+      row.ordered += toNum(po.total_amount);
+      row.billed += billed;
+      if (po.status !== 'CLOSED') row.open_pos += 1;
+      return {
+        _id: po._id,
+        po_no: po.po_no,
+        po_date: po.po_date,
+        supplier_id: po.supplier_id,
+        supplier_name: po.supplier_name,
+        supplier_trn: po.supplier_trn,
+        supplier_phone: po.supplier_phone,
+        supplier_email: po.supplier_email,
+        supplier_address: po.supplier_address,
+        supplier_bank_name: po.supplier_bank_name,
+        supplier_iban: po.supplier_iban,
+        supplier_invoice_no: po.supplier_invoice_no || po.supplier_reference,
+        supplier_invoice_date: po.supplier_invoice_date || po.po_date,
+        due_date: po.due_date,
+        receive_later: Boolean(po.receive_later),
+        subtotal: toNum(po.subtotal),
+        tax_amount: toNum(po.tax_amount),
+        lines: (po.lines || []).map((l) => ({
+          description: l.description,
+          sku: l.sku,
+          quantity: toNum(l.quantity),
+          received_qty: toNum(l.received_qty),
+          unit_cost: toNum(l.unit_cost),
+          line_total: toNum(l.line_total),
+        })),
+        journal_entry_no: po.journal_entry_no,
+        receipt_journal_nos: (po.receipt_journals || []).map((j) => j.journal_entry_no),
+        status: po.status,
+        total_amount: toNum(po.total_amount),
+        billed,
+        paid,
+        pending,
+        owed_now: Number((billed - paid).toFixed(2)),
+        left_to_pay: Number(Math.max(0, toNum(po.total_amount) - paid - pending).toFixed(2)),
+      };
+    });
+
+    payments.forEach((p) => {
+      const row = supplierRow(p.supplier_name);
+      if (p.status === 'APPROVED') {
+        row.paid += toNum(p.amount);
+      } else {
+        row.pending += toNum(p.amount);
+      }
+    });
+
+    const suppliers = [...bySupplier.values()]
+      .map((s) => ({
+        ...s,
+        ordered: Number(s.ordered.toFixed(2)),
+        billed: Number(s.billed.toFixed(2)),
+        paid: Number(s.paid.toFixed(2)),
+        pending: Number(s.pending.toFixed(2)),
+        outstanding: Number((s.billed - s.paid).toFixed(2)),
+      }))
+      .sort((a, b) => b.outstanding - a.outstanding);
+
+    let ap_gl_balance = 0;
+    if (apAccount) {
+      const [agg] = await JournalEntry.aggregate([
+        { $match: { status: 'POSTED', 'lines.account_code': glCode('2000') } },
+        { $unwind: '$lines' },
+        { $match: { 'lines.account_code': glCode('2000') } },
+        { $group: { _id: null, bal: { $sum: { $subtract: ['$lines.credit', '$lines.debit'] } } } },
+      ]);
+      ap_gl_balance = Number((agg?.bal || 0).toFixed(2));
+    }
+
+    const totals = suppliers.reduce(
+      (t, s) => ({
+        ordered: t.ordered + s.ordered,
+        billed: t.billed + s.billed,
+        paid: t.paid + s.paid,
+        pending: t.pending + s.pending,
+        outstanding: t.outstanding + s.outstanding,
+      }),
+      { ordered: 0, billed: 0, paid: 0, pending: 0, outstanding: 0 }
+    );
+    Object.keys(totals).forEach((k) => (totals[k] = Number(totals[k].toFixed(2))));
+
+    res.json({ success: true, data: { totals: { ...totals, ap_gl_balance }, suppliers, purchase_orders } });
+  } catch (error) {
+    console.error('Error loading payables summary:', error);
+    res.status(500).json({ success: false, error: 'Failed to load payables summary' });
+  }
+});
+
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const SUPPLIER_FIELDS = [
+  'name',
+  'trn',
+  'contact_person',
+  'phone',
+  'email',
+  'address',
+  'bank_name',
+  'iban',
+  'account_number',
+  'notes',
+];
+
+function pickSupplierFields(raw = {}) {
+  const out = {};
+  SUPPLIER_FIELDS.forEach((key) => {
+    if (raw[key] !== undefined) out[key] = String(raw[key] ?? '').trim();
+  });
+  if (raw.payment_terms_days !== undefined) {
+    out.payment_terms_days = Math.max(0, Math.round(toNum(raw.payment_terms_days)));
+  }
+  return out;
+}
+
+async function nextSupplierCode() {
+  const latest = await Supplier.findOne({ code: /^SUP-\d+$/ }).sort({ code: -1 }).lean();
+  const n = latest ? parseInt(latest.code.slice(4), 10) + 1 : 1;
+  return `SUP-${String(n).padStart(4, '0')}`;
+}
+
+async function createSupplierRecord(raw, actor) {
+  const fields = pickSupplierFields(raw);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await Supplier.create({
+        ...fields,
+        code: await nextSupplierCode(),
+        created_by_name: actor.created_by_name,
+        created_by_email: actor.created_by_email,
+      });
+    } catch (error) {
+      if (error?.code !== 11000 || attempt === 2) throw error;
+    }
+  }
+  return null;
+}
+
+function supplierSnapshot(supplier) {
+  return {
+    supplier_id: supplier._id,
+    supplier_name: supplier.name,
+    supplier_trn: supplier.trn || undefined,
+    supplier_phone: supplier.phone || undefined,
+    supplier_email: supplier.email || undefined,
+    supplier_address: supplier.address || undefined,
+    supplier_bank_name: supplier.bank_name || undefined,
+    supplier_iban: supplier.iban || undefined,
+  };
+}
+
+// supplier_id → saved supplier; supplier {...} → new supplier saved to the list (reusing a
+// same-name/TRN match); bare supplier_name → free-text supplier for older callers.
+async function resolvePoSupplier(body, actor) {
+  if (body.supplier_id) {
+    const supplier = await Supplier.findById(body.supplier_id);
+    if (!supplier || supplier.is_active === false) return { error: 'Supplier not found or inactive' };
+    return { supplier, snapshot: supplierSnapshot(supplier) };
+  }
+  if (body.supplier && typeof body.supplier === 'object') {
+    const fields = pickSupplierFields(body.supplier);
+    if (!fields.name) return { error: 'Supplier name is required' };
+    const existing = await Supplier.findOne({
+      $or: [
+        { name: new RegExp(`^${escapeRegex(fields.name)}$`, 'i') },
+        ...(fields.trn ? [{ trn: fields.trn }] : []),
+      ],
+      is_active: { $ne: false },
+    });
+    const supplier = existing || (await createSupplierRecord(fields, actor));
+    return { supplier, snapshot: supplierSnapshot(supplier) };
+  }
+  const name = String(body.supplier_name || '').trim();
+  if (!name) return { error: 'Supplier is required' };
+  return { supplier: null, snapshot: { supplier_name: name } };
+}
+
+router.get('/suppliers', auth, async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    const filter = req.query.include_inactive === 'true' ? {} : { is_active: { $ne: false } };
+    if (q) {
+      const rx = new RegExp(escapeRegex(q), 'i');
+      filter.$or = [{ name: rx }, { code: rx }, { trn: rx }, { email: rx }, { phone: rx }];
+    }
+    const suppliers = await Supplier.find(filter).sort({ name: 1 }).lean();
+    res.json({ success: true, data: suppliers });
+  } catch (error) {
+    console.error('Error fetching suppliers:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch suppliers' });
+  }
+});
+
+router.post('/suppliers', auth, async (req, res) => {
+  try {
+    const fields = pickSupplierFields(req.body || {});
+    if (!fields.name) return res.status(400).json({ success: false, error: 'Supplier name is required' });
+    const clash = await Supplier.findOne({
+      $or: [
+        { name: new RegExp(`^${escapeRegex(fields.name)}$`, 'i') },
+        ...(fields.trn ? [{ trn: fields.trn }] : []),
+      ],
+    }).lean();
+    if (clash) {
+      return res.status(400).json({
+        success: false,
+        error: `${clash.name} (${clash.code}) already exists${fields.trn && clash.trn === fields.trn ? ' with this TRN' : ''}`,
+      });
+    }
+    const supplier = await createSupplierRecord(fields, actorFromReq(req));
+    res.status(201).json({ success: true, data: supplier });
+  } catch (error) {
+    console.error('Error creating supplier:', error);
+    res.status(500).json({ success: false, error: 'Failed to create supplier' });
+  }
+});
+
+router.put('/suppliers/:id', auth, async (req, res) => {
+  try {
+    const supplier = await Supplier.findById(req.params.id);
+    if (!supplier) return res.status(404).json({ success: false, error: 'Supplier not found' });
+    const fields = pickSupplierFields(req.body || {});
+    if (fields.name === '') return res.status(400).json({ success: false, error: 'Supplier name is required' });
+    Object.assign(supplier, fields);
+    if (req.body?.is_active !== undefined) supplier.is_active = Boolean(req.body.is_active);
+    await supplier.save();
+    res.json({ success: true, data: supplier });
+  } catch (error) {
+    console.error('Error updating supplier:', error);
+    res.status(500).json({ success: false, error: 'Failed to update supplier' });
+  }
+});
+
+async function nextPurchaseOrderNo(poDate) {
+  const year = new Date(poDate).getFullYear() || new Date().getFullYear();
+  const prefix = `PO-${year}-`;
+  const latest = await PurchaseOrder.findOne({ po_no: new RegExp(`^${prefix}`) })
+    .sort({ po_no: -1 })
+    .select('po_no')
+    .lean();
+  let nextNum = 1;
+  if (latest?.po_no) {
+    const parts = String(latest.po_no).split('-');
+    const n = parseInt(parts[parts.length - 1], 10);
+    if (Number.isFinite(n)) nextNum = n + 1;
+  }
+  return `${prefix}${String(nextNum).padStart(4, '0')}`;
+}
+
+async function pendingPaymentsTotal(purchaseOrderId) {
+  const pending = await SupplierPayment.find({
+    purchase_order_id: purchaseOrderId,
+    status: 'PENDING_APPROVAL',
+  })
+    .select('amount')
+    .lean();
+  return Number(pending.reduce((s, p) => s + toNum(p.amount), 0).toFixed(2));
+}
+
+// POs fully received before receipt tracking existed posted their whole accrual at once.
+function poBilledValue(po) {
+  if (po.received_value_posted != null) return toNum(po.received_value_posted);
+  return ['RECEIVED', 'CLOSED'].includes(po.status) ? toNum(po.total_amount) : 0;
+}
+
+function buildPoLines(rawLines) {
+  if (!Array.isArray(rawLines)) return [];
+  return rawLines
+    .map((raw) => {
+      const description = String(raw.description || '').trim();
+      const sku = String(raw.sku || '').trim().toUpperCase() || undefined;
+      const quantity = toNum(raw.quantity);
+      const unit_cost = toNum(raw.unit_cost);
+      const line_total = Number((quantity * unit_cost).toFixed(2));
+      const account_code = String(raw.account_code || '').trim() || undefined;
+      return {
+        description,
+        sku,
+        quantity,
+        unit_cost,
+        received_qty: toNum(raw.received_qty),
+        line_total,
+        account_code,
+      };
+    })
+    .filter((l) => l.description && l.quantity > 0);
+}
+
+function poLineAccountCode(po, line) {
+  return String(line.account_code || po.debit_account_code || glCode('1200')).trim();
+}
+
+// Splits `net` across debit accounts in proportion to `weights` (Map code -> amount); rounding
+// remainder lands on the largest account so the journal still balances to the cent.
+async function poDebitJournalLines(po, net, weights, description) {
+  const total = [...weights.values()].reduce((s, v) => s + v, 0);
+  const entries =
+    total > 0
+      ? [...weights.entries()].filter(([, v]) => v > 0)
+      : [[String(po.debit_account_code || glCode('1200')), 1]];
+  const weightSum = entries.reduce((s, [, v]) => s + v, 0);
+  const lines = [];
+  let allocated = 0;
+  for (const [code, weight] of entries) {
+    const account = await loadPostableAccount(code);
+    if (!account) return { error: `GL account ${code} is not postable` };
+    const amount = Number(((net * weight) / weightSum).toFixed(2));
+    allocated += amount;
+    lines.push({
+      account_id: account._id,
+      account_code: account.code,
+      account_name: account.name,
+      description,
+      debit: amount,
+      credit: 0,
+    });
+  }
+  const remainder = Number((net - allocated).toFixed(2));
+  if (remainder !== 0 && lines.length) {
+    const largest = lines.reduce((a, b) => (b.debit > a.debit ? b : a));
+    largest.debit = Number((largest.debit + remainder).toFixed(2));
+  }
+  return { lines: lines.filter((l) => l.debit !== 0) };
+}
+
+async function ensurePoAccounts(actor = {}) {
+  if (useFiveDigitCoa()) {
+    await ensureKnexChartOfAccounts(actor);
+    return;
+  }
+  const needed = [
+    { code: glCode('1200'), name: 'Inventory Asset', type: 'Asset', subtype: 'Inventory' },
+    { code: glCode('1310'), name: 'VAT Input Recoverable', type: 'Asset', subtype: 'Tax' },
+    { code: glCode('2000'), name: 'Accounts Payable', type: 'Liability', subtype: 'Payables' },
+    { code: glCode('2200'), name: 'VAT Output Payable', type: 'Liability', subtype: 'Tax' },
+    { code: glCode('5000'), name: 'Cost of Goods Sold', type: 'Expense', subtype: 'COGS' },
+  ];
+  for (const row of needed) {
+    const existing = await Account.findOne({ code: row.code });
+    if (!existing) {
+      await Account.create({
+        ...row,
+        is_active: true,
+        is_postable: true,
+        ...actor,
+      });
+    }
+  }
+}
+
+// Purchase Orders
+router.get('/purchase-orders/overview', auth, async (req, res) => {
+  try {
+    const orders = await PurchaseOrder.find({}).sort({ createdAt: -1 }).lean();
+    const byStatus = orders.reduce((acc, po) => {
+      acc[po.status] = (acc[po.status] || 0) + 1;
+      return acc;
+    }, {});
+    const openValue = orders
+      .filter((po) => ['APPROVED', 'PARTIALLY_RECEIVED', 'PENDING_APPROVAL', 'DRAFT'].includes(po.status))
+      .reduce((s, po) => s + toNum(po.total_amount) - toNum(po.amount_paid), 0);
+
+    res.json({
+      success: true,
+      data: {
+        totals: {
+          count: orders.length,
+          draft: byStatus.DRAFT || 0,
+          pending: byStatus.PENDING_APPROVAL || 0,
+          approved: byStatus.APPROVED || 0,
+          partially_received: byStatus.PARTIALLY_RECEIVED || 0,
+          received: byStatus.RECEIVED || 0,
+          open_value: openValue,
+        },
+        recent: orders.slice(0, 12),
+      },
+    });
+  } catch (error) {
+    console.error('Error loading PO overview:', error);
+    res.status(500).json({ success: false, error: 'Failed to load purchase order overview' });
+  }
+});
+
+router.get('/purchase-orders', auth, async (req, res) => {
+  try {
+    const status = String(req.query.status || '').trim().toUpperCase();
+    const filter = {};
+    if (status && status !== 'ALL') filter.status = status;
+    const orders = await PurchaseOrder.find(filter).sort({ createdAt: -1 }).lean();
+    res.json({ success: true, data: orders });
+  } catch (error) {
+    console.error('Error fetching purchase orders:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch purchase orders' });
+  }
+});
+
+/** Statement of purchase — per-supplier invoices with paid / pending filters */
+router.get('/purchase-orders/statement', auth, async (req, res) => {
+  try {
+    const supplierId = String(req.query.supplier_id || '').trim();
+    const supplierName = String(req.query.supplier_name || '').trim();
+    const paymentStatus = String(req.query.payment_status || 'ALL').trim().toUpperCase();
+    const search = String(req.query.q || '').trim().toLowerCase();
+    const from = req.query.from ? new Date(String(req.query.from)) : null;
+    const to = req.query.to ? new Date(String(req.query.to)) : null;
+    if (from && !Number.isNaN(from.getTime())) from.setHours(0, 0, 0, 0);
+    if (to && !Number.isNaN(to.getTime())) to.setHours(23, 59, 59, 999);
+
+    if (!supplierId && !supplierName) {
+      return res.status(400).json({
+        success: false,
+        error: 'Select a supplier (supplier_id or supplier_name)',
+      });
+    }
+
+    const poFilter = {
+      status: { $nin: ['DRAFT', 'PENDING_APPROVAL', 'REJECTED', 'CANCELLED'] },
+    };
+    if (supplierId && mongoose.isValidObjectId(supplierId)) {
+      const nameForMatch = supplierName || (await Supplier.findById(supplierId).select('name').lean())?.name;
+      poFilter.$or = [{ supplier_id: supplierId }];
+      if (nameForMatch) {
+        poFilter.$or.push({ supplier_name: new RegExp(`^${escapeRegex(nameForMatch)}$`, 'i') });
+      }
+    } else {
+      poFilter.supplier_name = new RegExp(`^${escapeRegex(supplierName)}$`, 'i');
+    }
+
+    const orders = await PurchaseOrder.find(poFilter).sort({ supplier_invoice_date: -1, po_date: -1 }).lean();
+    const poIds = orders.map((po) => po._id);
+
+    const payments = await SupplierPayment.find({
+      $or: [
+        { purchase_order_id: { $in: poIds } },
+        ...(supplierName
+          ? [{ supplier_name: new RegExp(`^${escapeRegex(supplierName)}$`, 'i') }]
+          : []),
+        ...(orders[0]?.supplier_name
+          ? [{ supplier_name: new RegExp(`^${escapeRegex(orders[0].supplier_name)}$`, 'i') }]
+          : []),
+      ],
+      status: { $in: ['PENDING_APPROVAL', 'APPROVED', 'REVERSED'] },
+    })
+      .sort({ payment_date: -1, createdAt: -1 })
+      .lean();
+
+    const pendingByPo = new Map();
+    const paidByPo = new Map();
+    const paymentsByPo = new Map();
+    for (const p of payments) {
+      if (!p.purchase_order_id) continue;
+      const key = String(p.purchase_order_id);
+      if (!paymentsByPo.has(key)) paymentsByPo.set(key, []);
+      paymentsByPo.get(key).push(p);
+      if (p.status === 'PENDING_APPROVAL') {
+        pendingByPo.set(key, (pendingByPo.get(key) || 0) + toNum(p.amount));
+      }
+      if (p.status === 'APPROVED') {
+        paidByPo.set(key, (paidByPo.get(key) || 0) + toNum(p.amount));
+      }
+    }
+
+    let supplier = null;
+    if (supplierId && mongoose.isValidObjectId(supplierId)) {
+      supplier = await Supplier.findById(supplierId).lean();
+    }
+    if (!supplier && (supplierName || orders[0]?.supplier_name)) {
+      const name = supplierName || orders[0].supplier_name;
+      supplier = await Supplier.findOne({ name: new RegExp(`^${escapeRegex(name)}$`, 'i') }).lean();
+    }
+
+    const invoices = [];
+    for (const po of orders) {
+      const billed = poBilledValue(po);
+      const paid = Math.max(toNum(po.amount_paid), paidByPo.get(String(po._id)) || 0);
+      const pending = pendingByPo.get(String(po._id)) || 0;
+      const total = toNum(po.total_amount);
+      const left_to_pay = Number(Math.max(0, total - paid - pending).toFixed(2));
+      const owed_now = Number(Math.max(0, billed - paid).toFixed(2));
+
+      let pay_status = 'PENDING';
+      if (left_to_pay <= 0.009 && pending <= 0.009 && paid + 0.009 >= Math.max(total, billed) - 0.01) {
+        pay_status = 'PAID';
+      } else if (pending > 0.009 && left_to_pay <= 0.009) {
+        pay_status = 'AWAITING_CLEARANCE';
+      } else if (paid > 0.009 || pending > 0.009) {
+        pay_status = 'PARTIAL';
+      }
+
+      const invoiceDate = po.supplier_invoice_date || po.po_date;
+      if (from && !Number.isNaN(from.getTime()) && invoiceDate && new Date(invoiceDate) < from) continue;
+      if (to && !Number.isNaN(to.getTime()) && invoiceDate && new Date(invoiceDate) > to) continue;
+
+      if (paymentStatus === 'PENDING' && !['PENDING', 'PARTIAL', 'AWAITING_CLEARANCE'].includes(pay_status)) {
+        continue;
+      }
+      if (paymentStatus === 'PAID' && pay_status !== 'PAID') continue;
+      if (paymentStatus === 'PARTIAL' && pay_status !== 'PARTIAL') continue;
+      if (paymentStatus === 'AWAITING_CLEARANCE' && pay_status !== 'AWAITING_CLEARANCE') continue;
+
+      if (search) {
+        const hay = [
+          po.po_no,
+          po.supplier_invoice_no,
+          po.supplier_reference,
+          po.journal_entry_no,
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+        if (!hay.includes(search)) continue;
+      }
+
+      invoices.push({
+        _id: po._id,
+        po_no: po.po_no,
+        po_date: po.po_date,
+        supplier_invoice_no: po.supplier_invoice_no || po.supplier_reference || null,
+        supplier_invoice_date: po.supplier_invoice_date || null,
+        due_date: po.due_date || null,
+        status: po.status,
+        pay_status,
+        subtotal: toNum(po.subtotal),
+        tax_amount: toNum(po.tax_amount),
+        total_amount: total,
+        billed,
+        paid: Number(paid.toFixed(2)),
+        pending: Number(pending.toFixed(2)),
+        owed_now,
+        left_to_pay,
+        journal_entry_no: po.journal_entry_no || null,
+        payments: (paymentsByPo.get(String(po._id)) || []).map((p) => ({
+          _id: p._id,
+          payment_no: p.payment_no,
+          payment_date: p.payment_date,
+          amount: toNum(p.amount),
+          status: p.status,
+          supplier_name: p.supplier_name,
+          supplier_reference: p.supplier_reference || null,
+          description: p.description || null,
+          debit_account_code: p.debit_account_code || null,
+          debit_account_name: p.debit_account_name || null,
+          bank_cash_account_code: p.bank_cash_account_code || null,
+          bank_cash_account_name: p.bank_cash_account_name || null,
+          purchase_order_id: p.purchase_order_id || null,
+          purchase_order_no: p.purchase_order_no || po.po_no || null,
+          journal_entry_no: p.journal_entry_no || null,
+          requested_by_name: p.requested_by_name || null,
+          approved_by_name: p.approved_by_name || null,
+        })),
+      });
+    }
+
+    const summary = invoices.reduce(
+      (acc, row) => {
+        acc.invoice_count += 1;
+        acc.total_invoiced += row.total_amount;
+        acc.billed += row.billed;
+        acc.paid += row.paid;
+        acc.pending_clearance += row.pending;
+        acc.outstanding += row.owed_now;
+        if (row.pay_status === 'PAID') acc.paid_count += 1;
+        else acc.pending_count += 1;
+        return acc;
+      },
+      {
+        invoice_count: 0,
+        paid_count: 0,
+        pending_count: 0,
+        total_invoiced: 0,
+        billed: 0,
+        paid: 0,
+        pending_clearance: 0,
+        outstanding: 0,
+      }
+    );
+    Object.keys(summary).forEach((k) => {
+      if (typeof summary[k] === 'number' && !k.endsWith('_count')) {
+        summary[k] = Number(summary[k].toFixed(2));
+      }
+    });
+
+    const displayName =
+      supplier?.name || orders[0]?.supplier_name || supplierName || 'Supplier';
+
+    res.json({
+      success: true,
+      data: {
+        supplier: {
+          _id: supplier?._id || orders[0]?.supplier_id || null,
+          name: displayName,
+          trn: supplier?.trn || orders[0]?.supplier_trn || null,
+          phone: supplier?.phone || orders[0]?.supplier_phone || null,
+          email: supplier?.email || orders[0]?.supplier_email || null,
+          address: supplier?.address || orders[0]?.supplier_address || null,
+          payment_terms_days: supplier?.payment_terms_days ?? null,
+        },
+        filters: {
+          payment_status: paymentStatus,
+          from: from && !Number.isNaN(from.getTime()) ? from.toISOString().slice(0, 10) : null,
+          to: to && !Number.isNaN(to.getTime()) ? to.toISOString().slice(0, 10) : null,
+          q: search || null,
+        },
+        summary,
+        invoices,
+        payments: payments
+          .filter((p) => p.status !== 'REVERSED')
+          .map((p) => ({
+            _id: p._id,
+            payment_no: p.payment_no,
+            payment_date: p.payment_date,
+            amount: toNum(p.amount),
+            status: p.status,
+            supplier_name: p.supplier_name,
+            supplier_reference: p.supplier_reference || null,
+            description: p.description || null,
+            debit_account_code: p.debit_account_code || null,
+            debit_account_name: p.debit_account_name || null,
+            bank_cash_account_code: p.bank_cash_account_code || null,
+            bank_cash_account_name: p.bank_cash_account_name || null,
+            purchase_order_id: p.purchase_order_id || null,
+            purchase_order_no: p.purchase_order_no || null,
+            journal_entry_no: p.journal_entry_no || null,
+            requested_by_name: p.requested_by_name || null,
+            approved_by_name: p.approved_by_name || null,
+          })),
+      },
+    });
+  } catch (error) {
+    console.error('Error loading purchase statement:', error);
+    res.status(500).json({ success: false, error: 'Failed to load statement of purchase' });
+  }
+});
+
+router.get('/purchase-orders/:id', auth, async (req, res) => {
+  try {
+    const po = await PurchaseOrder.findById(req.params.id).lean();
+    if (!po) return res.status(404).json({ success: false, error: 'Purchase order not found' });
+    const payments = await SupplierPayment.find({ purchase_order_id: po._id })
+      .sort({ createdAt: -1 })
+      .lean();
+    res.json({ success: true, data: { ...po, payments } });
+  } catch (error) {
+    console.error('Error fetching purchase order:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch purchase order' });
+  }
+});
+
+router.post('/purchase-orders', auth, async (req, res) => {
+  try {
+    await ensurePoAccounts(actorFromReq(req));
+
+    const {
+      po_date,
+      expected_date,
+      supplier_reference = '',
+      currency = 'AED',
+      tax_amount = 0,
+      notes = '',
+      debit_account_code = '1200',
+      credit_account_code = '2000',
+      lines: rawLines,
+      supplier_invoice_no = '',
+      supplier_invoice_date,
+      due_date,
+      receive_later = false,
+    } = req.body || {};
+
+    const lines = buildPoLines(rawLines);
+    const invoiceNo = String(supplier_invoice_no || '').trim();
+    const poDate = po_date
+      ? new Date(po_date)
+      : supplier_invoice_date
+        ? new Date(supplier_invoice_date)
+        : new Date();
+
+    const resolved = await resolvePoSupplier(req.body || {}, actorFromReq(req));
+    if (resolved.error) {
+      return res.status(400).json({ success: false, error: resolved.error });
+    }
+    const { supplier, snapshot } = resolved;
+    const supplierName = snapshot.supplier_name;
+
+    if (!lines.length) {
+      return res.status(400).json({ success: false, error: 'At least one line item is required' });
+    }
+
+    if (invoiceNo) {
+      const duplicate = await PurchaseOrder.findOne({
+        ...(supplier ? { supplier_id: supplier._id } : { supplier_name: supplierName }),
+        supplier_invoice_no: new RegExp(`^${escapeRegex(invoiceNo)}$`, 'i'),
+        status: { $nin: ['REJECTED', 'CANCELLED'] },
+      }).lean();
+      if (duplicate) {
+        return res.status(400).json({
+          success: false,
+          error: `Invoice ${invoiceNo} from ${supplierName} is already entered as ${duplicate.po_no}`,
+        });
+      }
+    }
+
+    const termsDays = toNum(supplier?.payment_terms_days ?? 30);
+    const invoiceDate = supplier_invoice_date ? new Date(supplier_invoice_date) : null;
+    const dueDate = due_date
+      ? new Date(due_date)
+      : invoiceDate
+        ? new Date(invoiceDate.getTime() + termsDays * 24 * 60 * 60 * 1000)
+        : undefined;
+
+    const debitCode = String(debit_account_code || glCode('1200')).trim();
+    const creditCode = String(credit_account_code || glCode('2000')).trim();
+    const debitAccount = await loadPostableAccount(debitCode);
+    const creditAccount = await loadPostableAccount(creditCode);
+    if (!debitAccount || !creditAccount) {
+      return res.status(400).json({
+        success: false,
+        error: 'Debit/credit GL accounts must be postable',
+      });
+    }
+    for (const line of lines) {
+      const code = line.account_code || debitCode;
+      const account = code === debitCode ? debitAccount : await loadPostableAccount(code);
+      if (!account) {
+        return res.status(400).json({
+          success: false,
+          error: `GL account ${code} on line "${line.description}" is not postable`,
+        });
+      }
+      line.account_code = account.code;
+      line.account_name = account.name;
+    }
+
+    const subtotal = Number(lines.reduce((s, l) => s + l.line_total, 0).toFixed(2));
+    const tax = Math.max(0, toNum(tax_amount));
+    const total = Number((subtotal + tax).toFixed(2));
+    const actor = actorFromReq(req);
+    const po_no = await nextPurchaseOrderNo(poDate);
+
+    // A new PO is always a draft; the supplier invoice is recorded when the delivery arrives.
+    const po = await PurchaseOrder.create({
+      po_no,
+      po_date: poDate,
+      expected_date: expected_date ? new Date(expected_date) : undefined,
+      ...snapshot,
+      supplier_reference: String(supplier_reference || '').trim() || invoiceNo,
+      supplier_invoice_no: invoiceNo || undefined,
+      supplier_invoice_date: invoiceDate || undefined,
+      due_date: dueDate,
+      receive_later: Boolean(receive_later),
+      currency: String(currency || 'AED').trim() || 'AED',
+      status: 'DRAFT',
+      lines,
+      subtotal,
+      tax_amount: tax,
+      total_amount: total,
+      debit_account_code: debitCode,
+      debit_account_name: debitAccount.name,
+      credit_account_code: creditCode,
+      credit_account_name: creditAccount.name,
+      notes: String(notes || '').trim(),
+      ...actor,
+    });
+
+    res.status(201).json({ success: true, data: po });
+  } catch (error) {
+    console.error('Error creating purchase order:', error);
+    res.status(500).json({ success: false, error: 'Failed to create purchase order' });
+  }
+});
+
+router.post('/purchase-orders/:id/submit', auth, async (req, res) => {
+  try {
+    const po = await PurchaseOrder.findById(req.params.id);
+    if (!po) return res.status(404).json({ success: false, error: 'Purchase order not found' });
+    if (po.status !== 'DRAFT') {
+      return res.status(400).json({ success: false, error: 'Only draft POs can be submitted' });
+    }
+    if (!po.supplier_invoice_no) {
+      return res.status(400).json({
+        success: false,
+        error: 'Record the supplier invoice number and date once the delivery arrives',
+      });
+    }
+    po.status = 'PENDING_APPROVAL';
+    await po.save();
+    res.json({ success: true, data: po });
+  } catch (error) {
+    console.error('Error submitting purchase order:', error);
+    res.status(500).json({ success: false, error: 'Failed to submit purchase order' });
+  }
+});
+
+// Delivery received: record the supplier's invoice on the draft PO and send it for approval.
+router.post('/purchase-orders/:id/invoice', auth, async (req, res) => {
+  try {
+    const po = await PurchaseOrder.findById(req.params.id);
+    if (!po) return res.status(404).json({ success: false, error: 'Purchase order not found' });
+    if (po.status !== 'DRAFT') {
+      return res.status(400).json({
+        success: false,
+        error: `PO is ${po.status}; the supplier invoice can only be recorded on a draft PO`,
+      });
+    }
+
+    const body = req.body || {};
+    const invoiceNo = String(body.supplier_invoice_no || '').trim();
+    const invoiceDate = body.supplier_invoice_date ? new Date(body.supplier_invoice_date) : null;
+    if (!invoiceNo) {
+      return res.status(400).json({ success: false, error: 'Supplier invoice number is required' });
+    }
+    if (!invoiceDate || Number.isNaN(invoiceDate.getTime())) {
+      return res.status(400).json({ success: false, error: 'Supplier invoice date is required' });
+    }
+
+    const duplicate = await PurchaseOrder.findOne({
+      _id: { $ne: po._id },
+      ...(po.supplier_id ? { supplier_id: po.supplier_id } : { supplier_name: po.supplier_name }),
+      supplier_invoice_no: new RegExp(`^${escapeRegex(invoiceNo)}$`, 'i'),
+      status: { $nin: ['REJECTED', 'CANCELLED'] },
+    }).lean();
+    if (duplicate) {
+      return res.status(400).json({
+        success: false,
+        error: `Invoice ${invoiceNo} from ${po.supplier_name} is already entered as ${duplicate.po_no}`,
+      });
+    }
+
+    let termsDays = 30;
+    if (po.supplier_id) {
+      const supplier = await Supplier.findById(po.supplier_id).select('payment_terms_days').lean();
+      if (supplier) termsDays = toNum(supplier.payment_terms_days ?? 30);
+    }
+    const dueDate = body.due_date
+      ? new Date(body.due_date)
+      : new Date(invoiceDate.getTime() + termsDays * 24 * 60 * 60 * 1000);
+
+    if (body.tax_amount !== undefined) {
+      const tax = toNum(body.tax_amount);
+      if (tax < 0) return res.status(400).json({ success: false, error: 'VAT cannot be negative' });
+      po.tax_amount = tax;
+      po.total_amount = Number((toNum(po.subtotal) + tax).toFixed(2));
+    }
+
+    po.supplier_invoice_no = invoiceNo;
+    po.supplier_invoice_date = invoiceDate;
+    po.due_date = dueDate;
+    if (!po.supplier_reference) po.supplier_reference = invoiceNo;
+    po.receive_later = false;
+    po.status = 'PENDING_APPROVAL';
+    await po.save();
+    res.json({ success: true, data: po });
+  } catch (error) {
+    console.error('Error recording supplier invoice:', error);
+    res.status(500).json({ success: false, error: 'Failed to record supplier invoice' });
+  }
+});
+
+router.post('/purchase-orders/:id/approve', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({ success: false, error: 'Only Finance Manager / Admin can approve purchase invoices' });
+    }
+    const po = await PurchaseOrder.findById(req.params.id);
+    if (!po) return res.status(404).json({ success: false, error: 'Purchase order not found' });
+    if (!['DRAFT', 'PENDING_APPROVAL'].includes(po.status)) {
+      return res.status(400).json({
+        success: false,
+        error: `PO is ${po.status} and cannot be approved`,
+      });
+    }
+    if (!po.supplier_invoice_no) {
+      return res.status(400).json({
+        success: false,
+        error: 'Record the supplier invoice number and date before approving',
+      });
+    }
+
+    await ensurePoAccounts(actorFromReq(req));
+
+    const debitAccount = await loadPostableAccount(po.debit_account_code || glCode('1200'));
+    const creditAccount = await loadPostableAccount(po.credit_account_code || glCode('2000'));
+    if (!debitAccount || !creditAccount) {
+      return res.status(400).json({ success: false, error: 'Linked GL accounts are not postable' });
+    }
+
+    const actor = actorFromReq(req);
+    const subtotal = toNum(po.subtotal);
+    const tax = Math.max(0, toNum(po.tax_amount));
+    const amount = toNum(po.total_amount) || Number((subtotal + tax).toFixed(2));
+    const entryDate = po.supplier_invoice_date || po.po_date;
+    const entry_no = await nextJournalEntryNo(entryDate);
+
+    // Approve creates DRAFT journal. Split VAT Input when tax is present for VAT201.
+    const weights = new Map();
+    for (const line of po.lines) {
+      const code = poLineAccountCode(po, line);
+      weights.set(code, (weights.get(code) || 0) + toNum(line.line_total));
+    }
+    const lines = [];
+    if (tax > 0) {
+      const vatInput = await loadPostableAccount('1310');
+      if (!vatInput) {
+        return res.status(400).json({
+          success: false,
+          error: 'VAT Input account 1310 is not postable',
+        });
+      }
+      const netDebit = Number((amount - tax).toFixed(2));
+      const debits = await poDebitJournalLines(
+        po,
+        netDebit > 0 ? netDebit : amount,
+        weights,
+        `PO ${po.po_no} — ${po.supplier_name} (excl. VAT)`
+      );
+      if (debits.error) return res.status(400).json({ success: false, error: debits.error });
+      lines.push(...debits.lines);
+      if (netDebit > 0) {
+        lines.push({
+          account_id: vatInput._id,
+          account_code: vatInput.code,
+          account_name: vatInput.name,
+          description: `VAT input PO ${po.po_no}`,
+          debit: tax,
+          credit: 0,
+        });
+      }
+    } else {
+      const debits = await poDebitJournalLines(po, amount, weights, `PO ${po.po_no} — ${po.supplier_name}`);
+      if (debits.error) return res.status(400).json({ success: false, error: debits.error });
+      lines.push(...debits.lines);
+    }
+    lines.push({
+      account_id: creditAccount._id,
+      account_code: creditAccount.code,
+      account_name: creditAccount.name,
+      description: `AP for PO ${po.po_no}`,
+      debit: 0,
+      credit: amount,
+    });
+
+    const totalDebit = lines.reduce((s, l) => s + toNum(l.debit), 0);
+    const totalCredit = lines.reduce((s, l) => s + toNum(l.credit), 0);
+
+    const journal = await JournalEntry.create({
+      entry_no,
+      entry_date: entryDate,
+      memo: `Purchase order ${po.po_no} — ${po.supplier_name}`,
+      source: 'PAYMENT',
+      status: 'DRAFT',
+      lines,
+      total_debit: Number(totalDebit.toFixed(2)),
+      total_credit: Number(totalCredit.toFixed(2)),
+      source_reference: po.po_no,
+      source_label: 'Purchase order draft accrual',
+      ...actor,
+    });
+
+    po.status = 'APPROVED';
+    po.approved_at = new Date();
+    po.approved_by_name = actor.created_by_name;
+    po.approved_by_email = actor.created_by_email;
+    po.approved_by_user_id = actor.created_by_user_id;
+    po.journal_entry_id = journal._id;
+    po.journal_entry_no = journal.entry_no;
+    await po.save();
+
+    if (!po.receive_later) {
+      const booked = await receiveIntoPo(po, [], actor);
+      if (booked.error) {
+        return res.status(400).json({
+          success: false,
+          error: `Approved, but posting to accounts failed: ${booked.error}`,
+        });
+      }
+      return res.json({
+        success: true,
+        data: { purchase_order: po, journal: booked.journal || journal, posted: true },
+      });
+    }
+
+    res.json({ success: true, data: { purchase_order: po, journal, posted: false } });
+  } catch (error) {
+    console.error('Error approving purchase order:', error);
+    res.status(500).json({ success: false, error: 'Failed to approve purchase order' });
+  }
+});
+
+router.post('/purchase-orders/:id/reject', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({ success: false, error: 'Only Finance Manager / Admin can reject purchase invoices' });
+    }
+    const po = await PurchaseOrder.findById(req.params.id);
+    if (!po) return res.status(404).json({ success: false, error: 'Purchase order not found' });
+    if (!['DRAFT', 'PENDING_APPROVAL'].includes(po.status)) {
+      return res.status(400).json({
+        success: false,
+        error: `PO is ${po.status} and cannot be rejected`,
+      });
+    }
+    const actor = actorFromReq(req);
+    po.status = 'REJECTED';
+    po.rejection_reason = String(req.body?.reason || '').trim();
+    po.approved_at = new Date();
+    po.approved_by_name = actor.created_by_name;
+    po.approved_by_email = actor.created_by_email;
+    po.approved_by_user_id = actor.created_by_user_id;
+    await po.save();
+    res.json({ success: true, data: po });
+  } catch (error) {
+    console.error('Error rejecting purchase order:', error);
+    res.status(500).json({ success: false, error: 'Failed to reject purchase order' });
+  }
+});
+
+router.post('/purchase-orders/:id/cancel', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({ success: false, error: 'Only Finance Manager / Admin can cancel purchase orders' });
+    }
+    const po = await PurchaseOrder.findById(req.params.id);
+    if (!po) return res.status(404).json({ success: false, error: 'Purchase order not found' });
+    if (po.status !== 'APPROVED') {
+      return res.status(400).json({ success: false, error: `PO is ${po.status}; only approved POs with nothing received can be cancelled` });
+    }
+    if (po.lines.some((l) => toNum(l.received_qty) > 0)) {
+      return res.status(400).json({ success: false, error: 'Goods have already been received on this PO' });
+    }
+    if (toNum(po.amount_paid) > 0 || (await pendingPaymentsTotal(po._id)) > 0) {
+      return res.status(400).json({ success: false, error: 'Reverse or reject the payments on this PO first' });
+    }
+
+    if (po.journal_entry_id) {
+      const draft = await JournalEntry.findById(po.journal_entry_id);
+      if (draft && draft.status === 'DRAFT') {
+        draft.status = 'VOID';
+        draft.memo = `${draft.memo || ''} (voided — PO cancelled)`.trim();
+        await draft.save();
+      }
+    }
+    po.status = 'CANCELLED';
+    po.cancelled_at = new Date();
+    po.cancellation_reason = String(req.body?.reason || '').trim();
+    await po.save();
+    res.json({ success: true, data: po });
+  } catch (error) {
+    console.error('Error cancelling purchase order:', error);
+    res.status(500).json({ success: false, error: 'Failed to cancel purchase order' });
+  }
+});
+
+router.post('/purchase-orders/:id/receive', auth, async (req, res) => {
+  try {
+    const po = await PurchaseOrder.findById(req.params.id);
+    if (!po) return res.status(404).json({ success: false, error: 'Purchase order not found' });
+    if (!['APPROVED', 'PARTIALLY_RECEIVED'].includes(po.status)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Only approved purchase orders can receive goods',
+      });
+    }
+
+    const receipts = Array.isArray(req.body?.receipts) ? req.body.receipts : [];
+    const result = await receiveIntoPo(po, receipts, actorFromReq(req));
+    if (result.error) return res.status(400).json({ success: false, error: result.error });
+
+    res.json({
+      success: true,
+      data: {
+        purchase_order: po,
+        journal: result.journal,
+        inventory_transactions: result.inventoryTxns,
+      },
+    });
+  } catch (error) {
+    console.error('Error receiving purchase order:', error);
+    res.status(500).json({ success: false, error: 'Failed to receive purchase order' });
+  }
+});
+
+// Applies a goods receipt (empty receipts = everything outstanding): stock in, AP posted for the
+// newly received value. Mutates and saves the PO; returns { error } when nothing can be posted.
+async function receiveIntoPo(po, receipts, actor) {
+  await ensurePoAccounts(actor);
+  const [debitAccount, creditAccount, vatInput] = await Promise.all([
+    loadPostableAccount(po.debit_account_code || glCode('1200')),
+    loadPostableAccount(po.credit_account_code || glCode('2000')),
+    loadPostableAccount('1310'),
+  ]);
+  if (!debitAccount || !creditAccount || (toNum(po.tax_amount) > 0 && !vatInput)) {
+    return { error: 'Linked GL accounts are not postable' };
+  }
+  for (const code of new Set(po.lines.map((l) => poLineAccountCode(po, l)))) {
+    if (!(await loadPostableAccount(code))) return { error: `GL account ${code} is not postable` };
+  }
+
+  const inventoryTxns = [];
+  const receivePlan = [];
+
+  if (!receipts.length) {
+    for (const line of po.lines) {
+      const remaining = Math.max(0, toNum(line.quantity) - toNum(line.received_qty));
+      if (remaining > 0) {
+        receivePlan.push({ line, qty: remaining });
+      }
+    }
+  } else {
+    for (const raw of receipts) {
+      const lineId = String(raw.line_id || raw._id || '');
+      const qty = toNum(raw.quantity);
+      if (!(qty > 0)) continue;
+      const line = po.lines.id(lineId) || po.lines.find((l) => String(l._id) === lineId);
+      if (!line) continue;
+      const remaining = Math.max(0, toNum(line.quantity) - toNum(line.received_qty));
+      const applyQty = Math.min(qty, remaining);
+      if (applyQty > 0) receivePlan.push({ line, qty: applyQty });
+    }
+  }
+
+  if (!receivePlan.length) {
+    return { error: 'Nothing left to receive on this PO' };
+  }
+
+  for (const { line, qty } of receivePlan) {
+    line.received_qty = toNum(line.received_qty) + qty;
+
+    if (!line.sku) continue;
+    const item = await InventoryItem.findOne({ sku: line.sku, is_active: true });
+    if (!item) continue;
+
+    const unitCost = toNum(line.unit_cost);
+    const totalCost = Number((qty * unitCost).toFixed(2));
+    const prevQty = toNum(item.qty_on_hand);
+    const prevAvg = toNum(item.avg_cost);
+    const newQty = prevQty + qty;
+    item.avg_cost =
+      newQty > 0 ? Number(((prevQty * prevAvg + totalCost) / newQty).toFixed(6)) : unitCost;
+    item.qty_on_hand = newQty;
+    await item.save();
+
+    const txn = await InventoryTransaction.create({
+      txn_date: new Date(),
+      type: 'RECEIPT',
+      item_id: item._id,
+      sku: item.sku,
+      item_name: item.name,
+      qty,
+      unit_cost: unitCost,
+      total_cost: totalCost,
+      notes: `PO ${po.po_no} goods receipt`,
+      ...actor,
+    });
+    inventoryTxns.push(txn);
+  }
+
+  const allReceived = po.lines.every(
+    (l) => toNum(l.received_qty) + 0.0001 >= toNum(l.quantity)
+  );
+  const anyReceived = po.lines.some((l) => toNum(l.received_qty) > 0);
+  po.status = allReceived ? 'RECEIVED' : anyReceived ? 'PARTIALLY_RECEIVED' : po.status;
+  if (allReceived) po.received_at = new Date();
+
+  const draft = po.journal_entry_id ? await JournalEntry.findById(po.journal_entry_id) : null;
+  const total = toNum(po.total_amount);
+  const tax = Math.max(0, toNum(po.tax_amount));
+  const subtotal = toNum(po.subtotal) || Number((total - tax).toFixed(2));
+  const postedGross = toNum(po.received_value_posted);
+  const postedTax = toNum(po.received_tax_posted);
+  let journal = null;
+
+  if (allReceived && postedGross === 0 && draft && draft.status === 'DRAFT') {
+    draft.status = 'POSTED';
+    draft.posted_at = new Date();
+    draft.memo = `Purchase order ${po.po_no} — ${po.supplier_name} (received)`;
+    draft.source_label = 'Purchase order goods receipt';
+    await draft.save();
+    journal = draft;
+    po.received_value_posted = total;
+    po.received_tax_posted = tax;
+  } else {
+    const receivedNet = Number(
+      po.lines
+        .reduce((s, l) => s + Math.min(toNum(l.received_qty), toNum(l.quantity)) * toNum(l.unit_cost), 0)
+        .toFixed(2)
+    );
+    const targetTax = allReceived
+      ? tax
+      : Number((subtotal > 0 ? (tax * receivedNet) / subtotal : 0).toFixed(2));
+    const targetGross = allReceived ? total : Number((receivedNet + targetTax).toFixed(2));
+    const deltaGross = Number((targetGross - postedGross).toFixed(2));
+    const deltaTax = Number(Math.max(0, targetTax - postedTax).toFixed(2));
+    const deltaNet = Number((deltaGross - deltaTax).toFixed(2));
+
+    if (deltaGross > 0.009) {
+      const weights = new Map();
+      for (const { line, qty } of receivePlan) {
+        const code = poLineAccountCode(po, line);
+        weights.set(code, (weights.get(code) || 0) + qty * toNum(line.unit_cost));
+      }
+      const debits = await poDebitJournalLines(
+        po,
+        deltaNet,
+        weights,
+        `Goods received PO ${po.po_no} — ${po.supplier_name}`
+      );
+      if (debits.error) return { error: debits.error };
+      const lines = [...debits.lines];
+      if (deltaTax > 0) {
+        lines.push({
+          account_id: vatInput._id,
+          account_code: vatInput.code,
+          account_name: vatInput.name,
+          description: `VAT input PO ${po.po_no}`,
+          debit: deltaTax,
+          credit: 0,
+        });
+      }
+      lines.push({
+        account_id: creditAccount._id,
+        account_code: creditAccount.code,
+        account_name: creditAccount.name,
+        description: `AP for PO ${po.po_no}`,
+        debit: 0,
+        credit: deltaGross,
+      });
+      const receiptDate = new Date();
+      journal = await JournalEntry.create({
+        entry_no: await nextJournalEntryNo(receiptDate),
+        entry_date: receiptDate,
+        memo: `Goods receipt ${po.po_no} — ${po.supplier_name}${allReceived ? ' (final)' : ' (partial)'}`,
+        source: 'INVENTORY',
+        status: 'POSTED',
+        lines,
+        total_debit: deltaGross,
+        total_credit: deltaGross,
+        posted_at: new Date(),
+        source_reference: po.po_no,
+        source_label: 'Purchase order goods receipt',
+        ...actor,
+      });
+      po.received_value_posted = targetGross;
+      po.received_tax_posted = Number((postedTax + deltaTax).toFixed(2));
+      po.receipt_journals = [
+        ...(po.receipt_journals || []),
+        { journal_entry_id: journal._id, journal_entry_no: journal.entry_no, amount: deltaGross, posted_at: new Date() },
+      ];
+    }
+
+    if (draft && draft.status === 'DRAFT') {
+      draft.status = 'VOID';
+      draft.memo = `${draft.memo || ''} (replaced by goods receipt postings)`.trim();
+      await draft.save();
+    }
+  }
+
+  if (journal) {
+    for (const txn of inventoryTxns) {
+      txn.journal_entry_id = journal._id;
+      txn.journal_entry_no = journal.entry_no;
+      await txn.save();
+    }
+  }
+
+  if (allReceived && toNum(po.amount_paid) + 0.009 >= total) po.status = 'CLOSED';
+
+  await po.save();
+  return { journal, inventoryTxns };
+}
+
+function isFinanceManager(req) {
+  const role = String(req.user?.role || '').toUpperCase();
+  return role === 'ADMIN' || role === 'SUPERADMIN';
+}
+
+async function getPettyCashWallet(actor = {}) {
+  await ensureDefaultBankCashAccounts(actor);
+  let wallet = await BankCashAccount.findOne({ code: 'CASH-MAIN', is_active: true });
+  if (!wallet) {
+    wallet = await BankCashAccount.findOne({ account_type: 'CASH', is_active: true }).sort({
+      createdAt: 1,
+    });
+  }
+  return wallet;
+}
+
+async function ensurePettyCashExpenseAccount(actor = {}) {
+  const existing = await Account.findOne({ code: '5100' });
+  if (!existing) {
+    await Account.create({
+      code: '5100',
+      name: 'Petty Cash Expenses',
+      type: 'Expense',
+      subtype: 'Operating',
+      is_active: true,
+      is_postable: true,
+      ...actor,
+    });
+  }
+}
+
+async function nextPettyCashVoucherNo(date) {
+  const year = new Date(date).getFullYear() || new Date().getFullYear();
+  const prefix = `PCV-${year}-`;
+  const latest = await PettyCashVoucher.findOne({ voucher_no: new RegExp(`^${prefix}`) })
+    .sort({ voucher_no: -1 })
+    .select('voucher_no')
+    .lean();
+  let nextNum = 1;
+  if (latest?.voucher_no) {
+    const parts = String(latest.voucher_no).split('-');
+    const n = parseInt(parts[parts.length - 1], 10);
+    if (Number.isFinite(n)) nextNum = n + 1;
+  }
+  return `${prefix}${String(nextNum).padStart(4, '0')}`;
+}
+
+async function nextPettyCashReplenishNo(date) {
+  const year = new Date(date).getFullYear() || new Date().getFullYear();
+  const prefix = `PCR-${year}-`;
+  const latest = await PettyCashReplenishment.findOne({ request_no: new RegExp(`^${prefix}`) })
+    .sort({ request_no: -1 })
+    .select('request_no')
+    .lean();
+  let nextNum = 1;
+  if (latest?.request_no) {
+    const parts = String(latest.request_no).split('-');
+    const n = parseInt(parts[parts.length - 1], 10);
+    if (Number.isFinite(n)) nextNum = n + 1;
+  }
+  return `${prefix}${String(nextNum).padStart(4, '0')}`;
+}
+
+// Petty Cash — overview (FM summary + junior balance)
+router.get('/petty-cash/overview', auth, async (req, res) => {
+  try {
+    const actor = actorFromReq(req);
+    await ensurePettyCashExpenseAccount(actor);
+    const wallet = await getPettyCashWallet(actor);
+    if (!wallet) {
+      return res.status(500).json({ success: false, error: 'Petty cash account missing' });
+    }
+
+    const vouchers = await PettyCashVoucher.find({ status: 'POSTED' })
+      .sort({ voucher_date: -1, createdAt: -1 })
+      .limit(50)
+      .lean();
+    const pendingReplenish = await PettyCashReplenishment.find({ status: 'PENDING' })
+      .sort({ createdAt: -1 })
+      .lean();
+    const recentReplenish = await PettyCashReplenishment.find({})
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .lean();
+
+    const monthStart = new Date();
+    monthStart.setDate(1);
+    monthStart.setHours(0, 0, 0, 0);
+    const monthSpend = await PettyCashVoucher.aggregate([
+      {
+        $match: {
+          status: 'POSTED',
+          voucher_date: { $gte: monthStart },
+        },
+      },
+      { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } },
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        account: wallet,
+        balance: toNum(wallet.current_balance),
+        month_spend: toNum(monthSpend[0]?.total),
+        month_voucher_count: monthSpend[0]?.count || 0,
+        pending_replenish_count: pendingReplenish.length,
+        pending_replenish_amount: pendingReplenish.reduce(
+          (s, r) => s + toNum(r.requested_amount),
+          0
+        ),
+        vouchers,
+        pending_replenishments: pendingReplenish,
+        recent_replenishments: recentReplenish,
+        can_manage: isFinanceManager(req),
+      },
+    });
+  } catch (error) {
+    console.error('Error loading petty cash overview:', error);
+    res.status(500).json({ success: false, error: 'Failed to load petty cash overview' });
+  }
+});
+
+// FM funds petty cash via journal → balance increases
+router.post('/petty-cash/fund', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only Finance Manager / Admin can fund petty cash',
+      });
+    }
+
+    const actor = actorFromReq(req);
+    await ensurePettyCashExpenseAccount(actor);
+    const wallet = await getPettyCashWallet(actor);
+    if (!wallet) {
+      return res.status(500).json({ success: false, error: 'Petty cash account missing' });
+    }
+
+    const amount = toNum(req.body?.amount);
+    const fundingCode = String(req.body?.funding_account_code || glCode('1100')).trim();
+    const fundDate = req.body?.entry_date ? new Date(req.body.entry_date) : new Date();
+    const memo = String(req.body?.memo || '').trim() || 'Petty cash funding';
+
+    if (!(amount > 0)) {
+      return res.status(400).json({ success: false, error: 'Amount must be greater than zero' });
+    }
+
+    const pettyGl = await loadPostableAccount(wallet.gl_account_code || glCode('1000'));
+    const fundingGl = await loadPostableAccount(fundingCode);
+    if (!pettyGl || !fundingGl) {
+      return res.status(400).json({ success: false, error: 'GL accounts not postable' });
+    }
+
+    const entry_no = await nextJournalEntryNo(fundDate);
+    const journal = await JournalEntry.create({
+      entry_no,
+      entry_date: fundDate,
+      memo,
+      source: 'PAYMENT',
+      status: 'POSTED',
+      lines: [
+        {
+          account_id: pettyGl._id,
+          account_code: pettyGl.code,
+          account_name: pettyGl.name,
+          description: 'Fund petty cash',
+          debit: amount,
+          credit: 0,
+        },
+        {
+          account_id: fundingGl._id,
+          account_code: fundingGl.code,
+          account_name: fundingGl.name,
+          description: 'Transfer to petty cash',
+          debit: 0,
+          credit: amount,
+        },
+      ],
+      total_debit: amount,
+      total_credit: amount,
+      posted_at: new Date(),
+      source_reference: wallet.code,
+      source_label: 'Petty cash funding',
+      ...actor,
+    });
+
+    wallet.current_balance = toNum(wallet.current_balance) + amount;
+    await wallet.save();
+
+    res.status(201).json({
+      success: true,
+      data: { account: wallet, journal, balance: wallet.current_balance },
+    });
+  } catch (error) {
+    console.error('Error funding petty cash:', error);
+    res.status(500).json({ success: false, error: 'Failed to fund petty cash' });
+  }
+});
+
+router.get('/petty-cash/vouchers', auth, async (req, res) => {
+  try {
+    const vouchers = await PettyCashVoucher.find({})
+      .sort({ voucher_date: -1, createdAt: -1 })
+      .lean();
+    res.json({ success: true, data: vouchers });
+  } catch (error) {
+    console.error('Error fetching petty cash vouchers:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch vouchers' });
+  }
+});
+
+// Junior accountant creates voucher → deducts petty cash + posts expense journal
+router.post('/petty-cash/vouchers', auth, async (req, res) => {
+  try {
+    const actor = actorFromReq(req);
+    await ensurePettyCashExpenseAccount(actor);
+    const wallet = await getPettyCashWallet(actor);
+    if (!wallet) {
+      return res.status(500).json({ success: false, error: 'Petty cash account missing' });
+    }
+
+    const payee = String(req.body?.payee || '').trim();
+    const category = String(req.body?.category || '').trim();
+    const description = String(req.body?.description || '').trim();
+    const voucherDate = req.body?.voucher_date ? new Date(req.body.voucher_date) : new Date();
+
+    if (!payee) {
+      return res.status(400).json({ success: false, error: 'Payee is required' });
+    }
+
+    // Prefer multi-line payload; fall back to legacy single amount + expense_account_code
+    let rawLines = Array.isArray(req.body?.lines) ? req.body.lines : null;
+    if (!rawLines || !rawLines.length) {
+      const legacyAmount = toNum(req.body?.amount);
+      const legacyCode = String(req.body?.expense_account_code || glCode('5100')).trim();
+      if (!(legacyAmount > 0)) {
+        return res.status(400).json({ success: false, error: 'Add at least one line with an amount' });
+      }
+      rawLines = [
+        {
+          account_code: legacyCode,
+          description: description || undefined,
+          amount: legacyAmount,
+        },
+      ];
+    }
+
+    const builtLines = [];
+    for (let i = 0; i < rawLines.length; i += 1) {
+      const raw = rawLines[i] || {};
+      const code = String(raw.account_code || '').trim();
+      const lineAmount = Number(toNum(raw.amount).toFixed(2));
+      const lineDesc = String(raw.description || '').trim();
+      if (!code) {
+        return res.status(400).json({ success: false, error: `Line ${i + 1}: account (COA) is required` });
+      }
+      if (!(lineAmount > 0)) {
+        return res.status(400).json({ success: false, error: `Line ${i + 1}: amount must be greater than zero` });
+      }
+      const gl = await loadPostableAccount(code);
+      if (!gl) {
+        return res.status(400).json({
+          success: false,
+          error: `Line ${i + 1}: account ${code} not found or not postable`,
+        });
+      }
+      builtLines.push({
+        description: lineDesc || undefined,
+        account_code: gl.code,
+        account_name: gl.name,
+        amount: lineAmount,
+        account_id: gl._id,
+      });
+    }
+
+    const amount = Number(builtLines.reduce((s, l) => s + l.amount, 0).toFixed(2));
+    if (!(amount > 0)) {
+      return res.status(400).json({ success: false, error: 'Total amount must be greater than zero' });
+    }
+    if (toNum(wallet.current_balance) < amount) {
+      return res.status(400).json({
+        success: false,
+        error: `Insufficient petty cash (available AED ${toNum(wallet.current_balance).toFixed(2)})`,
+      });
+    }
+
+    const pettyGl = await loadPostableAccount(wallet.gl_account_code || glCode('1000'));
+    if (!pettyGl) {
+      return res.status(400).json({ success: false, error: 'Petty cash GL account is not postable' });
+    }
+
+    const voucher_no = await nextPettyCashVoucherNo(voucherDate);
+    const entry_no = await nextJournalEntryNo(voucherDate);
+
+    const journalLines = [
+      ...builtLines.map((l) => ({
+        account_id: l.account_id,
+        account_code: l.account_code,
+        account_name: l.account_name,
+        description: l.description || `Petty cash — ${payee}`,
+        debit: l.amount,
+        credit: 0,
+      })),
+      {
+        account_id: pettyGl._id,
+        account_code: pettyGl.code,
+        account_name: pettyGl.name,
+        description: `Paid from petty cash (${voucher_no})`,
+        debit: 0,
+        credit: amount,
+      },
+    ];
+
+    const journal = await JournalEntry.create({
+      entry_no,
+      entry_date: voucherDate,
+      memo: `Petty cash voucher ${voucher_no} — ${payee}`,
+      source: 'PAYMENT',
+      status: 'POSTED',
+      lines: journalLines,
+      total_debit: amount,
+      total_credit: amount,
+      posted_at: new Date(),
+      source_reference: voucher_no,
+      source_label: 'Petty cash voucher',
+      ...actor,
+    });
+
+    wallet.current_balance = toNum(wallet.current_balance) - amount;
+    await wallet.save();
+
+    const voucherLines = builtLines.map(({ description: d, account_code, account_name, amount: a }) => ({
+      description: d,
+      account_code,
+      account_name,
+      amount: a,
+    }));
+    const first = voucherLines[0];
+
+    const voucher = await PettyCashVoucher.create({
+      voucher_no,
+      voucher_date: voucherDate,
+      payee,
+      category,
+      description: description || voucherLines.map((l) => l.description).filter(Boolean).join('; ') || undefined,
+      amount,
+      expense_account_code: first.account_code,
+      expense_account_name: first.account_name,
+      lines: voucherLines,
+      petty_cash_account_id: wallet._id,
+      petty_cash_account_code: wallet.code,
+      status: 'POSTED',
+      journal_entry_id: journal._id,
+      journal_entry_no: journal.entry_no,
+      ...actor,
+    });
+
+    res.status(201).json({
+      success: true,
+      data: { voucher, journal, balance: wallet.current_balance },
+    });
+  } catch (error) {
+    console.error('Error creating petty cash voucher:', error);
+    res.status(500).json({ success: false, error: 'Failed to create voucher' });
+  }
+});
+
+router.get('/petty-cash/replenishments', auth, async (req, res) => {
+  try {
+    const status = String(req.query.status || '').trim().toUpperCase();
+    const filter = {};
+    if (status && status !== 'ALL') filter.status = status;
+    const rows = await PettyCashReplenishment.find(filter).sort({ createdAt: -1 }).lean();
+    res.json({ success: true, data: rows });
+  } catch (error) {
+    console.error('Error fetching replenishments:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch replenishment requests' });
+  }
+});
+
+// Junior requests replenishment
+router.post('/petty-cash/replenishments', auth, async (req, res) => {
+  try {
+    const actor = actorFromReq(req);
+    const wallet = await getPettyCashWallet(actor);
+    if (!wallet) {
+      return res.status(500).json({ success: false, error: 'Petty cash account missing' });
+    }
+
+    const amount = toNum(req.body?.requested_amount ?? req.body?.amount);
+    const reason = String(req.body?.reason || '').trim();
+    if (!(amount > 0)) {
+      return res.status(400).json({ success: false, error: 'Requested amount must be greater than zero' });
+    }
+
+    const pending = await PettyCashReplenishment.findOne({
+      status: 'PENDING',
+      requested_by_user_id: actor.created_by_user_id,
+    });
+    if (pending) {
+      return res.status(400).json({
+        success: false,
+        error: `You already have pending request ${pending.request_no}`,
+      });
+    }
+
+    const request_no = await nextPettyCashReplenishNo(new Date());
+    const row = await PettyCashReplenishment.create({
+      request_no,
+      requested_amount: amount,
+      reason,
+      status: 'PENDING',
+      petty_cash_account_id: wallet._id,
+      balance_at_request: toNum(wallet.current_balance),
+      requested_by_name: actor.created_by_name,
+      requested_by_email: actor.created_by_email,
+      requested_by_user_id: actor.created_by_user_id,
+    });
+
+    res.status(201).json({ success: true, data: row });
+  } catch (error) {
+    console.error('Error requesting replenishment:', error);
+    res.status(500).json({ success: false, error: 'Failed to request replenishment' });
+  }
+});
+
+// FM approves replenishment → journal + balance increase
+router.post('/petty-cash/replenishments/:id/approve', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only Finance Manager / Admin can replenish petty cash',
+      });
+    }
+
+    const row = await PettyCashReplenishment.findById(req.params.id);
+    if (!row) return res.status(404).json({ success: false, error: 'Request not found' });
+    if (row.status !== 'PENDING') {
+      return res.status(400).json({ success: false, error: `Request is ${row.status}` });
+    }
+
+    const actor = actorFromReq(req);
+    const wallet = await BankCashAccount.findById(row.petty_cash_account_id);
+    if (!wallet || !wallet.is_active) {
+      return res.status(400).json({ success: false, error: 'Petty cash account inactive' });
+    }
+
+    const amount = toNum(req.body?.approved_amount ?? row.requested_amount);
+    const fundingCode = String(req.body?.funding_account_code || glCode('1100')).trim();
+    if (!(amount > 0)) {
+      return res.status(400).json({ success: false, error: 'Approved amount must be greater than zero' });
+    }
+
+    const pettyGl = await loadPostableAccount(wallet.gl_account_code || glCode('1000'));
+    const fundingGl = await loadPostableAccount(fundingCode);
+    if (!pettyGl || !fundingGl) {
+      return res.status(400).json({ success: false, error: 'GL accounts not postable' });
+    }
+
+    const entryDate = new Date();
+    const entry_no = await nextJournalEntryNo(entryDate);
+    const journal = await JournalEntry.create({
+      entry_no,
+      entry_date: entryDate,
+      memo: `Petty cash replenishment ${row.request_no}`,
+      source: 'PAYMENT',
+      status: 'POSTED',
+      lines: [
+        {
+          account_id: pettyGl._id,
+          account_code: pettyGl.code,
+          account_name: pettyGl.name,
+          description: `Replenish petty cash (${row.request_no})`,
+          debit: amount,
+          credit: 0,
+        },
+        {
+          account_id: fundingGl._id,
+          account_code: fundingGl.code,
+          account_name: fundingGl.name,
+          description: 'Bank transfer for petty cash replenishment',
+          debit: 0,
+          credit: amount,
+        },
+      ],
+      total_debit: amount,
+      total_credit: amount,
+      posted_at: new Date(),
+      source_reference: row.request_no,
+      source_label: 'Petty cash replenishment',
+      ...actor,
+    });
+
+    wallet.current_balance = toNum(wallet.current_balance) + amount;
+    await wallet.save();
+
+    row.status = 'APPROVED';
+    row.approved_amount = amount;
+    row.funding_account_code = fundingCode;
+    row.reviewed_at = new Date();
+    row.reviewed_by_name = actor.created_by_name;
+    row.reviewed_by_email = actor.created_by_email;
+    row.reviewed_by_user_id = actor.created_by_user_id;
+    row.journal_entry_id = journal._id;
+    row.journal_entry_no = journal.entry_no;
+    await row.save();
+
+    res.json({
+      success: true,
+      data: { replenishment: row, journal, balance: wallet.current_balance },
+    });
+  } catch (error) {
+    console.error('Error approving replenishment:', error);
+    res.status(500).json({ success: false, error: 'Failed to replenish petty cash' });
+  }
+});
+
+router.post('/petty-cash/replenishments/:id/reject', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only Finance Manager / Admin can reject replenishment requests',
+      });
+    }
+
+    const row = await PettyCashReplenishment.findById(req.params.id);
+    if (!row) return res.status(404).json({ success: false, error: 'Request not found' });
+    if (row.status !== 'PENDING') {
+      return res.status(400).json({ success: false, error: `Request is ${row.status}` });
+    }
+
+    const actor = actorFromReq(req);
+    row.status = 'REJECTED';
+    row.rejection_reason = String(req.body?.reason || '').trim();
+    row.reviewed_at = new Date();
+    row.reviewed_by_name = actor.created_by_name;
+    row.reviewed_by_email = actor.created_by_email;
+    row.reviewed_by_user_id = actor.created_by_user_id;
+    await row.save();
+
+    res.json({ success: true, data: row });
+  } catch (error) {
+    console.error('Error rejecting replenishment:', error);
+    res.status(500).json({ success: false, error: 'Failed to reject replenishment' });
+  }
+});
+
+async function computeBudgetActuals(budget) {
+  const codes = (budget.lines || []).map((l) => l.account_code);
+  if (!codes.length) {
+    return {
+      lines: [],
+      totals: {
+        budgeted: 0,
+        actual: 0,
+        variance: 0,
+        percent_used: 0,
+      },
+    };
+  }
+
+  const journals = await JournalEntry.find({
+    status: 'POSTED',
+    entry_date: {
+      $gte: new Date(budget.start_date),
+      $lte: new Date(budget.end_date),
+    },
+    'lines.account_code': { $in: codes },
+  })
+    .select('lines')
+    .lean();
+
+  const actualByCode = new Map();
+  for (const code of codes) actualByCode.set(code, 0);
+
+  for (const j of journals) {
+    for (const line of j.lines || []) {
+      if (!actualByCode.has(line.account_code)) continue;
+      const debit = toNum(line.debit);
+      const credit = toNum(line.credit);
+      const meta = (budget.lines || []).find((l) => l.account_code === line.account_code);
+      const type = meta?.account_type || 'Expense';
+      // Expense / Asset: debit-normal → actual = debit - credit
+      // Revenue / Liability / Equity: credit-normal → actual = credit - debit
+      if (type === 'Expense' || type === 'Asset') {
+        actualByCode.set(line.account_code, actualByCode.get(line.account_code) + debit - credit);
+      } else {
+        actualByCode.set(line.account_code, actualByCode.get(line.account_code) + credit - debit);
+      }
+    }
+  }
+
+  const lines = (budget.lines || []).map((l) => {
+    const budgeted = toNum(l.budgeted_amount);
+    const actual = Number(toNum(actualByCode.get(l.account_code)).toFixed(2));
+    const variance = Number((budgeted - actual).toFixed(2));
+    const percent_used = budgeted > 0 ? Number(((actual / budgeted) * 100).toFixed(1)) : 0;
+    return {
+      _id: l._id,
+      account_code: l.account_code,
+      account_name: l.account_name,
+      account_type: l.account_type,
+      budgeted_amount: budgeted,
+      actual_amount: actual,
+      variance,
+      percent_used,
+      notes: l.notes || '',
+    };
+  });
+
+  const totalBudgeted = lines.reduce((s, l) => s + l.budgeted_amount, 0);
+  const totalActual = lines.reduce((s, l) => s + l.actual_amount, 0);
+  const totalVariance = Number((totalBudgeted - totalActual).toFixed(2));
+
+  return {
+    lines,
+    totals: {
+      budgeted: Number(totalBudgeted.toFixed(2)),
+      actual: Number(totalActual.toFixed(2)),
+      variance: totalVariance,
+      percent_used:
+        totalBudgeted > 0 ? Number(((totalActual / totalBudgeted) * 100).toFixed(1)) : 0,
+    },
+  };
+}
+
+function buildBudgetLines(rawLines) {
+  if (!Array.isArray(rawLines)) return [];
+  return rawLines
+    .map((raw) => ({
+      account_code: String(raw.account_code || '').trim(),
+      account_name: String(raw.account_name || '').trim(),
+      account_type: String(raw.account_type || 'Expense').trim(),
+      budgeted_amount: Math.max(0, toNum(raw.budgeted_amount)),
+      notes: String(raw.notes || '').trim(),
+    }))
+    .filter((l) => l.account_code && l.budgeted_amount >= 0);
+}
+
+router.get('/budgets/overview', auth, async (req, res) => {
+  try {
+    const budgets = await Budget.find({}).sort({ fiscal_year: -1, createdAt: -1 }).lean();
+    const active = budgets.find((b) => b.status === 'ACTIVE') || budgets[0] || null;
+    let activeVariance = null;
+    if (active) {
+      activeVariance = await computeBudgetActuals(active);
+    }
+
+    res.json({
+      success: true,
+      data: {
+        totals: {
+          count: budgets.length,
+          draft: budgets.filter((b) => b.status === 'DRAFT').length,
+          active: budgets.filter((b) => b.status === 'ACTIVE').length,
+          closed: budgets.filter((b) => b.status === 'CLOSED').length,
+        },
+        budgets: budgets.slice(0, 20),
+        active_budget: active
+          ? {
+              ...active,
+              variance: activeVariance,
+            }
+          : null,
+      },
+    });
+  } catch (error) {
+    console.error('Error loading budget overview:', error);
+    res.status(500).json({ success: false, error: 'Failed to load budget overview' });
+  }
+});
+
+router.get('/budgets', auth, async (req, res) => {
+  try {
+    const status = String(req.query.status || '').trim().toUpperCase();
+    const filter = {};
+    if (status && status !== 'ALL') filter.status = status;
+    const budgets = await Budget.find(filter).sort({ fiscal_year: -1, createdAt: -1 }).lean();
+    res.json({ success: true, data: budgets });
+  } catch (error) {
+    console.error('Error fetching budgets:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch budgets' });
+  }
+});
+
+router.get('/budgets/:id', auth, async (req, res) => {
+  try {
+    const budget = await Budget.findById(req.params.id).lean();
+    if (!budget) return res.status(404).json({ success: false, error: 'Budget not found' });
+    const variance = await computeBudgetActuals(budget);
+    res.json({ success: true, data: { ...budget, variance } });
+  } catch (error) {
+    console.error('Error fetching budget:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch budget' });
+  }
+});
+
+router.post('/budgets', auth, async (req, res) => {
+  try {
+    const {
+      name,
+      code,
+      fiscal_year,
+      period_type = 'ANNUAL',
+      start_date,
+      end_date,
+      notes = '',
+      currency = 'AED',
+      lines: rawLines = [],
+    } = req.body || {};
+
+    const budgetName = String(name || '').trim();
+    const budgetCode = String(code || '').trim().toUpperCase();
+    const year = Number(fiscal_year) || new Date().getFullYear();
+    const start = start_date ? new Date(start_date) : new Date(`${year}-01-01`);
+    const end = end_date ? new Date(end_date) : new Date(`${year}-12-31`);
+
+    if (!budgetName) {
+      return res.status(400).json({ success: false, error: 'Budget name is required' });
+    }
+    if (!budgetCode) {
+      return res.status(400).json({ success: false, error: 'Budget code is required' });
+    }
+
+    const linesIn = buildBudgetLines(rawLines);
+    const lines = [];
+    for (const row of linesIn) {
+      const account = await Account.findOne({ code: row.account_code, is_active: true }).lean();
+      if (!account) {
+        return res.status(400).json({
+          success: false,
+          error: `Account not found: ${row.account_code}`,
+        });
+      }
+      lines.push({
+        account_code: account.code,
+        account_name: account.name,
+        account_type: account.type,
+        budgeted_amount: row.budgeted_amount,
+        notes: row.notes,
+      });
+    }
+
+    const total_budgeted = lines.reduce((s, l) => s + toNum(l.budgeted_amount), 0);
+    const actor = actorFromReq(req);
+
+    const budget = await Budget.create({
+      name: budgetName,
+      code: budgetCode,
+      fiscal_year: year,
+      period_type: ['ANNUAL', 'QUARTERLY', 'MONTHLY'].includes(period_type)
+        ? period_type
+        : 'ANNUAL',
+      start_date: start,
+      end_date: end,
+      status: 'DRAFT',
+      currency: String(currency || 'AED').trim() || 'AED',
+      notes: String(notes || '').trim(),
+      lines,
+      total_budgeted,
+      ...actor,
+    });
+
+    res.status(201).json({ success: true, data: budget });
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(400).json({ success: false, error: 'Budget code already exists' });
+    }
+    console.error('Error creating budget:', error);
+    res.status(500).json({ success: false, error: 'Failed to create budget' });
+  }
+});
+
+router.put('/budgets/:id', auth, async (req, res) => {
+  try {
+    const budget = await Budget.findById(req.params.id);
+    if (!budget) return res.status(404).json({ success: false, error: 'Budget not found' });
+    if (budget.status === 'CLOSED') {
+      return res.status(400).json({ success: false, error: 'Closed budgets cannot be edited' });
+    }
+
+    const {
+      name,
+      fiscal_year,
+      period_type,
+      start_date,
+      end_date,
+      notes,
+      currency,
+      lines: rawLines,
+    } = req.body || {};
+
+    if (name != null) budget.name = String(name).trim();
+    if (fiscal_year != null) budget.fiscal_year = Number(fiscal_year) || budget.fiscal_year;
+    if (period_type && ['ANNUAL', 'QUARTERLY', 'MONTHLY'].includes(period_type)) {
+      budget.period_type = period_type;
+    }
+    if (start_date) budget.start_date = new Date(start_date);
+    if (end_date) budget.end_date = new Date(end_date);
+    if (notes != null) budget.notes = String(notes).trim();
+    if (currency != null) budget.currency = String(currency).trim() || 'AED';
+
+    if (Array.isArray(rawLines)) {
+      const linesIn = buildBudgetLines(rawLines);
+      const lines = [];
+      for (const row of linesIn) {
+        const account = await Account.findOne({ code: row.account_code, is_active: true }).lean();
+        if (!account) {
+          return res.status(400).json({
+            success: false,
+            error: `Account not found: ${row.account_code}`,
+          });
+        }
+        lines.push({
+          account_code: account.code,
+          account_name: account.name,
+          account_type: account.type,
+          budgeted_amount: row.budgeted_amount,
+          notes: row.notes,
+        });
+      }
+      budget.lines = lines;
+      budget.total_budgeted = lines.reduce((s, l) => s + toNum(l.budgeted_amount), 0);
+    }
+
+    await budget.save();
+    const variance = await computeBudgetActuals(budget.toObject());
+    res.json({ success: true, data: { ...budget.toObject(), variance } });
+  } catch (error) {
+    console.error('Error updating budget:', error);
+    res.status(500).json({ success: false, error: 'Failed to update budget' });
+  }
+});
+
+router.post('/budgets/:id/activate', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only Finance Manager / Admin can activate budgets',
+      });
+    }
+
+    const budget = await Budget.findById(req.params.id);
+    if (!budget) return res.status(404).json({ success: false, error: 'Budget not found' });
+    if (!budget.lines?.length) {
+      return res.status(400).json({ success: false, error: 'Add budget lines before activating' });
+    }
+
+    // Only one ACTIVE budget at a time (optional business rule)
+    await Budget.updateMany(
+      { _id: { $ne: budget._id }, status: 'ACTIVE' },
+      { $set: { status: 'CLOSED' } }
+    );
+
+    const actor = actorFromReq(req);
+    budget.status = 'ACTIVE';
+    budget.activated_at = new Date();
+    budget.activated_by_name = actor.created_by_name;
+    await budget.save();
+
+    const variance = await computeBudgetActuals(budget.toObject());
+    res.json({ success: true, data: { ...budget.toObject(), variance } });
+  } catch (error) {
+    console.error('Error activating budget:', error);
+    res.status(500).json({ success: false, error: 'Failed to activate budget' });
+  }
+});
+
+router.post('/budgets/:id/close', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only Finance Manager / Admin can close budgets',
+      });
+    }
+    const budget = await Budget.findById(req.params.id);
+    if (!budget) return res.status(404).json({ success: false, error: 'Budget not found' });
+    budget.status = 'CLOSED';
+    await budget.save();
+    res.json({ success: true, data: budget });
+  } catch (error) {
+    console.error('Error closing budget:', error);
+    res.status(500).json({ success: false, error: 'Failed to close budget' });
+  }
+});
+
+async function ensureFixedAssetAccounts(actor = {}) {
+  if (useFiveDigitCoa()) {
+    await ensureKnexChartOfAccounts(actor);
+    return;
+  }
+  const needed = [
+    { code: glCode('1500'), name: 'Fixed Assets', type: 'Asset', subtype: 'Fixed Assets' },
+    {
+      code: glCode('1510'),
+      name: 'Accumulated Depreciation',
+      type: 'Asset',
+      subtype: 'Contra Asset',
+    },
+    {
+      code: glCode('5200'),
+      name: 'Depreciation Expense',
+      type: 'Expense',
+      subtype: 'Operating',
+    },
+    { code: glCode('1100'), name: 'Cash at Bank', type: 'Asset', subtype: 'Bank' },
+    { code: glCode('2000'), name: 'Accounts Payable', type: 'Liability', subtype: 'Payables' },
+    {
+      code: glCode('4900'),
+      name: 'Gain/Loss on Asset Disposal',
+      type: 'Revenue',
+      subtype: 'Other',
+    },
+  ];
+  for (const row of needed) {
+    const existing = await Account.findOne({ code: row.code });
+    if (!existing) {
+      await Account.create({
+        ...row,
+        is_active: true,
+        is_postable: true,
+        ...actor,
+      });
+    }
+  }
+}
+
+function monthlyStraightLineAmount(asset) {
+  const depreciable = Math.max(0, toNum(asset.acquisition_cost) - toNum(asset.salvage_value));
+  const months = Math.max(1, toNum(asset.useful_life_months));
+  return Number((depreciable / months).toFixed(2));
+}
+
+function remainingDepreciable(asset) {
+  const maxDepr = Math.max(0, toNum(asset.acquisition_cost) - toNum(asset.salvage_value));
+  return Math.max(0, Number((maxDepr - toNum(asset.accumulated_depreciation)).toFixed(2)));
+}
+
+async function runAssetDepreciation(asset, periodDate, actor) {
+  if (asset.status !== 'ACTIVE') {
+    return { skipped: true, reason: `Asset is ${asset.status}` };
+  }
+
+  const remaining = remainingDepreciable(asset);
+  if (remaining <= 0) {
+    asset.status = 'FULLY_DEPRECIATED';
+    asset.book_value = toNum(asset.salvage_value);
+    await asset.save();
+    return { skipped: true, reason: 'Fully depreciated' };
+  }
+
+  let amount = monthlyStraightLineAmount(asset);
+  if (amount > remaining) amount = remaining;
+  if (!(amount > 0)) {
+    return { skipped: true, reason: 'Zero depreciation amount' };
+  }
+
+  const expenseGl = await loadPostableAccount(asset.depr_expense_account_code || glCode('5200'));
+  const accumGl = await loadPostableAccount(asset.accum_depr_account_code || glCode('1510'));
+  if (!expenseGl || !accumGl) {
+    return { skipped: true, reason: 'Depreciation GL accounts not postable' };
+  }
+
+  const entry_no = await nextJournalEntryNo(periodDate);
+  const journal = await JournalEntry.create({
+    entry_no,
+    entry_date: periodDate,
+    memo: `Depreciation — ${asset.asset_tag} ${asset.name}`,
+    source: 'ADJUSTMENT',
+    status: 'POSTED',
+    lines: [
+      {
+        account_id: expenseGl._id,
+        account_code: expenseGl.code,
+        account_name: expenseGl.name,
+        description: `Depreciation ${asset.asset_tag}`,
+        debit: amount,
+        credit: 0,
+      },
+      {
+        account_id: accumGl._id,
+        account_code: accumGl.code,
+        account_name: accumGl.name,
+        description: `Accum. depr. ${asset.asset_tag}`,
+        debit: 0,
+        credit: amount,
+      },
+    ],
+    total_debit: amount,
+    total_credit: amount,
+    posted_at: new Date(),
+    source_reference: asset.asset_tag,
+    source_label: 'Fixed asset depreciation',
+    ...actor,
+  });
+
+  asset.accumulated_depreciation = Number(
+    (toNum(asset.accumulated_depreciation) + amount).toFixed(2)
+  );
+  asset.book_value = Number(
+    (toNum(asset.acquisition_cost) - toNum(asset.accumulated_depreciation)).toFixed(2)
+  );
+  asset.last_depreciation_date = periodDate;
+  if (remainingDepreciable(asset) <= 0.009) {
+    asset.status = 'FULLY_DEPRECIATED';
+    asset.book_value = toNum(asset.salvage_value);
+  }
+  await asset.save();
+
+  const run = await FixedAssetDepreciation.create({
+    asset_id: asset._id,
+    asset_tag: asset.asset_tag,
+    period_date: periodDate,
+    amount,
+    accum_after: asset.accumulated_depreciation,
+    book_value_after: asset.book_value,
+    journal_entry_id: journal._id,
+    journal_entry_no: journal.entry_no,
+    ...actor,
+  });
+
+  return { skipped: false, depreciation: run, journal, asset };
+}
+
+// Fixed Assets
+router.get('/fixed-assets/overview', auth, async (req, res) => {
+  try {
+    await ensureFixedAssetAccounts(actorFromReq(req));
+    const assets = await FixedAsset.find({}).sort({ createdAt: -1 }).lean();
+    const active = assets.filter((a) => a.status === 'ACTIVE');
+    const disposed = assets.filter((a) => a.status === 'DISPOSED');
+    const fully = assets.filter((a) => a.status === 'FULLY_DEPRECIATED');
+
+    const totalCost = assets
+      .filter((a) => a.status !== 'DISPOSED')
+      .reduce((s, a) => s + toNum(a.acquisition_cost), 0);
+    const totalAccum = assets
+      .filter((a) => a.status !== 'DISPOSED')
+      .reduce((s, a) => s + toNum(a.accumulated_depreciation), 0);
+    const totalBook = assets
+      .filter((a) => a.status !== 'DISPOSED')
+      .reduce((s, a) => s + toNum(a.book_value), 0);
+
+    const recentDep = await FixedAssetDepreciation.find({})
+      .sort({ period_date: -1, createdAt: -1 })
+      .limit(20)
+      .lean();
+
+    res.json({
+      success: true,
+      data: {
+        totals: {
+          count: assets.length,
+          active: active.length,
+          fully_depreciated: fully.length,
+          disposed: disposed.length,
+          acquisition_cost: Number(totalCost.toFixed(2)),
+          accumulated_depreciation: Number(totalAccum.toFixed(2)),
+          book_value: Number(totalBook.toFixed(2)),
+        },
+        assets: assets.slice(0, 50),
+        recent_depreciations: recentDep,
+      },
+    });
+  } catch (error) {
+    console.error('Error loading fixed assets overview:', error);
+    res.status(500).json({ success: false, error: 'Failed to load fixed assets overview' });
+  }
+});
+
+router.get('/fixed-assets', auth, async (req, res) => {
+  try {
+    const status = String(req.query.status || '').trim().toUpperCase();
+    const filter = {};
+    if (status && status !== 'ALL') filter.status = status;
+    const assets = await FixedAsset.find(filter).sort({ createdAt: -1 }).lean();
+    res.json({ success: true, data: assets });
+  } catch (error) {
+    console.error('Error fetching fixed assets:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch fixed assets' });
+  }
+});
+
+router.get('/fixed-assets/:id', auth, async (req, res) => {
+  try {
+    const asset = await FixedAsset.findById(req.params.id).lean();
+    if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' });
+    const depreciations = await FixedAssetDepreciation.find({ asset_id: asset._id })
+      .sort({ period_date: -1 })
+      .lean();
+    res.json({
+      success: true,
+      data: {
+        ...asset,
+        monthly_depreciation: monthlyStraightLineAmount(asset),
+        remaining_depreciable: remainingDepreciable(asset),
+        depreciations,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching fixed asset:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch fixed asset' });
+  }
+});
+
+router.post('/fixed-assets', auth, async (req, res) => {
+  try {
+    const actor = actorFromReq(req);
+    await ensureFixedAssetAccounts(actor);
+
+    const {
+      asset_tag,
+      name,
+      category = '',
+      location = '',
+      purchase_date,
+      in_service_date,
+      acquisition_cost,
+      salvage_value = 0,
+      useful_life_months,
+      asset_account_code = '1500',
+      accum_depr_account_code = '1510',
+      depr_expense_account_code = '5200',
+      funding_account_code = '1100',
+      post_acquisition_journal = true,
+      notes = '',
+    } = req.body || {};
+
+    const tag = String(asset_tag || '').trim().toUpperCase();
+    const assetName = String(name || '').trim();
+    const cost = toNum(acquisition_cost);
+    const salvage = Math.max(0, toNum(salvage_value));
+    const life = Math.max(1, Math.round(toNum(useful_life_months)));
+    const purchaseDate = purchase_date ? new Date(purchase_date) : new Date();
+    const serviceDate = in_service_date ? new Date(in_service_date) : purchaseDate;
+
+    if (!tag) return res.status(400).json({ success: false, error: 'Asset tag is required' });
+    if (!assetName) return res.status(400).json({ success: false, error: 'Asset name is required' });
+    if (!(cost > 0)) {
+      return res.status(400).json({ success: false, error: 'Acquisition cost must be greater than zero' });
+    }
+    if (salvage > cost) {
+      return res.status(400).json({ success: false, error: 'Salvage cannot exceed cost' });
+    }
+
+    const assetGl = await loadPostableAccount(String(asset_account_code || glCode('1500')).trim());
+    if (!assetGl) {
+      return res.status(400).json({ success: false, error: 'Asset GL account not postable' });
+    }
+
+    let acquisitionJournal = null;
+    if (post_acquisition_journal) {
+      const fundingGl = await loadPostableAccount(String(funding_account_code || glCode('1100')).trim());
+      if (!fundingGl) {
+        return res.status(400).json({ success: false, error: 'Funding GL account not postable' });
+      }
+      const entry_no = await nextJournalEntryNo(purchaseDate);
+      acquisitionJournal = await JournalEntry.create({
+        entry_no,
+        entry_date: purchaseDate,
+        memo: `Acquire fixed asset ${tag} — ${assetName}`,
+        source: 'PAYMENT',
+        status: 'POSTED',
+        lines: [
+          {
+            account_id: assetGl._id,
+            account_code: assetGl.code,
+            account_name: assetGl.name,
+            description: `Purchase ${tag}`,
+            debit: cost,
+            credit: 0,
+          },
+          {
+            account_id: fundingGl._id,
+            account_code: fundingGl.code,
+            account_name: fundingGl.name,
+            description: `Payment for ${tag}`,
+            debit: 0,
+            credit: cost,
+          },
+        ],
+        total_debit: cost,
+        total_credit: cost,
+        posted_at: new Date(),
+        source_reference: tag,
+        source_label: 'Fixed asset acquisition',
+        ...actor,
+      });
+    }
+
+    const asset = await FixedAsset.create({
+      asset_tag: tag,
+      name: assetName,
+      category: String(category || '').trim(),
+      location: String(location || '').trim(),
+      purchase_date: purchaseDate,
+      in_service_date: serviceDate,
+      acquisition_cost: cost,
+      salvage_value: salvage,
+      useful_life_months: life,
+      depreciation_method: 'STRAIGHT_LINE',
+      asset_account_code: assetGl.code,
+      accum_depr_account_code: String(accum_depr_account_code || glCode('1510')).trim(),
+      depr_expense_account_code: String(depr_expense_account_code || glCode('5200')).trim(),
+      accumulated_depreciation: 0,
+      book_value: cost,
+      status: 'ACTIVE',
+      acquisition_journal_id: acquisitionJournal?._id,
+      acquisition_journal_no: acquisitionJournal?.entry_no,
+      notes: String(notes || '').trim(),
+      ...actor,
+    });
+
+    res.status(201).json({
+      success: true,
+      data: {
+        asset,
+        journal: acquisitionJournal,
+        monthly_depreciation: monthlyStraightLineAmount(asset),
+      },
+    });
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(400).json({ success: false, error: 'Asset tag already exists' });
+    }
+    console.error('Error creating fixed asset:', error);
+    res.status(500).json({ success: false, error: 'Failed to create fixed asset' });
+  }
+});
+
+router.post('/fixed-assets/depreciate-all', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only Finance Manager / Admin can run mass depreciation',
+      });
+    }
+
+    const periodDate = req.body?.period_date ? new Date(req.body.period_date) : new Date();
+    const actor = actorFromReq(req);
+    const assets = await FixedAsset.find({ status: 'ACTIVE' });
+    const results = [];
+
+    for (const asset of assets) {
+      const result = await runAssetDepreciation(asset, periodDate, actor);
+      results.push({
+        asset_tag: asset.asset_tag,
+        ...result,
+      });
+    }
+
+    const posted = results.filter((r) => !r.skipped).length;
+    res.json({
+      success: true,
+      data: {
+        period_date: periodDate,
+        processed: results.length,
+        posted,
+        results,
+      },
+    });
+  } catch (error) {
+    console.error('Error running mass depreciation:', error);
+    res.status(500).json({ success: false, error: 'Failed to run depreciation' });
+  }
+});
+
+router.post('/fixed-assets/:id/depreciate', auth, async (req, res) => {
+  try {
+    const asset = await FixedAsset.findById(req.params.id);
+    if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' });
+
+    const periodDate = req.body?.period_date ? new Date(req.body.period_date) : new Date();
+    const actor = actorFromReq(req);
+    const result = await runAssetDepreciation(asset, periodDate, actor);
+
+    if (result.skipped) {
+      return res.status(400).json({ success: false, error: result.reason });
+    }
+
+    res.json({ success: true, data: result });
+  } catch (error) {
+    console.error('Error depreciating asset:', error);
+    res.status(500).json({ success: false, error: 'Failed to depreciate asset' });
+  }
+});
+
+router.post('/fixed-assets/:id/dispose', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only Finance Manager / Admin can dispose assets',
+      });
+    }
+
+    const asset = await FixedAsset.findById(req.params.id);
+    if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' });
+    if (asset.status === 'DISPOSED') {
+      return res.status(400).json({ success: false, error: 'Asset already disposed' });
+    }
+
+    const proceeds = Math.max(0, toNum(req.body?.proceeds));
+    const disposeDate = req.body?.disposal_date ? new Date(req.body.disposal_date) : new Date();
+    const proceedsAccountCode = String(req.body?.proceeds_account_code || glCode('1100')).trim();
+    const gainLossCode = String(req.body?.gain_loss_account_code || glCode('4900')).trim();
+    const actor = actorFromReq(req);
+
+    const assetGl = await loadPostableAccount(asset.asset_account_code || glCode('1500'));
+    const accumGl = await loadPostableAccount(asset.accum_depr_account_code || glCode('1510'));
+    const proceedsGl = await loadPostableAccount(proceedsAccountCode);
+    const gainLossGl = await loadPostableAccount(gainLossCode);
+
+    if (!assetGl || !accumGl || !proceedsGl || !gainLossGl) {
+      return res.status(400).json({ success: false, error: 'Disposal GL accounts not postable' });
+    }
+
+    const cost = toNum(asset.acquisition_cost);
+    const accum = toNum(asset.accumulated_depreciation);
+    const book = Number((cost - accum).toFixed(2));
+    const gainLoss = Number((proceeds - book).toFixed(2));
+
+    const lines = [
+      {
+        account_id: accumGl._id,
+        account_code: accumGl.code,
+        account_name: accumGl.name,
+        description: `Clear accum. depr. ${asset.asset_tag}`,
+        debit: accum,
+        credit: 0,
+      },
+      {
+        account_id: proceedsGl._id,
+        account_code: proceedsGl.code,
+        account_name: proceedsGl.name,
+        description: `Proceeds ${asset.asset_tag}`,
+        debit: proceeds,
+        credit: 0,
+      },
+      {
+        account_id: assetGl._id,
+        account_code: assetGl.code,
+        account_name: assetGl.name,
+        description: `Remove asset ${asset.asset_tag}`,
+        debit: 0,
+        credit: cost,
+      },
+    ];
+
+    if (gainLoss > 0) {
+      lines.push({
+        account_id: gainLossGl._id,
+        account_code: gainLossGl.code,
+        account_name: gainLossGl.name,
+        description: `Gain on disposal ${asset.asset_tag}`,
+        debit: 0,
+        credit: gainLoss,
+      });
+    } else if (gainLoss < 0) {
+      lines.push({
+        account_id: gainLossGl._id,
+        account_code: gainLossGl.code,
+        account_name: gainLossGl.name,
+        description: `Loss on disposal ${asset.asset_tag}`,
+        debit: Math.abs(gainLoss),
+        credit: 0,
+      });
+    }
+
+    // If proceeds are 0, remove empty debit proceeds line and adjust
+    const cleaned = lines.filter((l) => l.debit > 0 || l.credit > 0);
+    const totalDebit = cleaned.reduce((s, l) => s + l.debit, 0);
+    const totalCredit = cleaned.reduce((s, l) => s + l.credit, 0);
+    if (Math.abs(totalDebit - totalCredit) > 0.02) {
+      return res.status(400).json({
+        success: false,
+        error: `Disposal journal unbalanced (${totalDebit} vs ${totalCredit})`,
+      });
+    }
+
+    const entry_no = await nextJournalEntryNo(disposeDate);
+    const journal = await JournalEntry.create({
+      entry_no,
+      entry_date: disposeDate,
+      memo: `Dispose fixed asset ${asset.asset_tag} — ${asset.name}`,
+      source: 'ADJUSTMENT',
+      status: 'POSTED',
+      lines: cleaned,
+      total_debit: totalDebit,
+      total_credit: totalCredit,
+      posted_at: new Date(),
+      source_reference: asset.asset_tag,
+      source_label: 'Fixed asset disposal',
+      ...actor,
+    });
+
+    asset.status = 'DISPOSED';
+    asset.disposed_at = disposeDate;
+    asset.disposal_proceeds = proceeds;
+    asset.book_value = 0;
+    asset.disposal_journal_id = journal._id;
+    asset.disposal_journal_no = journal.entry_no;
+    await asset.save();
+
+    res.json({
+      success: true,
+      data: {
+        asset,
+        journal,
+        book_value_at_disposal: book,
+        gain_loss: gainLoss,
+      },
+    });
+  } catch (error) {
+    console.error('Error disposing fixed asset:', error);
+    res.status(500).json({ success: false, error: 'Failed to dispose fixed asset' });
+  }
+});
+
+// ─── Finance invoices (operations) → GL ──────────────────────────────────────
+
+router.get('/finance-invoices/gl-status', auth, async (req, res) => {
+  try {
+    const { Invoice } = require('../models/unified-schema');
+    const [counts, failed] = await Promise.all([
+      Invoice.aggregate([{ $group: { _id: '$gl_sync.status', count: { $sum: 1 } } }]),
+      Invoice.find({ 'gl_sync.status': 'FAILED' })
+        .select('invoice_id awb_number total_amount issue_date gl_sync')
+        .sort({ issue_date: -1 })
+        .limit(50)
+        .lean(),
+    ]);
+    const summary = Object.fromEntries(counts.map((c) => [c._id || 'NOT_POSTED', c.count]));
+    res.json({
+      success: true,
+      data: {
+        summary,
+        failed: failed.map((f) => ({ ...f, total_amount: toNum(f.total_amount?.toString()) })),
+      },
+    });
+  } catch (error) {
+    console.error('Error loading finance invoice GL status:', error);
+    res.status(500).json({ success: false, error: 'Failed to load GL status' });
+  }
+});
+
+router.post('/finance-invoices/:id/post-journal', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({ success: false, error: 'Only Finance Manager / Admin can post invoice journals' });
+    }
+    const { Invoice } = require('../models/unified-schema');
+    const invoice = await Invoice.findById(req.params.id);
+    if (!invoice) return res.status(404).json({ success: false, error: 'Invoice not found' });
+    const gl = await postInvoiceJournal(invoice, { actorId: req.user?.id });
+    const receipts = gl.status === 'POSTED' ? await syncInvoiceReceipts(invoice, { actorId: req.user?.id }) : null;
+    const status = gl.status === 'FAILED' ? 400 : 200;
+    res.status(status).json({ success: gl.status !== 'FAILED', data: { ...gl, receipts }, error: gl.error });
+  } catch (error) {
+    console.error('Error posting finance invoice journal:', error);
+    res.status(500).json({ success: false, error: 'Failed to post invoice journal' });
+  }
+});
+
+// Retries FAILED postings; pass `since` to also post never-posted invoices issued on/after that date.
+router.post('/finance-invoices/post-pending', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({ success: false, error: 'Only Finance Manager / Admin can post invoice journals' });
+    }
+    const { Invoice } = require('../models/unified-schema');
+    const limit = Math.min(Math.max(parseInt(req.body?.limit, 10) || 200, 1), 1000);
+    const since = req.body?.since ? new Date(req.body.since) : null;
+    const or = [{ 'gl_sync.status': 'FAILED' }];
+    if (since && !Number.isNaN(since.getTime())) {
+      or.push({ 'gl_sync.status': { $exists: false }, issue_date: { $gte: since } });
+    }
+    const invoices = await Invoice.find({ status: { $ne: 'CANCELLED' }, $or: or })
+      .sort({ issue_date: 1 })
+      .limit(limit);
+
+    const results = { posted: [], skipped: 0, failed: [] };
+    for (const invoice of invoices) {
+      const gl = await postInvoiceJournal(invoice, { actorId: req.user?.id });
+      if (gl.status === 'POSTED') {
+        await syncInvoiceReceipts(invoice, { actorId: req.user?.id });
+        results.posted.push({ invoice_id: invoice.invoice_id, journal_no: gl.journal_no });
+      } else if (gl.status === 'FAILED') results.failed.push({ invoice_id: invoice.invoice_id, error: gl.error });
+      else results.skipped += 1;
+    }
+    res.json({ success: true, data: { scanned: invoices.length, ...results } });
+  } catch (error) {
+    console.error('Error posting pending finance invoice journals:', error);
+    res.status(500).json({ success: false, error: 'Failed to post pending invoice journals' });
+  }
+});
+
+// ─── Sales: VAT traders (customers) + invoices ───────────────────────────────
+
+async function ensureSalesAccounts(actor = {}) {
+  if (useFiveDigitCoa()) {
+    await ensureKnexChartOfAccounts(actor);
+    return;
+  }
+  const needed = [
+    { code: glCode('1300'), name: 'Accounts Receivable', type: 'Asset', subtype: 'Receivables' },
+    { code: glCode('1310'), name: 'VAT Input Recoverable', type: 'Asset', subtype: 'Tax' },
+    { code: glCode('4000'), name: 'Sales Revenue', type: 'Revenue', subtype: 'Operating' },
+    { code: glCode('2200'), name: 'VAT Output Payable', type: 'Liability', subtype: 'Tax' },
+    { code: glCode('1100'), name: 'Cash at Bank', type: 'Asset', subtype: 'Bank' },
+    { code: glCode('2210'), name: 'VAT Settlement', type: 'Liability', subtype: 'Tax' },
+    { code: glCode('2310'), name: 'Customer Payment Due', type: 'Liability', subtype: 'Current' },
+  ];
+  for (const row of needed) {
+    const existing = await Account.findOne({ code: row.code });
+    if (!existing) {
+      await Account.create({
+        ...row,
+        is_active: true,
+        is_postable: true,
+        ...actor,
+      });
+    }
+  }
+}
+
+async function nextSalesCustomerCode() {
+  const year = new Date().getFullYear();
+  const prefix = `CUS-${year}-`;
+  const latest = await SalesCustomer.findOne({ code: new RegExp(`^${prefix}`) })
+    .sort({ code: -1 })
+    .select('code')
+    .lean();
+  let nextNum = 1;
+  if (latest?.code) {
+    const parts = String(latest.code).split('-');
+    const n = parseInt(parts[parts.length - 1], 10);
+    if (Number.isFinite(n)) nextNum = n + 1;
+  }
+  return `${prefix}${String(nextNum).padStart(4, '0')}`;
+}
+
+async function nextSalesInvoiceNo(invoiceDate) {
+  const year = new Date(invoiceDate).getFullYear() || new Date().getFullYear();
+  const prefix = `INV-${year}-`;
+  const latest = await SalesInvoice.findOne({ invoice_no: new RegExp(`^${prefix}`) })
+    .sort({ invoice_no: -1 })
+    .select('invoice_no')
+    .lean();
+  let nextNum = 1;
+  if (latest?.invoice_no) {
+    const parts = String(latest.invoice_no).split('-');
+    const n = parseInt(parts[parts.length - 1], 10);
+    if (Number.isFinite(n)) nextNum = n + 1;
+  }
+  return `${prefix}${String(nextNum).padStart(4, '0')}`;
+}
+
+function buildSalesInvoiceLines(rawLines) {
+  if (!Array.isArray(rawLines)) return [];
+  return rawLines
+    .map((raw) => {
+      const description = String(raw.description || '').trim();
+      const sku = String(raw.sku || '').trim().toUpperCase() || undefined;
+      const quantity = toNum(raw.quantity);
+      const unit_price = toNum(raw.unit_price);
+      const vat_rate = Math.max(0, toNum(raw.vat_rate ?? 5));
+      const line_subtotal = Number((quantity * unit_price).toFixed(2));
+      const line_vat = Number(((line_subtotal * vat_rate) / 100).toFixed(2));
+      const line_total = Number((line_subtotal + line_vat).toFixed(2));
+      return {
+        description,
+        sku,
+        quantity,
+        unit_price,
+        vat_rate,
+        line_subtotal,
+        line_vat,
+        line_total,
+      };
+    })
+    .filter((l) => l.description && l.quantity > 0);
+}
+
+router.get('/sales/overview', auth, async (req, res) => {
+  try {
+    await ensureSalesAccounts(actorFromReq(req));
+    const [invoices, customers] = await Promise.all([
+      SalesInvoice.find({}).sort({ createdAt: -1 }).lean(),
+      SalesCustomer.find({ is_active: true }).lean(),
+    ]);
+
+    const byStatus = invoices.reduce((acc, inv) => {
+      acc[inv.status] = (acc[inv.status] || 0) + 1;
+      return acc;
+    }, {});
+
+    const openReceivable = invoices
+      .filter((inv) => ['APPROVED', 'PARTIALLY_PAID'].includes(inv.status))
+      .reduce((s, inv) => s + toNum(inv.total_amount) - toNum(inv.amount_paid), 0);
+
+    const vatTraders = customers.filter((c) => c.is_vat_registered || c.is_official_trader);
+
+    res.json({
+      success: true,
+      data: {
+        totals: {
+          invoices: invoices.length,
+          draft: byStatus.DRAFT || 0,
+          pending: byStatus.PENDING_APPROVAL || 0,
+          approved: byStatus.APPROVED || 0,
+          partially_paid: byStatus.PARTIALLY_PAID || 0,
+          paid: byStatus.PAID || 0,
+          open_receivable: Number(openReceivable.toFixed(2)),
+          customers: customers.length,
+          vat_traders: vatTraders.length,
+        },
+        recent_invoices: invoices.slice(0, 12),
+        recent_customers: customers.slice(0, 8),
+      },
+    });
+  } catch (error) {
+    console.error('Error loading sales overview:', error);
+    res.status(500).json({ success: false, error: 'Failed to load sales overview' });
+  }
+});
+
+router.get('/sales/customers', auth, async (req, res) => {
+  try {
+    const vatOnly = String(req.query.vat_traders || '').toLowerCase() === 'true';
+    const activeOnly = String(req.query.active || 'true').toLowerCase() !== 'false';
+    const filter = {};
+    if (activeOnly) filter.is_active = true;
+    if (vatOnly) {
+      filter.$or = [{ is_vat_registered: true }, { is_official_trader: true }];
+    }
+    const customers = await SalesCustomer.find(filter).sort({ legal_name: 1 }).lean();
+    res.json({ success: true, data: customers });
+  } catch (error) {
+    console.error('Error fetching sales customers:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch customers' });
+  }
+});
+
+router.get('/sales/customers/:id', auth, async (req, res) => {
+  try {
+    const customer = await SalesCustomer.findById(req.params.id).lean();
+    if (!customer) return res.status(404).json({ success: false, error: 'Customer not found' });
+    const invoices = await SalesInvoice.find({ customer_id: customer._id })
+      .sort({ invoice_date: -1 })
+      .limit(50)
+      .lean();
+    res.json({ success: true, data: { ...customer, invoices } });
+  } catch (error) {
+    console.error('Error fetching sales customer:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch customer' });
+  }
+});
+
+router.post('/sales/customers', auth, async (req, res) => {
+  try {
+    const actor = actorFromReq(req);
+    const {
+      code,
+      legal_name,
+      trade_name = '',
+      vat_trn = '',
+      is_vat_registered = false,
+      is_official_trader = false,
+      contact_name = '',
+      email = '',
+      phone = '',
+      address_line1 = '',
+      address_line2 = '',
+      city = '',
+      emirate = '',
+      country = 'AE',
+      payment_terms_days = 30,
+      credit_limit = 0,
+      notes = '',
+    } = req.body || {};
+
+    const legalName = String(legal_name || '').trim();
+    if (!legalName) {
+      return res.status(400).json({ success: false, error: 'Legal name is required' });
+    }
+
+    const vatRegistered = Boolean(is_vat_registered) || Boolean(is_official_trader);
+    const trn = String(vat_trn || '').trim().toUpperCase();
+    if (vatRegistered && !trn) {
+      return res.status(400).json({
+        success: false,
+        error: 'VAT TRN is required for VAT-registered / official traders',
+      });
+    }
+
+    const customerCode = String(code || '').trim().toUpperCase() || (await nextSalesCustomerCode());
+
+    const customer = await SalesCustomer.create({
+      code: customerCode,
+      legal_name: legalName,
+      trade_name: String(trade_name || '').trim(),
+      vat_trn: trn || undefined,
+      is_vat_registered: vatRegistered,
+      is_official_trader: Boolean(is_official_trader),
+      contact_name: String(contact_name || '').trim(),
+      email: String(email || '').trim().toLowerCase(),
+      phone: String(phone || '').trim(),
+      address_line1: String(address_line1 || '').trim(),
+      address_line2: String(address_line2 || '').trim(),
+      city: String(city || '').trim(),
+      emirate: String(emirate || '').trim(),
+      country: String(country || 'AE').trim() || 'AE',
+      payment_terms_days: Math.max(0, Math.round(toNum(payment_terms_days) || 30)),
+      credit_limit: Math.max(0, toNum(credit_limit)),
+      notes: String(notes || '').trim(),
+      is_active: true,
+      ...actor,
+    });
+
+    res.status(201).json({ success: true, data: customer });
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(400).json({ success: false, error: 'Customer code already exists' });
+    }
+    console.error('Error creating sales customer:', error);
+    res.status(500).json({ success: false, error: 'Failed to create customer' });
+  }
+});
+
+router.patch('/sales/customers/:id', auth, async (req, res) => {
+  try {
+    const customer = await SalesCustomer.findById(req.params.id);
+    if (!customer) return res.status(404).json({ success: false, error: 'Customer not found' });
+
+    const fields = [
+      'legal_name',
+      'trade_name',
+      'vat_trn',
+      'contact_name',
+      'email',
+      'phone',
+      'address_line1',
+      'address_line2',
+      'city',
+      'emirate',
+      'country',
+      'notes',
+    ];
+    for (const f of fields) {
+      if (req.body?.[f] !== undefined) {
+        let val = String(req.body[f] || '').trim();
+        if (f === 'vat_trn') val = val.toUpperCase();
+        if (f === 'email') val = val.toLowerCase();
+        customer[f] = val;
+      }
+    }
+    if (req.body?.is_vat_registered !== undefined) {
+      customer.is_vat_registered = Boolean(req.body.is_vat_registered);
+    }
+    if (req.body?.is_official_trader !== undefined) {
+      customer.is_official_trader = Boolean(req.body.is_official_trader);
+    }
+    if (customer.is_official_trader) customer.is_vat_registered = true;
+    if (req.body?.payment_terms_days !== undefined) {
+      customer.payment_terms_days = Math.max(0, Math.round(toNum(req.body.payment_terms_days)));
+    }
+    if (req.body?.credit_limit !== undefined) {
+      customer.credit_limit = Math.max(0, toNum(req.body.credit_limit));
+    }
+    if (req.body?.is_active !== undefined) {
+      customer.is_active = Boolean(req.body.is_active);
+    }
+
+    if ((customer.is_vat_registered || customer.is_official_trader) && !customer.vat_trn) {
+      return res.status(400).json({
+        success: false,
+        error: 'VAT TRN is required for VAT-registered / official traders',
+      });
+    }
+
+    await customer.save();
+    res.json({ success: true, data: customer });
+  } catch (error) {
+    console.error('Error updating sales customer:', error);
+    res.status(500).json({ success: false, error: 'Failed to update customer' });
+  }
+});
+
+router.get('/sales/invoices', auth, async (req, res) => {
+  try {
+    const status = String(req.query.status || '').trim().toUpperCase();
+    const filter = {};
+    if (status && status !== 'ALL') filter.status = status;
+    const invoices = await SalesInvoice.find(filter).sort({ createdAt: -1 }).lean();
+    res.json({ success: true, data: invoices });
+  } catch (error) {
+    console.error('Error fetching sales invoices:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch invoices' });
+  }
+});
+
+/** Unpaid invoice summary for customers — shipment + sales AR (Excel-ready) */
+/** Customer bill-wise statement — unpaid / paid / all with filters (PDF & Excel on frontend) */
+router.get('/sales/unpaid-summary', auth, async (req, res) => {
+  try {
+    const { Invoice } = require('../models/unified-schema');
+    const customerId = String(req.query.customer_id || '').trim();
+    const customerName = String(req.query.customer_name || '').trim();
+    const kind = String(req.query.kind || 'ALL').trim().toUpperCase(); // ALL | SHIPMENT | SALES
+    // ALL | UNPAID | PARTIAL | PAID  (default UNPAID keeps prior behaviour for callers that omit it)
+    const paymentStatus = String(req.query.payment_status || 'UNPAID').trim().toUpperCase();
+    const from = req.query.from ? new Date(String(req.query.from)) : null;
+    const to = req.query.to ? new Date(String(req.query.to)) : null;
+    if (from && !Number.isNaN(from.getTime())) from.setHours(0, 0, 0, 0);
+    if (to && !Number.isNaN(to.getTime())) to.setHours(23, 59, 59, 999);
+
+    const decimalNum = (v) => {
+      if (v == null) return 0;
+      if (typeof v === 'object' && v.$numberDecimal != null) return Number(v.$numberDecimal) || 0;
+      if (typeof v === 'object' && typeof v.toString === 'function') {
+        const n = Number(v.toString());
+        return Number.isFinite(n) ? n : 0;
+      }
+      return Number(v) || 0;
+    };
+
+    const inDateRange = (d) => {
+      if (!d) return true;
+      const dt = new Date(d);
+      if (Number.isNaN(dt.getTime())) return true;
+      if (from && !Number.isNaN(from.getTime()) && dt < from) return false;
+      if (to && !Number.isNaN(to.getTime()) && dt > to) return false;
+      return true;
+    };
+
+    const nameMatch = (name) => {
+      if (!customerName) return true;
+      return String(name || '')
+        .trim()
+        .toLowerCase()
+        .includes(customerName.trim().toLowerCase());
+    };
+
+    const matchesPaymentFilter = (payBucket) => {
+      if (paymentStatus === 'ALL') return true;
+      if (paymentStatus === 'UNPAID') return payBucket === 'UNPAID' || payBucket === 'PARTIAL';
+      if (paymentStatus === 'PARTIAL') return payBucket === 'PARTIAL';
+      if (paymentStatus === 'PAID') return payBucket === 'PAID';
+      return payBucket === 'UNPAID' || payBucket === 'PARTIAL';
+    };
+
+    const classifyOutstanding = (total, paid, outstanding) => {
+      if (outstanding <= 0.009) return 'PAID';
+      if (paid > 0.009) return 'PARTIAL';
+      return 'UNPAID';
+    };
+
+    const rows = [];
+
+    if (kind === 'ALL' || kind === 'SHIPMENT') {
+      const shipStatuses =
+        paymentStatus === 'PAID'
+          ? ['PAID']
+          : paymentStatus === 'ALL'
+            ? ['UNPAID', 'OVERDUE', 'PAID', 'COLLECTED_BY_DRIVER', 'REMITTED']
+            : ['UNPAID', 'OVERDUE', 'PAID', 'COLLECTED_BY_DRIVER', 'REMITTED'];
+      const shipFilter = {
+        status: { $in: shipStatuses },
+        is_cancellation_invoice: { $ne: true },
+      };
+      if (customerName) {
+        shipFilter.receiver_name = new RegExp(escapeRegex(customerName), 'i');
+      }
+      const shipments = await Invoice.find(shipFilter)
+        .select(
+          'invoice_id awb_number issue_date due_date status receiver_name receiver_phone total_amount amount_paid credit_notes_total debit_notes_total'
+        )
+        .sort({ issue_date: -1 })
+        .lean();
+
+      for (const inv of shipments) {
+        if (!inDateRange(inv.issue_date)) continue;
+        const total = decimalNum(inv.total_amount);
+        const paid = toNum(inv.amount_paid);
+        const credits = toNum(inv.credit_notes_total);
+        const debits = toNum(inv.debit_notes_total);
+        const outstanding = Number(Math.max(0, total - credits + debits - paid).toFixed(2));
+        const payBucket = classifyOutstanding(total, paid, outstanding);
+        if (!matchesPaymentFilter(payBucket)) continue;
+        const customer = String(inv.receiver_name || '').trim() || 'Unknown customer';
+        if (!nameMatch(customer)) continue;
+        rows.push({
+          kind: 'SHIPMENT',
+          id: String(inv._id),
+          invoice_no: inv.invoice_id || inv.awb_number || String(inv._id),
+          reference: inv.awb_number || '',
+          invoice_date: inv.issue_date,
+          due_date: inv.due_date || null,
+          customer_name: customer,
+          customer_phone: inv.receiver_phone || null,
+          status: inv.status,
+          pay_status: payBucket,
+          total_amount: Number(total.toFixed(2)),
+          amount_paid: Number(paid.toFixed(2)),
+          outstanding,
+          currency: 'AED',
+        });
+      }
+    }
+
+    if (kind === 'ALL' || kind === 'SALES') {
+      const salesStatuses =
+        paymentStatus === 'PAID'
+          ? ['PAID']
+          : paymentStatus === 'PARTIAL'
+            ? ['PARTIALLY_PAID']
+            : paymentStatus === 'UNPAID'
+              ? ['APPROVED', 'PARTIALLY_PAID']
+              : ['APPROVED', 'PARTIALLY_PAID', 'PAID'];
+      const salesFilter = {
+        status: { $in: salesStatuses },
+      };
+      if (customerId && mongoose.isValidObjectId(customerId)) {
+        salesFilter.customer_id = customerId;
+      } else if (customerName) {
+        salesFilter.customer_name = new RegExp(escapeRegex(customerName), 'i');
+      }
+      const sales = await SalesInvoice.find(salesFilter).sort({ invoice_date: -1 }).lean();
+      for (const inv of sales) {
+        if (!inDateRange(inv.invoice_date)) continue;
+        const total = toNum(inv.total_amount);
+        const paid = toNum(inv.amount_paid);
+        const outstanding = Number(Math.max(0, total - paid).toFixed(2));
+        const payBucket = classifyOutstanding(total, paid, outstanding);
+        if (!matchesPaymentFilter(payBucket)) continue;
+        const customer = String(inv.customer_name || '').trim() || 'Unknown customer';
+        if (customerId && mongoose.isValidObjectId(customerId)) {
+          if (String(inv.customer_id || '') !== customerId) continue;
+        } else if (!nameMatch(customer)) continue;
+        rows.push({
+          kind: 'SALES',
+          id: String(inv._id),
+          invoice_no: inv.invoice_no,
+          reference: inv.customer_vat_trn || '',
+          invoice_date: inv.invoice_date,
+          due_date: inv.due_date || null,
+          customer_name: customer,
+          customer_phone: null,
+          customer_trn: inv.customer_vat_trn || null,
+          status: inv.status,
+          pay_status: payBucket,
+          total_amount: total,
+          amount_paid: paid,
+          outstanding,
+          currency: inv.currency || 'AED',
+        });
+      }
+    }
+
+    rows.sort((a, b) => {
+      const byCust = String(a.customer_name).localeCompare(String(b.customer_name));
+      if (byCust !== 0) return byCust;
+      return new Date(b.invoice_date || 0).getTime() - new Date(a.invoice_date || 0).getTime();
+    });
+
+    const byCustomerMap = new Map();
+    for (const row of rows) {
+      const key = row.customer_name.toLowerCase();
+      if (!byCustomerMap.has(key)) {
+        byCustomerMap.set(key, {
+          customer_name: row.customer_name,
+          invoice_count: 0,
+          paid_count: 0,
+          unpaid_count: 0,
+          total_invoiced: 0,
+          amount_paid: 0,
+          outstanding: 0,
+          overdue_count: 0,
+        });
+      }
+      const g = byCustomerMap.get(key);
+      g.invoice_count += 1;
+      g.total_invoiced += row.total_amount;
+      g.amount_paid += row.amount_paid;
+      g.outstanding += row.outstanding;
+      if (row.pay_status === 'PAID') g.paid_count += 1;
+      else g.unpaid_count += 1;
+      if (
+        row.status === 'OVERDUE' ||
+        (row.due_date && new Date(row.due_date) < new Date() && row.outstanding > 0.009)
+      ) {
+        g.overdue_count += 1;
+      }
+    }
+
+    const by_customer = [...byCustomerMap.values()]
+      .map((g) => ({
+        ...g,
+        total_invoiced: Number(g.total_invoiced.toFixed(2)),
+        amount_paid: Number(g.amount_paid.toFixed(2)),
+        outstanding: Number(g.outstanding.toFixed(2)),
+      }))
+      .sort((a, b) => b.outstanding - a.outstanding);
+
+    const totals = {
+      invoice_count: rows.length,
+      customer_count: by_customer.length,
+      paid_count: rows.filter((r) => r.pay_status === 'PAID').length,
+      unpaid_count: rows.filter((r) => r.pay_status !== 'PAID').length,
+      total_invoiced: Number(rows.reduce((s, r) => s + r.total_amount, 0).toFixed(2)),
+      amount_paid: Number(rows.reduce((s, r) => s + r.amount_paid, 0).toFixed(2)),
+      outstanding: Number(rows.reduce((s, r) => s + r.outstanding, 0).toFixed(2)),
+    };
+
+    res.json({
+      success: true,
+      data: {
+        as_of: new Date().toISOString(),
+        filters: {
+          customer_id: customerId || null,
+          customer_name: customerName || null,
+          kind,
+          payment_status: paymentStatus,
+          from: from && !Number.isNaN(from.getTime()) ? from.toISOString().slice(0, 10) : null,
+          to: to && !Number.isNaN(to.getTime()) ? to.toISOString().slice(0, 10) : null,
+        },
+        totals,
+        by_customer,
+        invoices: rows,
+      },
+    });
+  } catch (error) {
+    console.error('Error loading unpaid summary:', error);
+    res.status(500).json({ success: false, error: 'Failed to load unpaid invoice summary' });
+  }
+});
+
+router.get('/sales/invoices/:id', auth, async (req, res) => {
+  try {
+    const invoice = await SalesInvoice.findById(req.params.id).lean();
+    if (!invoice) return res.status(404).json({ success: false, error: 'Invoice not found' });
+    res.json({ success: true, data: invoice });
+  } catch (error) {
+    console.error('Error fetching sales invoice:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch invoice' });
+  }
+});
+
+router.post('/sales/invoices', auth, async (req, res) => {
+  try {
+    const actor = actorFromReq(req);
+    await ensureSalesAccounts(actor);
+
+    const {
+      invoice_date,
+      due_date,
+      customer_id,
+      customer_name,
+      currency = 'AED',
+      notes = '',
+      ar_account_code = '1300',
+      revenue_account_code = '4000',
+      vat_account_code = '2200',
+      submit = false,
+      lines: rawLines,
+    } = req.body || {};
+
+    const lines = buildSalesInvoiceLines(rawLines);
+    if (!lines.length) {
+      return res.status(400).json({ success: false, error: 'At least one line item is required' });
+    }
+
+    let customer = null;
+    if (customer_id) {
+      customer = await SalesCustomer.findById(customer_id);
+      if (!customer) {
+        return res.status(400).json({ success: false, error: 'Customer not found' });
+      }
+    }
+
+    const customerName =
+      (customer?.legal_name || String(customer_name || '').trim() || '').trim();
+    if (!customerName) {
+      return res.status(400).json({ success: false, error: 'Customer name is required' });
+    }
+
+    const arCode = String(ar_account_code || glCode('1300')).trim();
+    const revCode = String(revenue_account_code || glCode('4000')).trim();
+    const vatCode = String(vat_account_code || glCode('2200')).trim();
+    const [arGl, revGl, vatGl] = await Promise.all([
+      loadPostableAccount(arCode),
+      loadPostableAccount(revCode),
+      loadPostableAccount(vatCode),
+    ]);
+    if (!arGl || !revGl || !vatGl) {
+      return res.status(400).json({
+        success: false,
+        error: 'AR / revenue / VAT GL accounts must be postable',
+      });
+    }
+
+    const invDate = invoice_date ? new Date(invoice_date) : new Date();
+    const termsDays = customer?.payment_terms_days ?? 30;
+    const due =
+      due_date != null && due_date !== ''
+        ? new Date(due_date)
+        : new Date(invDate.getTime() + termsDays * 24 * 60 * 60 * 1000);
+
+    const subtotal = Number(lines.reduce((s, l) => s + l.line_subtotal, 0).toFixed(2));
+    const vat_amount = Number(lines.reduce((s, l) => s + l.line_vat, 0).toFixed(2));
+    const total_amount = Number((subtotal + vat_amount).toFixed(2));
+    const invoice_no = await nextSalesInvoiceNo(invDate);
+    const shouldSubmit = Boolean(submit);
+
+    const invoice = await SalesInvoice.create({
+      invoice_no,
+      invoice_date: invDate,
+      due_date: due,
+      customer_id: customer?._id,
+      customer_code: customer?.code,
+      customer_name: customerName,
+      customer_vat_trn: customer?.vat_trn || undefined,
+      customer_is_vat_registered: Boolean(customer?.is_vat_registered),
+      currency: String(currency || 'AED').trim() || 'AED',
+      status: shouldSubmit ? 'PENDING_APPROVAL' : 'DRAFT',
+      lines,
+      subtotal,
+      vat_amount,
+      total_amount,
+      amount_paid: 0,
+      ar_account_code: arCode,
+      revenue_account_code: revCode,
+      vat_account_code: vatCode,
+      notes: String(notes || '').trim(),
+      ...actor,
+    });
+
+    res.status(201).json({ success: true, data: invoice });
+  } catch (error) {
+    console.error('Error creating sales invoice:', error);
+    res.status(500).json({ success: false, error: 'Failed to create invoice' });
+  }
+});
+
+router.post('/sales/invoices/:id/submit', auth, async (req, res) => {
+  try {
+    const invoice = await SalesInvoice.findById(req.params.id);
+    if (!invoice) return res.status(404).json({ success: false, error: 'Invoice not found' });
+    if (invoice.status !== 'DRAFT') {
+      return res.status(400).json({ success: false, error: 'Only draft invoices can be submitted' });
+    }
+    invoice.status = 'PENDING_APPROVAL';
+    await invoice.save();
+    res.json({ success: true, data: invoice });
+  } catch (error) {
+    console.error('Error submitting sales invoice:', error);
+    res.status(500).json({ success: false, error: 'Failed to submit invoice' });
+  }
+});
+
+router.post('/sales/invoices/:id/approve', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only Finance Manager / Admin can approve invoices',
+      });
+    }
+
+    const invoice = await SalesInvoice.findById(req.params.id);
+    if (!invoice) return res.status(404).json({ success: false, error: 'Invoice not found' });
+    if (!['DRAFT', 'PENDING_APPROVAL'].includes(invoice.status)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invoice is ${invoice.status} and cannot be approved`,
+      });
+    }
+
+    const arGl = await loadPostableAccount(invoice.ar_account_code || glCode('1300'));
+    const revGl = await loadPostableAccount(invoice.revenue_account_code || glCode('4000'));
+    const vatGl = await loadPostableAccount(invoice.vat_account_code || glCode('2200'));
+    if (!arGl || !revGl || !vatGl) {
+      return res.status(400).json({ success: false, error: 'Linked GL accounts are not postable' });
+    }
+
+    const actor = actorFromReq(req);
+    const subtotal = toNum(invoice.subtotal);
+    const vat = toNum(invoice.vat_amount);
+    const total = toNum(invoice.total_amount);
+    const entry_no = await nextJournalEntryNo(invoice.invoice_date);
+
+    // Approve → POSTED JE: Dr AR, Cr Revenue, Cr VAT Output
+    const lines = [
+      {
+        account_id: arGl._id,
+        account_code: arGl.code,
+        account_name: arGl.name,
+        description: `AR ${invoice.invoice_no} — ${invoice.customer_name}`,
+        debit: total,
+        credit: 0,
+      },
+      {
+        account_id: revGl._id,
+        account_code: revGl.code,
+        account_name: revGl.name,
+        description: `Sales ${invoice.invoice_no}`,
+        debit: 0,
+        credit: subtotal,
+      },
+    ];
+    if (vat > 0) {
+      lines.push({
+        account_id: vatGl._id,
+        account_code: vatGl.code,
+        account_name: vatGl.name,
+        description: `VAT output ${invoice.invoice_no}`,
+        debit: 0,
+        credit: vat,
+      });
+    } else if (Math.abs(total - subtotal) > 0.009) {
+      // safety: if totals differ without VAT lines
+      lines[1].credit = total;
+    }
+
+    const journal = await JournalEntry.create({
+      entry_no,
+      entry_date: invoice.invoice_date,
+      memo: `Sales invoice ${invoice.invoice_no} — ${invoice.customer_name}`,
+      source: 'INVOICE',
+      status: 'POSTED',
+      lines,
+      total_debit: total,
+      total_credit: total,
+      posted_at: new Date(),
+      source_reference: invoice.invoice_no,
+      source_label: 'Sales invoice approval',
+      ...actor,
+    });
+
+    invoice.status = 'APPROVED';
+    invoice.approved_at = new Date();
+    invoice.approved_by_name = actor.created_by_name;
+    invoice.approved_by_email = actor.created_by_email;
+    invoice.approved_by_user_id = actor.created_by_user_id;
+    invoice.invoice_journal_id = journal._id;
+    invoice.invoice_journal_no = journal.entry_no;
+    await invoice.save();
+
+    let einvoice = null;
+    try {
+      const { doc } = await generateEInvoiceForSalesInvoice(invoice, actor);
+      einvoice = { _id: doc._id, einvoice_no: doc.einvoice_no, status: doc.status };
+    } catch (einvoiceError) {
+      console.error('E-invoice auto-generation failed:', einvoiceError);
+    }
+
+    res.json({ success: true, data: { invoice, journal, einvoice } });
+  } catch (error) {
+    console.error('Error approving sales invoice:', error);
+    res.status(500).json({ success: false, error: 'Failed to approve invoice' });
+  }
+});
+
+router.post('/sales/invoices/:id/reject', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only Finance Manager / Admin can reject invoices',
+      });
+    }
+
+    const invoice = await SalesInvoice.findById(req.params.id);
+    if (!invoice) return res.status(404).json({ success: false, error: 'Invoice not found' });
+    if (!['DRAFT', 'PENDING_APPROVAL'].includes(invoice.status)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invoice is ${invoice.status} and cannot be rejected`,
+      });
+    }
+
+    invoice.status = 'REJECTED';
+    invoice.rejection_reason = String(req.body?.reason || '').trim() || 'Rejected by finance';
+    await invoice.save();
+    res.json({ success: true, data: invoice });
+  } catch (error) {
+    console.error('Error rejecting sales invoice:', error);
+    res.status(500).json({ success: false, error: 'Failed to reject invoice' });
+  }
+});
+
+router.post('/sales/invoices/:id/pay', auth, async (req, res) => {
+  try {
+    const invoice = await SalesInvoice.findById(req.params.id);
+    if (!invoice) return res.status(404).json({ success: false, error: 'Invoice not found' });
+    if (!['APPROVED', 'PARTIALLY_PAID'].includes(invoice.status)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Only approved / partially paid invoices can receive payment',
+      });
+    }
+
+    const outstanding = Number(
+      (toNum(invoice.total_amount) - toNum(invoice.amount_paid)).toFixed(2)
+    );
+    if (!(outstanding > 0)) {
+      return res.status(400).json({ success: false, error: 'Invoice is already fully paid' });
+    }
+
+    let amount = toNum(req.body?.amount);
+    if (!(amount > 0)) amount = outstanding;
+    if (amount > outstanding + 0.009) {
+      return res.status(400).json({
+        success: false,
+        error: `Payment exceeds outstanding AED ${outstanding.toFixed(2)}`,
+      });
+    }
+    amount = Number(amount.toFixed(2));
+
+    const payDate = req.body?.payment_date ? new Date(req.body.payment_date) : new Date();
+    const actor = actorFromReq(req);
+
+    let receiptGl = null;
+    let wallet = null;
+    if (req.body?.bank_cash_account_id) {
+      wallet = await BankCashAccount.findById(req.body.bank_cash_account_id);
+      if (!wallet || wallet.is_active === false) {
+        return res.status(400).json({ success: false, error: 'Bank/cash account not found' });
+      }
+      receiptGl = await loadPostableAccount(wallet.gl_account_code);
+    } else {
+      const receiptCode = String(req.body?.receipt_account_code || glCode('1100')).trim();
+      receiptGl = await loadPostableAccount(receiptCode);
+    }
+    if (!receiptGl) {
+      return res.status(400).json({ success: false, error: 'Receipt GL account is not postable' });
+    }
+
+    const arGl = await loadPostableAccount(invoice.ar_account_code || glCode('1300'));
+    if (!arGl) {
+      return res.status(400).json({ success: false, error: 'AR account is not postable' });
+    }
+
+    // Payment JE: Dr Bank/Cash, Cr AR (clears receivable)
+    const entry_no = await nextJournalEntryNo(payDate);
+    const journal = await JournalEntry.create({
+      entry_no,
+      entry_date: payDate,
+      memo: `Receipt ${invoice.invoice_no} — ${invoice.customer_name}`,
+      source: 'PAYMENT',
+      status: 'POSTED',
+      lines: [
+        {
+          account_id: receiptGl._id,
+          account_code: receiptGl.code,
+          account_name: receiptGl.name,
+          description: `Receipt ${invoice.invoice_no}`,
+          debit: amount,
+          credit: 0,
+        },
+        {
+          account_id: arGl._id,
+          account_code: arGl.code,
+          account_name: arGl.name,
+          description: `Clear AR ${invoice.invoice_no}`,
+          debit: 0,
+          credit: amount,
+        },
+      ],
+      total_debit: amount,
+      total_credit: amount,
+      posted_at: new Date(),
+      source_reference: invoice.invoice_no,
+      source_label: 'Sales invoice receipt',
+      ...actor,
+    });
+
+    if (wallet) {
+      wallet.current_balance = Number((toNum(wallet.current_balance) + amount).toFixed(2));
+      await wallet.save();
+    }
+
+    invoice.amount_paid = Number((toNum(invoice.amount_paid) + amount).toFixed(2));
+    const remaining = Number((toNum(invoice.total_amount) - toNum(invoice.amount_paid)).toFixed(2));
+    invoice.status = remaining <= 0.009 ? 'PAID' : 'PARTIALLY_PAID';
+    const receipt_no = await nextSalesReceiptNo(payDate);
+    const paymentRow = {
+      receipt_no,
+      payment_date: payDate,
+      amount,
+      bank_cash_account_id: wallet?._id,
+      bank_cash_account_code: wallet?.code,
+      bank_cash_account_name: wallet?.name,
+      receipt_account_code: receiptGl.code,
+      receipt_account_name: receiptGl.name,
+      ar_account_code: arGl.code,
+      ar_account_name: arGl.name,
+      journal_entry_id: journal._id,
+      journal_entry_no: journal.entry_no,
+      notes: String(req.body?.notes || '').trim(),
+      recorded_by_name: actor.created_by_name,
+      recorded_by_email: actor.created_by_email,
+      recorded_at: new Date(),
+    };
+    invoice.payments.push(paymentRow);
+    await invoice.save();
+
+    const savedPayment = invoice.payments[invoice.payments.length - 1];
+
+    res.json({
+      success: true,
+      data: {
+        invoice,
+        journal,
+        payment: {
+          ...((savedPayment && typeof savedPayment.toObject === 'function'
+            ? savedPayment.toObject()
+            : savedPayment) || paymentRow),
+          invoice_id: invoice._id,
+          invoice_no: invoice.invoice_no,
+          invoice_date: invoice.invoice_date,
+          due_date: invoice.due_date,
+          customer_id: invoice.customer_id,
+          customer_name: invoice.customer_name,
+          customer_vat_trn: invoice.customer_vat_trn,
+          invoice_total: toNum(invoice.total_amount),
+          invoice_amount_paid: toNum(invoice.amount_paid),
+          invoice_status: invoice.status,
+        },
+        amount_applied: amount,
+        remaining: Math.max(0, remaining),
+      },
+    });
+  } catch (error) {
+    console.error('Error recording sales invoice payment:', error);
+    res.status(500).json({ success: false, error: 'Failed to record payment' });
+  }
+});
+
+// ─── VAT201 (UAE) — connected to Sales + POs + GL ────────────────────────────
+
+const EMIRATE_BOX = {
+  'abu dhabi': '1a',
+  abudhabi: '1a',
+  dubai: '1b',
+  sharjah: '1c',
+  ajman: '1d',
+  'umm al quwain': '1e',
+  'umm al-quwain': '1e',
+  uaq: '1e',
+  'ras al khaimah': '1f',
+  'ras al-khaimah': '1f',
+  rak: '1f',
+  fujairah: '1g',
+};
+
+function mapEmirateToBox(emirate) {
+  const key = String(emirate || '')
+    .trim()
+    .toLowerCase();
+  if (!key) return '1b'; // default Dubai if unspecified
+  return EMIRATE_BOX[key] || '1b';
+}
+
+function periodBounds(start, end) {
+  const period_start = new Date(start);
+  period_start.setHours(0, 0, 0, 0);
+  const period_end = new Date(end);
+  period_end.setHours(23, 59, 59, 999);
+  return { period_start, period_end };
+}
+
+async function nextVat201ReturnNo(periodEnd) {
+  const year = new Date(periodEnd).getFullYear() || new Date().getFullYear();
+  const prefix = `VAT201-${year}-`;
+  const latest = await Vat201Return.findOne({ return_no: new RegExp(`^${prefix}`) })
+    .sort({ return_no: -1 })
+    .select('return_no')
+    .lean();
+  let nextNum = 1;
+  if (latest?.return_no) {
+    const parts = String(latest.return_no).split('-');
+    const n = parseInt(parts[parts.length - 1], 10);
+    if (Number.isFinite(n)) nextNum = n + 1;
+  }
+  return `${prefix}${String(nextNum).padStart(3, '0')}`;
+}
+
+// Posted journals from booking/shipment invoices (services/invoice-gl.js, services/invoice-notes.js).
+// Reading the journals keeps cancellations, edits, notes and gateway charges in the period they were booked.
+const SHIPMENT_VAT_JOURNAL_KINDS = {
+  'Finance invoice': 'SHIPMENT_INVOICE',
+  'Finance invoice reversal': 'SHIPMENT_INVOICE_REVERSAL',
+  'Finance invoice payment': 'GATEWAY_CHARGE',
+  'Finance invoice payment void': 'GATEWAY_CHARGE_VOID',
+  'Finance credit note': 'CREDIT_NOTE',
+  'Finance debit note': 'DEBIT_NOTE',
+  'Finance note void': 'NOTE_VOID',
+};
+const UAE_STANDARD_VAT_RATE = 0.05;
+
+async function computeVat201Period(period_start, period_end) {
+  const invoiceStatuses = ['APPROVED', 'PARTIALLY_PAID', 'PAID'];
+  const poStatuses = ['APPROVED', 'PARTIALLY_RECEIVED', 'RECEIVED', 'CLOSED'];
+
+  const [invoices, customers, purchaseOrders, journals, shipmentJournals] = await Promise.all([
+    SalesInvoice.find({
+      status: { $in: invoiceStatuses },
+      invoice_date: { $gte: period_start, $lte: period_end },
+    })
+      .sort({ invoice_date: 1 })
+      .lean(),
+    SalesCustomer.find({}).lean(),
+    PurchaseOrder.find({
+      status: { $in: poStatuses },
+      po_date: { $gte: period_start, $lte: period_end },
+      tax_amount: { $gt: 0 },
+    })
+      .sort({ po_date: 1 })
+      .lean(),
+    JournalEntry.find({
+      status: 'POSTED',
+      entry_date: { $gte: period_start, $lte: period_end },
+      $or: [{ 'lines.account_code': '2200' }, { 'lines.account_code': '1310' }],
+      // Settling a filed return clears 2200/1310 against the bank; it is not tax for this period.
+      source_label: { $ne: 'VAT201 settlement' },
+    })
+      .select('entry_no entry_date source_reference source_label lines memo')
+      .lean(),
+    JournalEntry.find({
+      status: 'POSTED',
+      entry_date: { $gte: period_start, $lte: period_end },
+      source_label: { $in: Object.keys(SHIPMENT_VAT_JOURNAL_KINDS) },
+    })
+      .sort({ entry_date: 1, entry_no: 1 })
+      .select('_id entry_no entry_date source_reference source_label lines memo')
+      .lean(),
+  ]);
+
+  const customerById = new Map(customers.map((c) => [String(c._id), c]));
+
+  const emirateSupplies = {
+    '1a': 0,
+    '1b': 0,
+    '1c': 0,
+    '1d': 0,
+    '1e': 0,
+    '1f': 0,
+    '1g': 0,
+  };
+  let outputVat = 0;
+  let zeroRatedSupplies = 0;
+  let standardSupplies = 0;
+  const salesSources = [];
+
+  for (const inv of invoices) {
+    const cust = inv.customer_id ? customerById.get(String(inv.customer_id)) : null;
+    const box = mapEmirateToBox(cust?.emirate || inv.emirate);
+    let invStandard = 0;
+    let invZero = 0;
+    let invVat = 0;
+
+    for (const line of inv.lines || []) {
+      const rate = toNum(line.vat_rate);
+      const sub = toNum(line.line_subtotal);
+      const vat = toNum(line.line_vat);
+      if (rate <= 0) {
+        invZero += sub;
+      } else {
+        invStandard += sub;
+        invVat += vat;
+      }
+    }
+
+    // Fallback if lines empty but invoice totals exist
+    if (!(inv.lines || []).length) {
+      invStandard = toNum(inv.subtotal);
+      invVat = toNum(inv.vat_amount);
+    }
+
+    emirateSupplies[box] = Number((emirateSupplies[box] + invStandard).toFixed(2));
+    standardSupplies = Number((standardSupplies + invStandard).toFixed(2));
+    zeroRatedSupplies = Number((zeroRatedSupplies + invZero).toFixed(2));
+    outputVat = Number((outputVat + invVat).toFixed(2));
+
+    salesSources.push({
+      type: 'SALES_INVOICE',
+      id: inv._id,
+      ref: inv.invoice_no,
+      date: inv.invoice_date,
+      customer: inv.customer_name,
+      customer_trn: inv.customer_vat_trn || cust?.vat_trn || null,
+      emirate_box: box,
+      taxable_supplies: Number(invStandard.toFixed(2)),
+      zero_rated: Number(invZero.toFixed(2)),
+      output_vat: Number(invVat.toFixed(2)),
+      journal_no: inv.invoice_journal_no || null,
+      status: inv.status,
+    });
+  }
+
+  // Shipment invoices are supplied from the Dubai establishment, so standard-rated value goes to box 1b.
+  // Revenue lines (4xxx) are the supply value; the part carrying 5% VAT is standard-rated, the rest zero-rated.
+  let shipmentCount = 0;
+  for (const je of shipmentJournals) {
+    let vat = 0;
+    let revenue = 0;
+    for (const line of je.lines || []) {
+      const code = String(line.account_code || '');
+      const net = toNum(line.credit) - toNum(line.debit);
+      if (code === '2200') vat += net;
+      else if (code.startsWith('4')) revenue += net;
+    }
+    vat = Number(vat.toFixed(2));
+    revenue = Number(revenue.toFixed(2));
+    if (vat === 0 && revenue === 0) continue;
+
+    let standard = 0;
+    let zero = revenue;
+    if (vat !== 0) {
+      standard = Number((vat / UAE_STANDARD_VAT_RATE).toFixed(2));
+      if (Math.abs(standard) > Math.abs(revenue) || Math.abs(revenue - standard) < 0.05) standard = revenue;
+      zero = Number((revenue - standard).toFixed(2));
+    }
+
+    const kind = SHIPMENT_VAT_JOURNAL_KINDS[je.source_label] || 'SHIPMENT_INVOICE';
+    const memoCustomer = String(je.memo || '').split(' — ')[1];
+    emirateSupplies['1b'] = Number((emirateSupplies['1b'] + standard).toFixed(2));
+    standardSupplies = Number((standardSupplies + standard).toFixed(2));
+    zeroRatedSupplies = Number((zeroRatedSupplies + zero).toFixed(2));
+    outputVat = Number((outputVat + vat).toFixed(2));
+    if (kind === 'SHIPMENT_INVOICE') shipmentCount += 1;
+
+    salesSources.push({
+      type: kind,
+      id: je._id,
+      ref: je.source_reference || je.entry_no,
+      date: je.entry_date,
+      customer: memoCustomer ? memoCustomer.replace(/\s*\(.*\)$/, '').trim() : je.source_label,
+      customer_trn: null,
+      emirate_box: '1b',
+      taxable_supplies: standard,
+      zero_rated: zero,
+      output_vat: vat,
+      journal_no: je.entry_no,
+      status: 'POSTED',
+    });
+  }
+  salesSources.sort((a, b) => new Date(a.date) - new Date(b.date));
+
+  const box1Total = Object.values(emirateSupplies).reduce((s, v) => s + v, 0);
+  const box3 = Number(box1Total.toFixed(2)); // + tourist refunds (box2=0)
+  const box4 = Number(outputVat.toFixed(2));
+
+  let inputExpensesExVat = 0;
+  let inputVat = 0;
+  const purchaseSources = [];
+
+  for (const po of purchaseOrders) {
+    const tax = toNum(po.tax_amount);
+    const net = toNum(po.subtotal) || Number((toNum(po.total_amount) - tax).toFixed(2));
+    inputExpensesExVat = Number((inputExpensesExVat + net).toFixed(2));
+    inputVat = Number((inputVat + tax).toFixed(2));
+    purchaseSources.push({
+      type: 'PURCHASE_ORDER',
+      id: po._id,
+      ref: po.po_no,
+      date: po.po_date,
+      supplier: po.supplier_name,
+      expenses_ex_vat: Number(net.toFixed(2)),
+      input_vat: Number(tax.toFixed(2)),
+      journal_no: po.journal_entry_no || null,
+      status: po.status,
+    });
+  }
+
+  // GL reconciliation from posted VAT journals
+  let glOutputCredits = 0;
+  let glOutputDebits = 0;
+  let glInputDebits = 0;
+  let glInputCredits = 0;
+  const glSources = [];
+
+  for (const je of journals) {
+    for (const line of je.lines || []) {
+      const code = String(line.account_code || '');
+      const debit = toNum(line.debit);
+      const credit = toNum(line.credit);
+      if (code === '2200') {
+        glOutputCredits += credit;
+        glOutputDebits += debit;
+        if (credit > 0 || debit > 0) {
+          glSources.push({
+            side: 'OUTPUT',
+            entry_no: je.entry_no,
+            date: je.entry_date,
+            ref: je.source_reference,
+            debit,
+            credit,
+          });
+        }
+      }
+      if (code === '1310') {
+        glInputDebits += debit;
+        glInputCredits += credit;
+        if (credit > 0 || debit > 0) {
+          glSources.push({
+            side: 'INPUT',
+            entry_no: je.entry_no,
+            date: je.entry_date,
+            ref: je.source_reference,
+            debit,
+            credit,
+          });
+        }
+      }
+    }
+  }
+
+  const glOutputNet = Number((glOutputCredits - glOutputDebits).toFixed(2));
+  const glInputNet = Number((glInputDebits - glInputCredits).toFixed(2));
+
+  const box9 = Number(zeroRatedSupplies.toFixed(2)); // using box 9 slot for zero-rated value in our simplified form
+  // FTA mapping we expose clearly in UI:
+  // boxes.standard_by_emirate 1a-1g, box3 total supplies, box4 output tax,
+  // box10 zero-rated, box12 expenses, box13 input VAT, box16 net payable
+
+  const box12 = Number(inputExpensesExVat.toFixed(2));
+  const box13 = Number(inputVat.toFixed(2));
+  const totalOutputTax = box4; // + reverse charge etc. = 0
+  const totalRecoverable = box13;
+  const netPayable = Number((totalOutputTax - totalRecoverable).toFixed(2));
+
+  const vatTraders = customers.filter((c) => c.is_vat_registered || c.is_official_trader);
+
+  return {
+    period_start,
+    period_end,
+    boxes: {
+      '1a_abu_dhabi': emirateSupplies['1a'],
+      '1b_dubai': emirateSupplies['1b'],
+      '1c_sharjah': emirateSupplies['1c'],
+      '1d_ajman': emirateSupplies['1d'],
+      '1e_uaq': emirateSupplies['1e'],
+      '1f_rak': emirateSupplies['1f'],
+      '1g_fujairah': emirateSupplies['1g'],
+      box2_tourist_refunds: 0,
+      box3_total_supplies: box3,
+      box4_output_vat: box4,
+      box5_rcm_supplies: 0,
+      box6_rcm_vat: 0,
+      box7_zero_rated_goods: box9,
+      box8_exempt: 0,
+      box9_imports: 0,
+      box10_adjustments_output: 0,
+      box11_total_output_vat: totalOutputTax,
+      box12_expenses_ex_vat: box12,
+      box13_input_vat: box13,
+      box14_adjustments_input: 0,
+      box15_total_recoverable: totalRecoverable,
+      box16_net_vat: netPayable,
+    },
+    net_vat_payable: netPayable,
+    sources: {
+      sales_invoices: salesSources,
+      purchase_orders: purchaseSources,
+      vat_traders_count: vatTraders.length,
+      sales_count: salesSources.length,
+      sales_invoice_count: invoices.length,
+      shipment_invoice_count: shipmentCount,
+      purchase_count: purchaseSources.length,
+    },
+    gl_reconciliation: {
+      output_account: '2200',
+      input_account: '1310',
+      gl_output_vat_net: glOutputNet,
+      gl_input_vat_net: glInputNet,
+      doc_output_vat: box4,
+      doc_input_vat: box13,
+      output_variance: Number((glOutputNet - box4).toFixed(2)),
+      input_variance: Number((glInputNet - box13).toFixed(2)),
+      journal_lines: glSources.slice(0, 100),
+    },
+  };
+}
+
+router.get('/vat201/overview', auth, async (req, res) => {
+  try {
+    await ensureSalesAccounts(actorFromReq(req));
+    await ensurePoAccounts(actorFromReq(req));
+
+    const returns = await Vat201Return.find({}).sort({ period_end: -1 }).limit(20).lean();
+    const now = new Date();
+    const qStart = new Date(now.getFullYear(), Math.floor(now.getMonth() / 3) * 3, 1);
+    const qEnd = new Date(qStart.getFullYear(), qStart.getMonth() + 3, 0, 23, 59, 59, 999);
+    const preview = await computeVat201Period(qStart, qEnd);
+
+    res.json({
+      success: true,
+      data: {
+        current_quarter: {
+          label: `Q${Math.floor(now.getMonth() / 3) + 1} ${now.getFullYear()}`,
+          period_start: qStart,
+          period_end: qEnd,
+          ...preview,
+        },
+        returns,
+        connections: {
+          sales: '/dashboard/accounting/sales',
+          purchase_orders: '/dashboard/accounting/purchase-orders',
+          journals: '/dashboard/accounting/journals',
+          output_gl: '2200',
+          input_gl: '1310',
+        },
+      },
+    });
+  } catch (error) {
+    console.error('Error loading VAT201 overview:', error);
+    res.status(500).json({ success: false, error: 'Failed to load VAT201 overview' });
+  }
+});
+
+router.get('/vat201/compute', auth, async (req, res) => {
+  try {
+    const start = req.query.from || req.query.period_start;
+    const end = req.query.to || req.query.period_end;
+    if (!start || !end) {
+      return res.status(400).json({ success: false, error: 'from and to dates are required' });
+    }
+    const { period_start, period_end } = periodBounds(start, end);
+    if (Number.isNaN(period_start.getTime()) || Number.isNaN(period_end.getTime())) {
+      return res.status(400).json({ success: false, error: 'Invalid date range' });
+    }
+    await ensureSalesAccounts(actorFromReq(req));
+    await ensurePoAccounts(actorFromReq(req));
+    const data = await computeVat201Period(period_start, period_end);
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('Error computing VAT201:', error);
+    res.status(500).json({ success: false, error: 'Failed to compute VAT201' });
+  }
+});
+
+router.get('/vat201/returns', auth, async (req, res) => {
+  try {
+    const returns = await Vat201Return.find({}).sort({ period_end: -1 }).lean();
+    res.json({ success: true, data: returns });
+  } catch (error) {
+    console.error('Error listing VAT201 returns:', error);
+    res.status(500).json({ success: false, error: 'Failed to list VAT201 returns' });
+  }
+});
+
+router.get('/vat201/returns/:id', auth, async (req, res) => {
+  try {
+    const row = await Vat201Return.findById(req.params.id).lean();
+    if (!row) return res.status(404).json({ success: false, error: 'VAT201 return not found' });
+    res.json({ success: true, data: row });
+  } catch (error) {
+    console.error('Error fetching VAT201 return:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch VAT201 return' });
+  }
+});
+
+router.post('/vat201/returns', auth, async (req, res) => {
+  try {
+    const actor = actorFromReq(req);
+    await ensureSalesAccounts(actor);
+    await ensurePoAccounts(actor);
+
+    const start = req.body?.period_start || req.body?.from;
+    const end = req.body?.period_end || req.body?.to;
+    if (!start || !end) {
+      return res.status(400).json({ success: false, error: 'period_start and period_end are required' });
+    }
+    const { period_start, period_end } = periodBounds(start, end);
+    const computed = await computeVat201Period(period_start, period_end);
+
+    const label =
+      String(req.body?.period_label || '').trim() ||
+      `${period_start.toISOString().slice(0, 10)} → ${period_end.toISOString().slice(0, 10)}`;
+
+    const return_no = await nextVat201ReturnNo(period_end);
+    const row = await Vat201Return.create({
+      return_no,
+      period_label: label,
+      period_start,
+      period_end,
+      status: 'READY',
+      boxes: computed.boxes,
+      sources: computed.sources,
+      gl_reconciliation: computed.gl_reconciliation,
+      net_vat_payable: computed.net_vat_payable,
+      notes: String(req.body?.notes || '').trim(),
+      ...actor,
+    });
+
+    res.status(201).json({ success: true, data: row });
+  } catch (error) {
+    console.error('Error creating VAT201 return:', error);
+    res.status(500).json({ success: false, error: 'Failed to create VAT201 return' });
+  }
+});
+
+router.post('/vat201/returns/:id/refresh', auth, async (req, res) => {
+  try {
+    const row = await Vat201Return.findById(req.params.id);
+    if (!row) return res.status(404).json({ success: false, error: 'VAT201 return not found' });
+    if (['FILED', 'SETTLED'].includes(row.status)) {
+      return res.status(400).json({ success: false, error: 'Filed/settled returns cannot be refreshed' });
+    }
+
+    const computed = await computeVat201Period(row.period_start, row.period_end);
+    row.boxes = computed.boxes;
+    row.sources = computed.sources;
+    row.gl_reconciliation = computed.gl_reconciliation;
+    row.net_vat_payable = computed.net_vat_payable;
+    row.status = 'READY';
+    await row.save();
+    res.json({ success: true, data: row });
+  } catch (error) {
+    console.error('Error refreshing VAT201 return:', error);
+    res.status(500).json({ success: false, error: 'Failed to refresh VAT201 return' });
+  }
+});
+
+router.post('/vat201/returns/:id/file', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only Finance Manager / Admin can file VAT201',
+      });
+    }
+
+    const row = await Vat201Return.findById(req.params.id);
+    if (!row) return res.status(404).json({ success: false, error: 'VAT201 return not found' });
+    if (['FILED', 'SETTLED'].includes(row.status)) {
+      return res.status(400).json({ success: false, error: 'Return already filed' });
+    }
+
+    // Refresh snapshot at filing time
+    const computed = await computeVat201Period(row.period_start, row.period_end);
+    row.boxes = computed.boxes;
+    row.sources = computed.sources;
+    row.gl_reconciliation = computed.gl_reconciliation;
+    row.net_vat_payable = computed.net_vat_payable;
+    row.status = 'FILED';
+    row.filed_at = new Date();
+    row.filed_by_name = actorFromReq(req).created_by_name;
+    row.filed_by_email = actorFromReq(req).created_by_email;
+    if (req.body?.notes) row.notes = String(req.body.notes).trim();
+    await row.save();
+
+    res.json({ success: true, data: row });
+  } catch (error) {
+    console.error('Error filing VAT201 return:', error);
+    res.status(500).json({ success: false, error: 'Failed to file VAT201 return' });
+  }
+});
+
+router.post('/vat201/returns/:id/settle', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only Finance Manager / Admin can settle VAT201',
+      });
+    }
+
+    const row = await Vat201Return.findById(req.params.id);
+    if (!row) return res.status(404).json({ success: false, error: 'VAT201 return not found' });
+    if (row.status !== 'FILED') {
+      return res.status(400).json({
+        success: false,
+        error: 'File the return before settling VAT',
+      });
+    }
+    if (row.settlement_journal_id) {
+      return res.status(400).json({ success: false, error: 'Already settled' });
+    }
+
+    await ensureSalesAccounts(actorFromReq(req));
+    const actor = actorFromReq(req);
+    const net = toNum(row.net_vat_payable);
+    const settleDate = req.body?.settlement_date
+      ? new Date(req.body.settlement_date)
+      : new Date();
+
+    const outputGl = await loadPostableAccount('2200');
+    const inputGl = await loadPostableAccount('1310');
+    const bankCode = String(req.body?.bank_account_code || glCode('1100')).trim();
+    const bankGl = await loadPostableAccount(bankCode);
+
+    if (!outputGl || !inputGl || !bankGl) {
+      return res.status(400).json({ success: false, error: 'VAT/bank GL accounts not postable' });
+    }
+
+    const outputVat = toNum(row.boxes?.box11_total_output_vat ?? row.boxes?.box4_output_vat);
+    const inputVat = toNum(row.boxes?.box15_total_recoverable ?? row.boxes?.box13_input_vat);
+
+    // Clear output liability and input asset; difference goes to bank
+    // Dr VAT Output (clear credit balance) = outputVat
+    //   Cr VAT Input (clear debit balance) = inputVat
+    //   Cr Bank (if payable) OR Dr Bank (if refund) = |net|
+    const lines = [];
+    if (outputVat > 0) {
+      lines.push({
+        account_id: outputGl._id,
+        account_code: outputGl.code,
+        account_name: outputGl.name,
+        description: `Clear VAT output ${row.return_no}`,
+        debit: outputVat,
+        credit: 0,
+      });
+    }
+    if (inputVat > 0) {
+      lines.push({
+        account_id: inputGl._id,
+        account_code: inputGl.code,
+        account_name: inputGl.name,
+        description: `Clear VAT input ${row.return_no}`,
+        debit: 0,
+        credit: inputVat,
+      });
+    }
+
+    if (net > 0.009) {
+      // Payable to FTA — credit bank (payment out) wait: paying VAT decreases bank → Cr Bank
+      lines.push({
+        account_id: bankGl._id,
+        account_code: bankGl.code,
+        account_name: bankGl.name,
+        description: `VAT201 payment ${row.return_no}`,
+        debit: 0,
+        credit: net,
+      });
+    } else if (net < -0.009) {
+      const refund = Math.abs(net);
+      lines.push({
+        account_id: bankGl._id,
+        account_code: bankGl.code,
+        account_name: bankGl.name,
+        description: `VAT201 refund ${row.return_no}`,
+        debit: refund,
+        credit: 0,
+      });
+    }
+
+    const cleaned = lines.filter((l) => l.debit > 0 || l.credit > 0);
+    if (cleaned.length < 2) {
+      // Nothing to settle (zero net and zero boxes)
+      row.status = 'SETTLED';
+      row.settled_at = settleDate;
+      await row.save();
+      return res.json({ success: true, data: { return: row, journal: null } });
+    }
+
+    const totalDebit = cleaned.reduce((s, l) => s + l.debit, 0);
+    const totalCredit = cleaned.reduce((s, l) => s + l.credit, 0);
+    if (Math.abs(totalDebit - totalCredit) > 0.02) {
+      return res.status(400).json({
+        success: false,
+        error: `Settlement journal unbalanced (${totalDebit} vs ${totalCredit})`,
+      });
+    }
+
+    const entry_no = await nextJournalEntryNo(settleDate);
+    const journal = await JournalEntry.create({
+      entry_no,
+      entry_date: settleDate,
+      memo: `VAT201 settlement ${row.return_no} — ${row.period_label}`,
+      source: 'ADJUSTMENT',
+      status: 'POSTED',
+      lines: cleaned,
+      total_debit: Number(totalDebit.toFixed(2)),
+      total_credit: Number(totalCredit.toFixed(2)),
+      posted_at: new Date(),
+      source_reference: row.return_no,
+      source_label: 'VAT201 settlement',
+      ...actor,
+    });
+
+    // Update bank wallet if settling against a bank-cash linked GL
+    const wallet = await BankCashAccount.findOne({
+      gl_account_code: bankGl.code,
+      is_active: true,
+    });
+    if (wallet && Math.abs(net) > 0.009) {
+      if (net > 0) {
+        wallet.current_balance = Number((toNum(wallet.current_balance) - net).toFixed(2));
+      } else {
+        wallet.current_balance = Number((toNum(wallet.current_balance) + Math.abs(net)).toFixed(2));
+      }
+      await wallet.save();
+    }
+
+    row.status = 'SETTLED';
+    row.settled_at = settleDate;
+    row.settlement_journal_id = journal._id;
+    row.settlement_journal_no = journal.entry_no;
+    await row.save();
+
+    res.json({ success: true, data: { return: row, journal } });
+  } catch (error) {
+    console.error('Error settling VAT201:', error);
+    res.status(500).json({ success: false, error: 'Failed to settle VAT201' });
+  }
+});
+
+// ─── E-Invoicing (UAE PINT AE via Accredited Service Provider) ───────────────
+
+const E_INVOICE_ELIGIBLE_SALES_STATUSES = ['APPROVED', 'PARTIALLY_PAID', 'PAID'];
+const E_INVOICE_EDITABLE = ['DRAFT', 'INVALID', 'VALIDATED', 'REJECTED'];
+
+async function nextEInvoiceNo(date) {
+  const year = new Date(date || Date.now()).getFullYear() || new Date().getFullYear();
+  const prefix = `EINV-${year}-`;
+  const latest = await EInvoice.findOne({ einvoice_no: new RegExp(`^${prefix}`) })
+    .sort({ einvoice_no: -1 })
+    .select('einvoice_no')
+    .lean();
+  let nextNum = 1;
+  if (latest?.einvoice_no) {
+    const n = parseInt(String(latest.einvoice_no).split('-').pop(), 10);
+    if (Number.isFinite(n)) nextNum = n + 1;
+  }
+  return `${prefix}${String(nextNum).padStart(6, '0')}`;
+}
+
+function pushEInvoiceHistory(doc, status, actor, note) {
+  doc.status_history.push({
+    status,
+    at: new Date(),
+    by_name: actor?.created_by_name,
+    by_email: actor?.created_by_email,
+    note,
+  });
+}
+
+async function refreshEInvoiceSnapshot(doc, invoice, actor, note) {
+  const customer = invoice.customer_id
+    ? await SalesCustomer.findById(invoice.customer_id).lean()
+    : null;
+  const snap = einvoicing.buildSnapshot(invoice, customer);
+  Object.assign(doc, snap);
+
+  const plain = { ...doc.toObject(), ...snap };
+  const { errors, warnings } = einvoicing.validateSnapshot(plain, invoice);
+  doc.xml = einvoicing.buildUblXml(plain);
+  doc.xml_sha256 = einvoicing.sha256(doc.xml);
+  doc.is_valid = errors.length === 0;
+  doc.validation_errors = errors;
+  doc.validation_warnings = warnings;
+  doc.validated_at = new Date();
+  doc.status = errors.length ? 'INVALID' : 'VALIDATED';
+  pushEInvoiceHistory(
+    doc,
+    doc.status,
+    actor,
+    errors.length ? `${note} — ${errors.length} error(s)` : note
+  );
+}
+
+async function generateEInvoiceForSalesInvoice(invoice, actor) {
+  const existing = await EInvoice.findOne({
+    sales_invoice_id: invoice._id,
+    status: { $ne: 'CANCELLED' },
+  });
+  if (existing) return { doc: existing, created: false };
+
+  const doc = new EInvoice({
+    einvoice_no: await nextEInvoiceNo(invoice.invoice_date),
+    uuid: crypto.randomUUID(),
+    document_type: 'TAX_INVOICE',
+    sales_invoice_id: invoice._id,
+    sales_invoice_no: invoice.invoice_no,
+    issue_date: invoice.invoice_date,
+    ...actor,
+  });
+  await refreshEInvoiceSnapshot(doc, invoice, actor, 'Generated from approved sales invoice');
+  await doc.save();
+  return { doc, created: true };
+}
+
+async function eligibleSalesInvoicesForEInvoice() {
+  const taken = await EInvoice.find({ status: { $ne: 'CANCELLED' } }).distinct('sales_invoice_id');
+  return SalesInvoice.find({
+    status: { $in: E_INVOICE_ELIGIBLE_SALES_STATUSES },
+    _id: { $nin: taken },
+  })
+    .sort({ invoice_date: -1 })
+    .select('invoice_no invoice_date customer_name customer_vat_trn customer_is_vat_registered total_amount vat_amount status currency')
+    .lean();
+}
+
+router.get('/einvoicing/overview', auth, async (req, res) => {
+  try {
+    const [byStatus, eligible, recent] = await Promise.all([
+      EInvoice.aggregate([
+        { $group: { _id: '$status', count: { $sum: 1 }, total: { $sum: '$total_amount' }, vat: { $sum: '$vat_amount' } } },
+      ]),
+      eligibleSalesInvoicesForEInvoice(),
+      EInvoice.find({}).sort({ createdAt: -1 }).limit(8).select('-xml').lean(),
+    ]);
+
+    const counts = Object.fromEntries(byStatus.map((s) => [s._id, s.count]));
+    const exchanged = byStatus
+      .filter((s) => ['SUBMITTED', 'DELIVERED', 'ACCEPTED'].includes(s._id))
+      .reduce((acc, s) => ({ total: acc.total + s.total, vat: acc.vat + s.vat, count: acc.count + s.count }), {
+        total: 0,
+        vat: 0,
+        count: 0,
+      });
+    const asp = einvoicing.aspConfig();
+
+    res.json({
+      success: true,
+      data: {
+        counts,
+        eligible_count: eligible.length,
+        exchanged: {
+          count: exchanged.count,
+          total: Number(exchanged.total.toFixed(2)),
+          vat: Number(exchanged.vat.toFixed(2)),
+        },
+        asp: { configured: asp.configured, mode: asp.mode, provider: asp.provider },
+        seller: einvoicing.sellerProfile(),
+        recent,
+        connections: {
+          sales: '/dashboard/accounting/sales',
+          vat201: '/dashboard/accounting/vat201',
+        },
+      },
+    });
+  } catch (error) {
+    console.error('Error loading e-invoicing overview:', error);
+    res.status(500).json({ success: false, error: 'Failed to load e-invoicing overview' });
+  }
+});
+
+router.get('/einvoicing/eligible', auth, async (req, res) => {
+  try {
+    res.json({ success: true, data: await eligibleSalesInvoicesForEInvoice() });
+  } catch (error) {
+    console.error('Error listing e-invoice eligible sales invoices:', error);
+    res.status(500).json({ success: false, error: 'Failed to list eligible invoices' });
+  }
+});
+
+router.get('/einvoicing/documents', auth, async (req, res) => {
+  try {
+    const filter = {};
+    if (req.query.status) filter.status = String(req.query.status).toUpperCase();
+    const q = String(req.query.q || '').trim();
+    if (q) {
+      const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      filter.$or = [{ einvoice_no: rx }, { sales_invoice_no: rx }, { 'buyer.name': rx }, { 'buyer.trn': rx }];
+    }
+    const rows = await EInvoice.find(filter).sort({ createdAt: -1 }).limit(500).select('-xml').lean();
+    res.json({ success: true, data: rows });
+  } catch (error) {
+    console.error('Error listing e-invoices:', error);
+    res.status(500).json({ success: false, error: 'Failed to list e-invoices' });
+  }
+});
+
+router.get('/einvoicing/documents/:id', auth, async (req, res) => {
+  try {
+    const row = await EInvoice.findById(req.params.id).lean();
+    if (!row) return res.status(404).json({ success: false, error: 'E-invoice not found' });
+    res.json({ success: true, data: row });
+  } catch (error) {
+    console.error('Error fetching e-invoice:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch e-invoice' });
+  }
+});
+
+router.get('/einvoicing/documents/:id/xml', auth, async (req, res) => {
+  try {
+    const row = await EInvoice.findById(req.params.id).select('einvoice_no xml').lean();
+    if (!row?.xml) return res.status(404).json({ success: false, error: 'E-invoice XML not found' });
+    res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${row.einvoice_no}.xml"`);
+    res.send(row.xml);
+  } catch (error) {
+    console.error('Error downloading e-invoice XML:', error);
+    res.status(500).json({ success: false, error: 'Failed to download XML' });
+  }
+});
+
+router.post('/einvoicing/documents', auth, async (req, res) => {
+  try {
+    const invoice = await SalesInvoice.findById(req.body?.sales_invoice_id);
+    if (!invoice) return res.status(404).json({ success: false, error: 'Sales invoice not found' });
+    if (!E_INVOICE_ELIGIBLE_SALES_STATUSES.includes(invoice.status)) {
+      return res.status(400).json({
+        success: false,
+        error: `Sales invoice is ${invoice.status}; approve it in Sales first`,
+      });
+    }
+    const { doc, created } = await generateEInvoiceForSalesInvoice(invoice, actorFromReq(req));
+    res.status(created ? 201 : 200).json({ success: true, data: doc, created });
+  } catch (error) {
+    console.error('Error generating e-invoice:', error);
+    res.status(500).json({ success: false, error: 'Failed to generate e-invoice' });
+  }
+});
+
+router.post('/einvoicing/generate-all', auth, async (req, res) => {
+  try {
+    const actor = actorFromReq(req);
+    const eligible = await eligibleSalesInvoicesForEInvoice();
+    const results = { created: 0, valid: 0, invalid: 0 };
+    for (const row of eligible) {
+      const invoice = await SalesInvoice.findById(row._id);
+      if (!invoice) continue;
+      const { doc, created } = await generateEInvoiceForSalesInvoice(invoice, actor);
+      if (!created) continue;
+      results.created += 1;
+      if (doc.status === 'VALIDATED') results.valid += 1;
+      else results.invalid += 1;
+    }
+    res.json({ success: true, data: results });
+  } catch (error) {
+    console.error('Error bulk-generating e-invoices:', error);
+    res.status(500).json({ success: false, error: 'Failed to generate e-invoices' });
+  }
+});
+
+router.post('/einvoicing/documents/:id/revalidate', auth, async (req, res) => {
+  try {
+    const doc = await EInvoice.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, error: 'E-invoice not found' });
+    if (!E_INVOICE_EDITABLE.includes(doc.status)) {
+      return res.status(400).json({
+        success: false,
+        error: `E-invoice is ${doc.status}; it can no longer be changed`,
+      });
+    }
+    const invoice = await SalesInvoice.findById(doc.sales_invoice_id);
+    if (!invoice) return res.status(404).json({ success: false, error: 'Source sales invoice not found' });
+    await refreshEInvoiceSnapshot(doc, invoice, actorFromReq(req), 'Revalidated against latest sales data');
+    await doc.save();
+    res.json({ success: true, data: doc });
+  } catch (error) {
+    console.error('Error revalidating e-invoice:', error);
+    res.status(500).json({ success: false, error: 'Failed to revalidate e-invoice' });
+  }
+});
+
+router.post('/einvoicing/documents/:id/submit', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only Finance Manager / Admin can submit e-invoices',
+      });
+    }
+    const doc = await EInvoice.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, error: 'E-invoice not found' });
+    if (doc.status !== 'VALIDATED') {
+      return res.status(400).json({
+        success: false,
+        error: `Only VALIDATED e-invoices can be submitted (current: ${doc.status})`,
+      });
+    }
+    if (doc.transaction_type !== 'B2B') {
+      return res.status(400).json({
+        success: false,
+        error: 'B2C invoices are outside the UAE e-invoice exchange scope and are kept for records only',
+      });
+    }
+
+    const actor = actorFromReq(req);
+    const asp = einvoicing.aspConfig();
+    if (asp.configured) {
+      try {
+        const result = await einvoicing.submitToAsp(doc);
+        doc.asp_reference = result.reference || undefined;
+        doc.asp_response = result.response;
+      } catch (aspError) {
+        doc.asp_response = aspError.response || { error: aspError.message };
+        pushEInvoiceHistory(doc, 'VALIDATED', actor, `ASP submission failed: ${aspError.message}`);
+        await doc.save();
+        return res.status(502).json({ success: false, error: `ASP submission failed: ${aspError.message}` });
+      }
+    } else {
+      doc.asp_reference = `SANDBOX-${doc.uuid.slice(0, 8).toUpperCase()}`;
+      doc.asp_response = { mode: 'SANDBOX', note: 'No ASP configured; not transmitted to FTA' };
+    }
+
+    doc.transmission_mode = asp.mode;
+    doc.status = 'SUBMITTED';
+    doc.submitted_at = new Date();
+    doc.submitted_by_name = actor.created_by_name;
+    pushEInvoiceHistory(
+      doc,
+      'SUBMITTED',
+      actor,
+      asp.configured ? `Sent to ${asp.provider}` : 'Recorded in sandbox (no ASP configured)'
+    );
+    await doc.save();
+    res.json({ success: true, data: doc });
+  } catch (error) {
+    console.error('Error submitting e-invoice:', error);
+    res.status(500).json({ success: false, error: 'Failed to submit e-invoice' });
+  }
+});
+
+router.post('/einvoicing/documents/:id/status', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only Finance Manager / Admin can record ASP responses',
+      });
+    }
+    const next = String(req.body?.status || '').toUpperCase();
+    if (!['DELIVERED', 'ACCEPTED', 'REJECTED'].includes(next)) {
+      return res.status(400).json({ success: false, error: 'Status must be DELIVERED, ACCEPTED or REJECTED' });
+    }
+    const doc = await EInvoice.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, error: 'E-invoice not found' });
+    if (!['SUBMITTED', 'DELIVERED'].includes(doc.status)) {
+      return res.status(400).json({
+        success: false,
+        error: `Responses can only be recorded for submitted e-invoices (current: ${doc.status})`,
+      });
+    }
+    const note = String(req.body?.note || '').trim();
+    if (next === 'REJECTED' && !note) {
+      return res.status(400).json({ success: false, error: 'A rejection reason is required' });
+    }
+    if (req.body?.asp_reference) doc.asp_reference = String(req.body.asp_reference).trim();
+    doc.status = next;
+    pushEInvoiceHistory(doc, next, actorFromReq(req), note || undefined);
+    await doc.save();
+    res.json({ success: true, data: doc });
+  } catch (error) {
+    console.error('Error updating e-invoice status:', error);
+    res.status(500).json({ success: false, error: 'Failed to update e-invoice status' });
+  }
+});
+
+router.post('/einvoicing/documents/:id/cancel', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only Finance Manager / Admin can cancel e-invoices',
+      });
+    }
+    const doc = await EInvoice.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, error: 'E-invoice not found' });
+    if (!E_INVOICE_EDITABLE.includes(doc.status)) {
+      return res.status(400).json({
+        success: false,
+        error: `E-invoice is ${doc.status}; issue a credit note instead of cancelling`,
+      });
+    }
+    doc.status = 'CANCELLED';
+    pushEInvoiceHistory(doc, 'CANCELLED', actorFromReq(req), String(req.body?.note || '').trim() || undefined);
+    await doc.save();
+    res.json({ success: true, data: doc });
+  } catch (error) {
+    console.error('Error cancelling e-invoice:', error);
+    res.status(500).json({ success: false, error: 'Failed to cancel e-invoice' });
+  }
+});
+
+module.exports = router;

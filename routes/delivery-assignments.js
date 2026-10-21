@@ -1,0 +1,1263 @@
+const express = require('express');
+const mongoose = require('mongoose');
+const router = express.Router();
+const auth = require('../middleware/auth');
+const { DeliveryAssignment, Driver, ShipmentRequest, Invoice, Client } = require('../models/unified-schema');
+const crypto = require('crypto');
+const empostService = require('../services/empost-api');
+const { cleanupBookingIdentityDocumentsForDeliveredInvoiceRequest } = require('../utils/booking-identity-cleanup');
+
+const normalizeAssignmentStatus = (status) => {
+  if (status === 'DELIVERED') return 'DELIVERED';
+  if (status === 'CANCELLED') return 'CANCELLED';
+  return 'NOT_DELIVERED';
+};
+
+async function applyPayloadToExistingAssignment(existing, assignmentData, invoiceAmount) {
+  existing.amount = mongoose.Types.Decimal128.fromString(invoiceAmount.toFixed(2));
+  existing.client_id = assignmentData.client_id;
+  existing.delivery_type = assignmentData.delivery_type;
+  existing.delivery_address = assignmentData.delivery_address;
+  existing.receiver_name = assignmentData.receiver_name;
+  existing.receiver_phone = assignmentData.receiver_phone;
+  existing.receiver_address = assignmentData.receiver_address;
+  existing.delivery_instructions = assignmentData.delivery_instructions;
+  if (assignmentData.request_id) {
+    existing.request_id = assignmentData.request_id;
+  }
+  if (assignmentData.driver_id) {
+    existing.driver_id = assignmentData.driver_id;
+  }
+  await existing.save();
+  return existing;
+}
+
+async function toAssignmentResponsePayload(assignment) {
+  if (assignment.driver_id) {
+    await assignment.populate('driver_id', 'name phone vehicle_type vehicle_number');
+  }
+  if (assignment.request_id) {
+    await assignment.populate('request_id', 'request_id customer receiver');
+  }
+  await assignment.populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address');
+  await assignment.populate('client_id', 'company_name');
+  const assignmentResponse = assignment.toObject();
+  if (!assignmentResponse.receiver_name && assignmentResponse.invoice_id) {
+    assignmentResponse.receiver_name = assignmentResponse.invoice_id.receiver_name || 'N/A';
+  }
+  if (!assignmentResponse.receiver_phone && assignmentResponse.invoice_id) {
+    assignmentResponse.receiver_phone = assignmentResponse.invoice_id.receiver_phone || 'N/A';
+  }
+  if (!assignmentResponse.receiver_address && assignmentResponse.invoice_id) {
+    assignmentResponse.receiver_address =
+      assignmentResponse.invoice_id.receiver_address ||
+      assignmentResponse.delivery_address ||
+      'N/A';
+  }
+  return assignmentResponse;
+}
+
+// GET /api/delivery-assignments - Get all delivery assignments
+router.get('/', auth, async (req, res) => {
+  try {
+    const assignments = await DeliveryAssignment.find()
+      .populate('driver_id', 'name phone vehicle_type vehicle_number')
+      .populate('request_id', 'request_id customer receiver awb_number')
+      .populate('invoice_id', 'invoice_id total_amount amount awb_number receiver_name receiver_phone receiver_address')
+      .populate('client_id', 'company_name')
+      .sort({ createdAt: -1 });
+    
+    // Convert Decimal128 amounts to numbers and enrich with invoice data
+    const formattedAssignments = assignments.map(assignment => {
+      const assignmentData = assignment.toObject();
+      
+      // Convert amount from Decimal128 to number
+      if (assignmentData.amount) {
+        assignmentData.amount = typeof assignmentData.amount === 'object'
+          ? parseFloat(assignmentData.amount.toString())
+          : parseFloat(assignmentData.amount);
+      }
+      
+      // If receiver info is missing, try to get it from invoice
+      if (!assignmentData.receiver_name && assignmentData.invoice_id) {
+        assignmentData.receiver_name = assignmentData.invoice_id.receiver_name || 
+                                       assignmentData.invoice_id.request_id?.receiver?.name || 
+                                       'N/A';
+      }
+      
+      if (!assignmentData.receiver_phone && assignmentData.invoice_id) {
+        assignmentData.receiver_phone = assignmentData.invoice_id.receiver_phone || 
+                                        assignmentData.invoice_id.request_id?.receiver?.phone || 
+                                        'N/A';
+      }
+      
+      if (!assignmentData.receiver_address && assignmentData.invoice_id) {
+        assignmentData.receiver_address = assignmentData.invoice_id.receiver_address || 
+                                         assignmentData.invoice_id.request_id?.receiver?.address || 
+                                         assignmentData.delivery_address || 
+                                         'N/A';
+      }
+      
+      // If assignment_id is in old format (DA-000001) but invoice has AWB number, use AWB as assignment_id
+      if (assignmentData.invoice_id?.awb_number && 
+          assignmentData.assignment_id && 
+          assignmentData.assignment_id.startsWith('DA-')) {
+        // Replace old DA- format with AWB number (tracking ID)
+        assignmentData.assignment_id = assignmentData.invoice_id.awb_number;
+        console.log(`🔄 Updated assignment_id from DA- format to AWB: ${assignmentData.invoice_id.awb_number}`);
+      }
+
+      const normalizedStatus = normalizeAssignmentStatus(assignmentData.status);
+      if (assignmentData.status !== normalizedStatus) {
+        assignmentData.status = normalizedStatus;
+      }
+      
+      return assignmentData;
+    });
+    
+    res.json({
+      success: true,
+      data: formattedAssignments
+    });
+  } catch (error) {
+    console.error('Error fetching delivery assignments:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch delivery assignments'
+    });
+  }
+});
+
+// GET /api/delivery-assignments/by-invoice/:invoiceId - Get assignment by invoice ID
+router.get('/by-invoice/:invoiceId', auth, async (req, res) => {
+  try {
+    const assignment = await DeliveryAssignment.findOne({ invoice_id: req.params.invoiceId })
+      .populate('driver_id', 'name phone vehicle_type vehicle_number')
+      .populate('request_id', 'request_id customer receiver awb_number')
+      .populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address')
+      .populate('client_id', 'company_name');
+    
+    if (!assignment) {
+      return res.status(404).json({
+        success: false,
+        error: 'Delivery assignment not found for this invoice'
+      });
+    }
+    
+    const assignmentData = assignment.toObject();
+    
+    // Enrich with invoice data if receiver info is missing
+    if (!assignmentData.receiver_name && assignmentData.invoice_id) {
+      assignmentData.receiver_name = assignmentData.invoice_id.receiver_name || 'N/A';
+    }
+    if (!assignmentData.receiver_phone && assignmentData.invoice_id) {
+      assignmentData.receiver_phone = assignmentData.invoice_id.receiver_phone || 'N/A';
+    }
+    if (!assignmentData.receiver_address && assignmentData.invoice_id) {
+      assignmentData.receiver_address = assignmentData.invoice_id.receiver_address || assignmentData.delivery_address || 'N/A';
+    }
+    
+    // If assignment_id is in old format (DA-000001) but invoice has AWB number, use AWB as assignment_id
+    if (assignmentData.invoice_id?.awb_number && 
+        assignmentData.assignment_id && 
+        assignmentData.assignment_id.startsWith('DA-')) {
+      assignmentData.assignment_id = assignmentData.invoice_id.awb_number;
+    }
+
+    assignmentData.status = normalizeAssignmentStatus(assignmentData.status);
+
+    assignmentData.status = normalizeAssignmentStatus(assignmentData.status);
+
+    assignmentData.status = normalizeAssignmentStatus(assignmentData.status);
+    
+    res.json({
+      success: true,
+      data: assignmentData
+    });
+  } catch (error) {
+    console.error('Error fetching delivery assignment by invoice:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch delivery assignment'
+    });
+  }
+});
+
+// GET /api/delivery-assignments/:id - Get assignment by ID
+router.get('/:id', auth, async (req, res) => {
+  try {
+    const assignment = await DeliveryAssignment.findById(req.params.id)
+      .populate('driver_id', 'name phone vehicle_type vehicle_number')
+      .populate('request_id', 'request_id customer receiver awb_number')
+      .populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address')
+      .populate('client_id', 'company_name');
+    
+    if (!assignment) {
+      return res.status(404).json({
+        success: false,
+        error: 'Delivery assignment not found'
+      });
+    }
+    
+    const assignmentData = assignment.toObject();
+    
+    // Enrich with invoice data if receiver info is missing
+    if (!assignmentData.receiver_name && assignmentData.invoice_id) {
+      assignmentData.receiver_name = assignmentData.invoice_id.receiver_name || 'N/A';
+    }
+    if (!assignmentData.receiver_phone && assignmentData.invoice_id) {
+      assignmentData.receiver_phone = assignmentData.invoice_id.receiver_phone || 'N/A';
+    }
+    if (!assignmentData.receiver_address && assignmentData.invoice_id) {
+      assignmentData.receiver_address = assignmentData.invoice_id.receiver_address || assignmentData.delivery_address || 'N/A';
+    }
+    
+    // If assignment_id is in old format (DA-000001) but invoice has AWB number, use AWB as assignment_id
+    if (assignmentData.invoice_id?.awb_number && 
+        assignmentData.assignment_id && 
+        assignmentData.assignment_id.startsWith('DA-')) {
+      assignmentData.assignment_id = assignmentData.invoice_id.awb_number;
+    }
+
+    assignmentData.status = normalizeAssignmentStatus(assignmentData.status);
+    
+    res.json({
+      success: true,
+      data: assignmentData
+    });
+  } catch (error) {
+    console.error('Error fetching delivery assignment:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch delivery assignment'
+    });
+  }
+});
+
+// POST /api/delivery-assignments - Create new delivery assignment with QR code
+router.post('/', auth, async (req, res) => {
+  let invoice;
+  let assignmentId;
+  let invoiceAmount;
+  let assignmentData;
+  try {
+    console.log('Creating delivery assignment with data:', req.body);
+    
+    const { request_id, driver_id, invoice_id, client_id, amount, delivery_type, delivery_address, delivery_instructions } = req.body;
+    
+    // Validate required fields
+    if (!invoice_id) {
+      return res.status(400).json({
+        success: false,
+        error: 'invoice_id is required'
+      });
+    }
+    
+    if (!client_id) {
+      return res.status(400).json({
+        success: false,
+        error: 'client_id is required'
+      });
+    }
+    
+    // Fetch invoice to get receiver information and AWB number
+    invoice = await Invoice.findById(invoice_id);
+    if (!invoice) {
+      return res.status(404).json({
+        success: false,
+        error: 'Invoice not found'
+      });
+    }
+    
+    // Extract receiver information from invoice
+    const receiverName = invoice.receiver_name || invoice.request_id?.receiver?.name || 'N/A';
+    const receiverPhone = invoice.receiver_phone || invoice.request_id?.receiver?.phone || 'N/A';
+    const receiverAddress = invoice.receiver_address || invoice.request_id?.receiver?.address || delivery_address || 'N/A';
+    
+    // Get AWB number from invoice (this will be used as tracking ID/assignment_id)
+    const awbNumber = invoice.awb_number || invoice.request_id?.awb_number || null;
+    
+    // AWB number is REQUIRED - assignment_id MUST be the tracking ID
+    if (!awbNumber) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invoice must have an AWB number (tracking ID) to create a delivery assignment'
+      });
+    }
+    
+    // Use AWB number as assignment_id (tracking ID) - this is mandatory
+    assignmentId = awbNumber;
+
+    // Get amount from invoice if not provided
+    invoiceAmount = amount || (invoice.total_amount ? parseFloat(invoice.total_amount.toString()) : 0);
+    
+    if (!invoiceAmount || invoiceAmount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invoice amount is required and must be greater than 0'
+      });
+    }
+    
+    if (!delivery_type) {
+      return res.status(400).json({
+        success: false,
+        error: 'delivery_type is required'
+      });
+    }
+    
+    // Use receiver address from invoice if delivery_address not provided
+    const finalDeliveryAddress = delivery_address || receiverAddress;
+    
+    if (!finalDeliveryAddress || finalDeliveryAddress === 'N/A') {
+      return res.status(400).json({
+        success: false,
+        error: 'delivery_address is required'
+      });
+    }
+    
+    // request_id is optional - some invoices may not have a shipment request yet
+
+    assignmentData = {
+      invoice_id,
+      client_id,
+      amount: invoiceAmount,
+      delivery_type,
+      delivery_address: finalDeliveryAddress,
+      receiver_name: receiverName,
+      receiver_phone: receiverPhone,
+      receiver_address: receiverAddress,
+      delivery_instructions: delivery_instructions || 'Please contact customer for delivery details',
+      created_by: req.user.id,
+    };
+    
+    // Set assignment_id to AWB number (tracking ID) - this is mandatory
+    assignmentData.assignment_id = assignmentId;
+    
+    // Only add request_id if it's provided
+    if (request_id) {
+      assignmentData.request_id = request_id;
+    } else if (invoice.request_id) {
+      // Use invoice's request_id if available
+      assignmentData.request_id = invoice.request_id;
+    }
+    
+    // Only add driver_id if it's provided and not empty
+    if (driver_id && driver_id.trim() !== '') {
+      assignmentData.driver_id = driver_id;
+    }
+    
+    console.log('Assignment data to save:', assignmentData);
+
+    let existing =
+      (await DeliveryAssignment.findOne({ invoice_id: invoice._id })) ||
+      (await DeliveryAssignment.findOne({ assignment_id: assignmentId }));
+
+    if (existing) {
+      if (existing.invoice_id.toString() !== invoice._id.toString()) {
+        return res.status(409).json({
+          success: false,
+          error: `A delivery assignment already exists for tracking ID ${assignmentId}. It is linked to a different invoice.`,
+        });
+      }
+      await applyPayloadToExistingAssignment(existing, assignmentData, invoiceAmount);
+      const assignmentResponse = await toAssignmentResponsePayload(existing);
+      return res.status(200).json({
+        success: true,
+        data: assignmentResponse,
+        message: 'Delivery assignment already existed; details updated.',
+      });
+    }
+
+    const qrCode = crypto.randomBytes(16).toString('hex');
+    const qrUrl = `${process.env.FRONTEND_URL || 'https://finance-system-frontend.vercel.app'}/qr-payment/${qrCode}`;
+    const qrExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    assignmentData.qr_code = qrCode;
+    assignmentData.qr_url = qrUrl;
+    assignmentData.qr_expires_at = qrExpiresAt;
+
+    const assignment = new DeliveryAssignment(assignmentData);
+    await assignment.save();
+
+    console.log('Assignment saved successfully:', assignment._id);
+
+    const assignmentResponse = await toAssignmentResponsePayload(assignment);
+
+    res.status(201).json({
+      success: true,
+      data: assignmentResponse,
+      message: 'Delivery assignment created successfully',
+    });
+  } catch (error) {
+    if (
+      error.code === 11000 &&
+      assignmentId &&
+      invoice &&
+      assignmentData &&
+      invoiceAmount > 0
+    ) {
+      const isAssignmentIdDup =
+        (error.keyPattern && Object.prototype.hasOwnProperty.call(error.keyPattern, 'assignment_id')) ||
+        String(error.message || '').includes('assignment_id');
+      if (isAssignmentIdDup) {
+        const rescued = await DeliveryAssignment.findOne({ assignment_id: assignmentId });
+        if (rescued && rescued.invoice_id.toString() === invoice._id.toString()) {
+          await applyPayloadToExistingAssignment(rescued, assignmentData, invoiceAmount);
+          const assignmentResponse = await toAssignmentResponsePayload(rescued);
+          return res.status(200).json({
+            success: true,
+            data: assignmentResponse,
+            message: 'Delivery assignment already existed; details updated.',
+          });
+        }
+        if (rescued) {
+          return res.status(409).json({
+            success: false,
+            error: `A delivery assignment already exists for tracking ID ${assignmentId}. It is linked to a different invoice.`,
+          });
+        }
+      }
+    }
+    console.error('Error creating delivery assignment:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to create delivery assignment',
+      details: error.message
+    });
+  }
+});
+
+// PUT /api/delivery-assignments/:id - Update assignment status
+router.put('/:id', auth, async (req, res) => {
+  try {
+    const { status, pickup_date, delivery_date, payment_method, payment_reference, payment_notes, driver_name, driver_phone, cancellation_reason } = req.body;
+    
+    // Get current assignment to check old status
+    const currentAssignment = await DeliveryAssignment.findById(req.params.id);
+    if (!currentAssignment) {
+      return res.status(404).json({
+        success: false,
+        error: 'Delivery assignment not found'
+      });
+    }
+    
+    const oldStatus = currentAssignment.status;
+    const normalizedStatus = normalizeAssignmentStatus(status);
+    
+    const updateData = { status: normalizedStatus };
+    
+    // Handle cancellation
+    if (normalizedStatus === 'CANCELLED') {
+      updateData.cancelled_at = new Date();
+      if (cancellation_reason) {
+        updateData.cancellation_reason = cancellation_reason;
+      }
+      // Initialize empost_sync if not exists
+      if (!currentAssignment.empost_sync || currentAssignment.empost_sync.status === 'pending') {
+        updateData.empost_sync = {
+          status: 'pending',
+          retry_count: 0
+        };
+      }
+    }
+    
+    if (pickup_date) updateData.pickup_date = pickup_date;
+    if (delivery_date) updateData.delivery_date = delivery_date;
+    if (payment_method) updateData.payment_method = payment_method;
+    if (payment_reference) updateData.payment_reference = payment_reference;
+    if (payment_notes) updateData.payment_notes = payment_notes;
+    
+    // Handle driver information - create or update Driver record
+    if (driver_name && driver_phone) {
+      const { Driver } = require('../models/unified-schema');
+      
+      // Try to find existing driver by phone
+      let driver = await Driver.findOne({ phone: driver_phone });
+      
+      if (driver) {
+        // Update existing driver name if different
+        if (driver.name !== driver_name) {
+          driver.name = driver_name;
+          await driver.save();
+        }
+      } else {
+        // Create new driver record with minimal required fields
+        const driverCount = await Driver.countDocuments();
+        const driverId = `DRV-${String(driverCount + 1).padStart(6, '0')}`;
+        
+        driver = new Driver({
+          driver_id: driverId,
+          name: driver_name,
+          phone: driver_phone,
+          email: `${driver_phone.replace(/\D/g, '')}@temp.driver`, // Temporary email
+          license_number: `TEMP-${Date.now()}`, // Temporary license number
+          vehicle_type: 'CAR', // Default vehicle type
+          vehicle_number: 'TEMP', // Temporary vehicle number
+          is_active: true
+        });
+        
+        await driver.save();
+        console.log('✅ Created new driver record:', driver.driver_id);
+      }
+      
+      // Link driver to assignment
+      updateData.driver_id = driver._id;
+    }
+    
+    // If status is DELIVERED and payment_method is provided, mark payment as collected
+    if (normalizedStatus === 'DELIVERED' && payment_method) {
+      updateData.payment_collected = true;
+      updateData.payment_collected_at = new Date();
+    }
+    
+    const assignment = await DeliveryAssignment.findByIdAndUpdate(
+      req.params.id,
+      updateData,
+      { new: true, runValidators: true }
+    ).populate('driver_id', 'name phone vehicle_type vehicle_number')
+     .populate('request_id', 'request_id customer receiver awb_number')
+     .populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address')
+     .populate('client_id', 'company_name');
+    
+    if (!assignment) {
+      return res.status(404).json({
+        success: false,
+        error: 'Delivery assignment not found'
+      });
+    }
+    
+    // If status changed to CANCELLED, trigger Empost sync in background
+    if (normalizedStatus === 'CANCELLED' && oldStatus !== 'CANCELLED') {
+      // Don't wait for sync to complete - do it in background
+      syncWithEmpostAsync(assignment._id).catch(err => {
+        console.error('Background Empost sync failed:', err);
+      });
+    }
+    
+    const assignmentData = assignment.toObject();
+    
+    // Enrich with invoice data if receiver info is missing
+    if (!assignmentData.receiver_name && assignmentData.invoice_id) {
+      assignmentData.receiver_name = assignmentData.invoice_id.receiver_name || 'N/A';
+    }
+    if (!assignmentData.receiver_phone && assignmentData.invoice_id) {
+      assignmentData.receiver_phone = assignmentData.invoice_id.receiver_phone || 'N/A';
+    }
+    if (!assignmentData.receiver_address && assignmentData.invoice_id) {
+      assignmentData.receiver_address = assignmentData.invoice_id.receiver_address || assignmentData.delivery_address || 'N/A';
+    }
+    
+    // If assignment_id is in old format (DA-000001) but invoice has AWB number, use AWB as assignment_id
+    if (assignmentData.invoice_id?.awb_number && 
+        assignmentData.assignment_id && 
+        assignmentData.assignment_id.startsWith('DA-')) {
+      assignmentData.assignment_id = assignmentData.invoice_id.awb_number;
+    }
+    
+    // If status is DELIVERED, update related documents
+    if (normalizedStatus === 'DELIVERED') {
+      try {
+        const { InvoiceRequest, Booking } = require('../models');
+        const { Invoice, ShipmentRequest } = require('../models/unified-schema');
+        
+        // Get the invoice ID (either populated or as string)
+        const invoiceId = assignment.invoice_id 
+          ? (typeof assignment.invoice_id === 'object' 
+            ? assignment.invoice_id._id?.toString() || assignment.invoice_id.toString()
+            : assignment.invoice_id.toString())
+          : null;
+        
+        // Get the request ID (either populated or as string)
+        const requestId = assignment.request_id
+          ? (typeof assignment.request_id === 'object'
+            ? assignment.request_id._id?.toString() || assignment.request_id.toString()
+            : assignment.request_id.toString())
+          : null;
+        
+        console.log('🔍 Updating related documents - Invoice ID:', invoiceId, 'Request ID:', requestId);
+        
+        // 1. Update Invoice delivery_status
+        if (invoiceId) {
+          try {
+            await Invoice.findByIdAndUpdate(invoiceId, {
+              delivery_status: 'DELIVERED',
+              updatedAt: new Date()
+            });
+            console.log('✅ Invoice delivery_status updated to DELIVERED');
+          } catch (invoiceError) {
+            console.warn('⚠️ Error updating invoice delivery_status:', invoiceError.message);
+          }
+        }
+        
+        // 2. Update ShipmentRequest delivery_status (if linked)
+        if (requestId) {
+          try {
+            await ShipmentRequest.findByIdAndUpdate(requestId, {
+              'status.delivery_status': 'DELIVERED',
+              updatedAt: new Date()
+            });
+            console.log('✅ ShipmentRequest delivery_status updated to DELIVERED');
+          } catch (requestError) {
+            console.warn('⚠️ Error updating shipment request delivery_status:', requestError.message);
+          }
+        }
+        
+        // 3. Find and update InvoiceRequest
+        let invoiceRequest = null;
+        if (invoiceId) {
+          const invoice = await Invoice.findById(invoiceId);
+          
+          if (invoice) {
+            // Try multiple methods to find the invoice request
+            if (invoice.request_id) {
+              // Check if request_id points to InvoiceRequest (might be ShipmentRequest)
+              invoiceRequest = await InvoiceRequest.findById(invoice.request_id);
+            }
+            
+            if (!invoiceRequest && invoice.invoice_id) {
+              invoiceRequest = await InvoiceRequest.findOne({ invoice_number: invoice.invoice_id });
+            }
+            
+            if (!invoiceRequest && invoice.notes) {
+              const match = invoice.notes.match(/Invoice for request ([a-fA-F0-9]{24})/);
+              if (match && match[1]) {
+                invoiceRequest = await InvoiceRequest.findById(match[1]);
+              }
+            }
+            
+            // Also try matching by tracking_code/awb_number if available
+            if (!invoiceRequest && invoice.awb_number) {
+              invoiceRequest = await InvoiceRequest.findOne({
+                $or: [
+                  { tracking_code: invoice.awb_number },
+                  { awb_number: invoice.awb_number }
+                ]
+              });
+            }
+          }
+        }
+        
+        if (invoiceRequest) {
+          const oldDeliveryStatus = invoiceRequest.delivery_status;
+          invoiceRequest.delivery_status = 'DELIVERED';
+          await invoiceRequest.save();
+          console.log('✅ Invoice request delivery_status updated to DELIVERED');
+
+          if (oldDeliveryStatus !== 'DELIVERED') {
+            await cleanupBookingIdentityDocumentsForDeliveredInvoiceRequest(invoiceRequest);
+          }
+          
+          // Check if invoice request should be marked as COMPLETED
+          // (e.g., if invoice is generated, payment collected, and now delivered)
+          if (invoiceRequest.status !== 'COMPLETED' && 
+              invoiceRequest.status !== 'CANCELLED') {
+            // You can add additional conditions here (e.g., payment collected)
+            // For now, we'll just update delivery_status
+          }
+          
+          // Sync DELIVERED status to EMPOST
+          if (oldDeliveryStatus !== 'DELIVERED') {
+            try {
+              const { syncStatusToEMPost, getTrackingNumberFromInvoiceRequest } = require('../utils/empost-status-sync');
+              const trackingNumber = getTrackingNumberFromInvoiceRequest(invoiceRequest);
+              
+              await syncStatusToEMPost({
+                trackingNumber,
+                status: 'DELIVERED',
+                additionalData: {
+                  deliveryDate: new Date(),
+                  invoiceRequest,
+                }
+              });
+            } catch (empostError) {
+              console.warn('⚠️ Error syncing to EMPOST:', empostError.message);
+            }
+          }
+          
+          // 4. CRITICAL: Update Booking's shipment_status
+          // This makes the status appear in Review Requests page (Cargo Status Management)
+          try {
+            const bookingUpdateResult = await Booking.updateMany(
+              { converted_to_invoice_request_id: invoiceRequest._id },
+              { 
+                shipment_status: 'DELIVERED',
+                updatedAt: new Date()
+              }
+            );
+            
+            if (bookingUpdateResult.modifiedCount > 0) {
+              console.log(`✅ Updated ${bookingUpdateResult.modifiedCount} booking(s) shipment_status to DELIVERED`);
+            } else {
+              console.log('ℹ️  No bookings found with converted_to_invoice_request_id:', invoiceRequest._id);
+            }
+          } catch (bookingError) {
+            console.error('❌ Error updating booking shipment_status:', bookingError);
+          }
+        } else {
+          console.warn('⚠️ Invoice request not found for invoice:', invoiceId);
+          
+          // Fallback: Try to find booking by invoice_id if invoice request not found
+          // Some bookings might have invoice_id directly
+          if (invoiceId) {
+            try {
+              // Try to find booking by matching invoice_number or tracking_code
+              const invoice = await Invoice.findById(invoiceId);
+              if (invoice && invoice.invoice_id) {
+                const bookingUpdateResult = await Booking.updateMany(
+                  { 
+                    $or: [
+                      { invoice_id: invoice.invoice_id },
+                      { invoice_number: invoice.invoice_id },
+                      { tracking_code: invoice.awb_number },
+                      { awb_number: invoice.awb_number }
+                    ]
+                  },
+                  { 
+                    shipment_status: 'DELIVERED',
+                    updatedAt: new Date()
+                  }
+                );
+                
+                if (bookingUpdateResult.modifiedCount > 0) {
+                  console.log(`✅ Updated ${bookingUpdateResult.modifiedCount} booking(s) shipment_status to DELIVERED (fallback method)`);
+                }
+              }
+            } catch (fallbackError) {
+              console.warn('⚠️ Error in fallback booking update:', fallbackError.message);
+            }
+          }
+        }
+      } catch (syncError) {
+        console.error('❌ Error syncing related documents:', syncError);
+        // Don't fail assignment update if sync fails
+      }
+    } else if (normalizedStatus === 'NOT_DELIVERED') {
+      // If status is NOT_DELIVERED, we might want to reset delivery_status in related documents
+      // For now, we'll leave them as is, but you can add logic here if needed
+      console.log('ℹ️  Status set to NOT_DELIVERED - related documents not updated');
+    }
+    
+    res.json({
+      success: true,
+      data: assignmentData,
+      message: 'Delivery assignment updated successfully'
+    });
+  } catch (error) {
+    console.error('Error updating delivery assignment:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update delivery assignment'
+    });
+  }
+});
+
+// GET /api/delivery-assignments/qr/:qrCode - Get assignment by QR code (for payment page)
+router.get('/qr/:qrCode', async (req, res) => {
+  try {
+    const assignment = await DeliveryAssignment.findOne({ 
+      qr_code: req.params.qrCode,
+      qr_expires_at: { $gt: new Date() },
+      qr_used: false
+    })
+      .populate('driver_id', 'name phone vehicle_type vehicle_number')
+      .populate('request_id', 'request_id customer receiver awb_number')
+      .populate('invoice_id', 'invoice_id total_amount amount awb_number receiver_name receiver_phone receiver_address')
+      .populate('client_id', 'company_name');
+    
+    if (!assignment) {
+      return res.status(404).json({
+        success: false,
+        error: 'QR code not found or expired'
+      });
+    }
+    
+    // Convert Decimal128 amount to number for frontend
+    const assignmentData = assignment.toObject();
+    if (assignmentData.amount && typeof assignmentData.amount === 'object') {
+      assignmentData.amount = parseFloat(assignmentData.amount.toString());
+    }
+    
+    // If amount is missing or 0, get it from the invoice
+    if (!assignmentData.amount || assignmentData.amount === 0) {
+      if (assignmentData.invoice_id) {
+        const { Invoice } = require('../models/unified-schema');
+        const invoice = await Invoice.findById(assignmentData.invoice_id._id || assignmentData.invoice_id)
+          .select('invoice_id total_amount amount');
+        
+        if (invoice) {
+          // Convert Decimal128 to number
+          const invoiceAmount = typeof invoice.total_amount === 'object' 
+            ? parseFloat(invoice.total_amount.toString()) 
+            : invoice.total_amount;
+          
+          assignmentData.amount = invoiceAmount;
+          console.log(`✅ Retrieved amount from invoice: ${assignmentData.amount}`);
+        }
+      }
+    }
+    
+    // Enrich with invoice data if receiver info is missing
+    if (!assignmentData.receiver_name && assignmentData.invoice_id) {
+      assignmentData.receiver_name = assignmentData.invoice_id.receiver_name || 'N/A';
+    }
+    if (!assignmentData.receiver_phone && assignmentData.invoice_id) {
+      assignmentData.receiver_phone = assignmentData.invoice_id.receiver_phone || 'N/A';
+    }
+    if (!assignmentData.receiver_address && assignmentData.invoice_id) {
+      assignmentData.receiver_address = assignmentData.invoice_id.receiver_address || assignmentData.delivery_address || 'N/A';
+    }
+    
+    // If assignment_id is in old format (DA-000001) but invoice has AWB number, use AWB as assignment_id
+    if (assignmentData.invoice_id?.awb_number && 
+        assignmentData.assignment_id && 
+        assignmentData.assignment_id.startsWith('DA-')) {
+      assignmentData.assignment_id = assignmentData.invoice_id.awb_number;
+    }
+    
+    res.json({
+      success: true,
+      data: assignmentData
+    });
+  } catch (error) {
+    console.error('Error fetching assignment by QR code:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch assignment'
+    });
+  }
+});
+
+// PUT /api/delivery-assignments/qr/:qrCode/status - Update assignment status via QR code (no auth required)
+router.put('/qr/:qrCode/status', async (req, res) => {
+  try {
+    const { status, delivery_date, driver_name, driver_phone } = req.body;
+    const normalizedStatus = status === 'DELIVERED' ? 'DELIVERED' : 'NOT_DELIVERED';
+    
+    // Find assignment by QR code
+    const assignment = await DeliveryAssignment.findOne({ 
+      qr_code: req.params.qrCode,
+      qr_expires_at: { $gt: new Date() }
+    });
+    
+    if (!assignment) {
+      return res.status(404).json({
+        success: false,
+        error: 'QR code not found or expired'
+      });
+    }
+    
+    const updateData = { status: normalizedStatus };
+    
+    if (normalizedStatus === 'DELIVERED') {
+      updateData.delivery_date = delivery_date || new Date();
+    } else {
+      updateData.delivery_date = null;
+    }
+    
+    // Handle driver information - create or update Driver record
+    if (driver_name && driver_phone) {
+      // Try to find existing driver by phone
+      let driver = await Driver.findOne({ phone: driver_phone });
+      
+      if (driver) {
+        // Update existing driver name if different
+        if (driver.name !== driver_name) {
+          driver.name = driver_name;
+          await driver.save();
+        }
+      } else {
+        // Create new driver record with minimal required fields
+        const driverCount = await Driver.countDocuments();
+        const driverId = `DRV-${String(driverCount + 1).padStart(6, '0')}`;
+        
+        driver = new Driver({
+          driver_id: driverId,
+          name: driver_name,
+          phone: driver_phone,
+          email: `${driver_phone.replace(/\D/g, '')}@temp.driver`, // Temporary email
+          license_number: `TEMP-${Date.now()}`, // Temporary license number
+          vehicle_type: 'CAR', // Default vehicle type
+          vehicle_number: 'TEMP', // Temporary vehicle number
+          is_active: true
+        });
+        
+        await driver.save();
+        console.log('✅ Created new driver record:', driver.driver_id);
+      }
+      
+      // Link driver to assignment
+      updateData.driver_id = driver._id;
+    }
+    
+    const updatedAssignment = await DeliveryAssignment.findByIdAndUpdate(
+      assignment._id,
+      updateData,
+      { new: true, runValidators: true }
+    ).populate('driver_id', 'name phone vehicle_type vehicle_number')
+     .populate('request_id', 'request_id customer receiver awb_number')
+     .populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address')
+     .populate('client_id', 'company_name');
+    
+    const assignmentData = updatedAssignment.toObject();
+    
+    // Enrich with invoice data if receiver info is missing
+    if (!assignmentData.receiver_name && assignmentData.invoice_id) {
+      assignmentData.receiver_name = assignmentData.invoice_id.receiver_name || 'N/A';
+    }
+    if (!assignmentData.receiver_phone && assignmentData.invoice_id) {
+      assignmentData.receiver_phone = assignmentData.invoice_id.receiver_phone || 'N/A';
+    }
+    if (!assignmentData.receiver_address && assignmentData.invoice_id) {
+      assignmentData.receiver_address = assignmentData.invoice_id.receiver_address || assignmentData.delivery_address || 'N/A';
+    }
+    
+    // If assignment_id is in old format (DA-000001) but invoice has AWB number, use AWB as assignment_id
+    if (assignmentData.invoice_id?.awb_number && 
+        assignmentData.assignment_id && 
+        assignmentData.assignment_id.startsWith('DA-')) {
+      assignmentData.assignment_id = assignmentData.invoice_id.awb_number;
+    }
+    
+    res.json({
+      success: true,
+      data: assignmentData,
+      message: 'Delivery assignment updated successfully'
+    });
+  } catch (error) {
+    console.error('Error updating delivery assignment via QR:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update delivery assignment'
+    });
+  }
+});
+
+// POST /api/delivery-assignments/qr/:qrCode/payment - Process payment via QR code
+router.post('/qr/:qrCode/payment', async (req, res) => {
+  try {
+    const { payment_method, payment_reference, payment_notes } = req.body;
+    
+    const assignment = await DeliveryAssignment.findOne({ 
+      qr_code: req.params.qrCode,
+      qr_expires_at: { $gt: new Date() },
+      qr_used: false
+    });
+    
+    if (!assignment) {
+      return res.status(404).json({
+        success: false,
+        error: 'QR code not found or expired'
+      });
+    }
+    
+    // Update assignment with payment details
+    assignment.payment_collected = true;
+    assignment.payment_method = payment_method;
+    assignment.payment_reference = payment_reference;
+    assignment.payment_notes = payment_notes;
+    assignment.payment_collected_at = new Date();
+    assignment.qr_used = true;
+    assignment.qr_used_at = new Date();
+    assignment.status = 'DELIVERED';
+    assignment.delivery_date = new Date();
+    
+    await assignment.save();
+    
+    // Update invoice status to COLLECTED_BY_DRIVER
+    if (assignment.invoice_id) {
+      const { Invoice } = require('../models/unified-schema');
+      // Handle both populated and non-populated invoice_id
+      const invoiceId = assignment.invoice_id._id 
+        ? assignment.invoice_id._id.toString() 
+        : assignment.invoice_id.toString();
+      
+      const collectedInvoice = await Invoice.findByIdAndUpdate(
+        invoiceId,
+        { status: 'COLLECTED_BY_DRIVER' },
+        { new: true }
+      );
+      console.log('✅ Invoice status updated to COLLECTED_BY_DRIVER for invoice:', invoiceId);
+      if (collectedInvoice) {
+        const { syncInvoiceReceipts } = require('../services/invoice-gl');
+        await syncInvoiceReceipts(collectedInvoice, {
+          reason: `QR payment${payment_method ? ` via ${payment_method}` : ''}`,
+        });
+      }
+    } else {
+      console.warn('⚠️ No invoice_id found in assignment, cannot update invoice status');
+    }
+    
+    // Create QR payment session record
+    const { QRPaymentSession } = require('../models/unified-schema');
+    const session = new QRPaymentSession({
+      assignment_id: assignment._id,
+      qr_code: req.params.qrCode,
+      status: 'COMPLETED',
+      payment_method,
+      amount: assignment.amount,
+      payment_reference,
+      payment_notes,
+      completed_at: new Date(),
+      expires_at: assignment.qr_expires_at,
+      ip_address: req.ip,
+      user_agent: req.get('User-Agent')
+    });
+    
+    await session.save();
+    
+    res.json({
+      success: true,
+      data: assignment,
+      message: 'Payment processed successfully'
+    });
+  } catch (error) {
+    console.error('Error processing payment:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to process payment'
+    });
+  }
+});
+
+// GET /api/delivery-assignments/driver/:driverId - Get assignments for specific driver
+router.get('/driver/:driverId', auth, async (req, res) => {
+  try {
+    const assignments = await DeliveryAssignment.find({ driver_id: req.params.driverId })
+      .populate('request_id', 'request_id customer receiver awb_number')
+      .populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address')
+      .populate('client_id', 'company_name')
+      .sort({ createdAt: -1 });
+    
+    // Convert and enrich assignments
+    const formattedAssignments = assignments.map(assignment => {
+      const assignmentData = assignment.toObject();
+      
+      // Convert amount from Decimal128 to number
+      if (assignmentData.amount) {
+        assignmentData.amount = typeof assignmentData.amount === 'object'
+          ? parseFloat(assignmentData.amount.toString())
+          : parseFloat(assignmentData.amount);
+      }
+      
+      // If assignment_id is in old format (DA-000001) but invoice has AWB number, use AWB as assignment_id
+      if (assignmentData.invoice_id?.awb_number && 
+          assignmentData.assignment_id && 
+          assignmentData.assignment_id.startsWith('DA-')) {
+        assignmentData.assignment_id = assignmentData.invoice_id.awb_number;
+      }
+      
+      return assignmentData;
+    });
+    
+    res.json({
+      success: true,
+      data: formattedAssignments
+    });
+  } catch (error) {
+    console.error('Error fetching driver assignments:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch driver assignments'
+    });
+  }
+});
+
+// Background sync function for Empost
+async function syncWithEmpostAsync(assignmentId) {
+  try {
+    const assignment = await DeliveryAssignment.findById(assignmentId)
+      .populate('invoice_id', 'awb_number receiver_name receiver_phone receiver_address total_amount')
+      .populate('request_id', 'awb_number');
+    
+    if (!assignment || assignment.status !== 'CANCELLED') {
+      console.warn(`⚠️ Assignment ${assignmentId} is not cancelled, skipping Empost sync`);
+      return;
+    }
+    
+    // Prepare data for Empost
+    const awbNumber = assignment.invoice_id?.awb_number || 
+                     assignment.request_id?.awb_number || 
+                     assignment.assignment_id;
+    
+    const empostData = {
+      assignment_id: assignment.assignment_id,
+      awb_number: awbNumber,
+      tracking_code: assignment.assignment_id,
+      customer_name: assignment.receiver_name || assignment.invoice_id?.receiver_name || 'N/A',
+      customer_phone: assignment.receiver_phone || assignment.invoice_id?.receiver_phone || 'N/A',
+      delivery_address: assignment.delivery_address || assignment.invoice_id?.receiver_address || 'N/A',
+      amount: assignment.amount ? parseFloat(assignment.amount.toString()) : 0,
+      status: 'CANCELLED',
+      cancellation_reason: assignment.cancellation_reason,
+      cancelled_at: assignment.cancelled_at || new Date().toISOString(),
+      invoice_id: assignment.invoice_id?._id?.toString(),
+      driver_id: assignment.driver_id?.toString(),
+      original_status: 'NOT_DELIVERED'
+    };
+    
+    // Call Empost API
+    const empostResponse = await empostService.cancelDelivery(empostData);
+    
+    // Update assignment with sync status
+    if (empostResponse.success) {
+      assignment.empost_sync = {
+        status: 'synced',
+        reference: empostResponse.reference,
+        synced_at: new Date(),
+        error_message: null,
+        retry_count: assignment.empost_sync?.retry_count || 0
+      };
+      console.log(`✅ Empost sync successful for assignment ${assignmentId}, reference: ${empostResponse.reference}`);
+    } else {
+      // Handle sync failure
+      const retryCount = (assignment.empost_sync?.retry_count || 0) + 1;
+      assignment.empost_sync = {
+        status: retryCount < 3 ? 'pending' : 'failed',
+        reference: null,
+        synced_at: null,
+        error_message: empostResponse.error,
+        retry_count: retryCount
+      };
+      
+      // Retry logic with exponential backoff
+      if (retryCount < 3) {
+        const delay = retryCount === 1 ? 60000 : retryCount === 2 ? 300000 : 900000; // 1min, 5min, 15min
+        console.log(`⚠️ Empost sync failed for assignment ${assignmentId}, retrying in ${delay/1000}s (attempt ${retryCount}/3)`);
+        setTimeout(() => {
+          syncWithEmpostAsync(assignmentId).catch(err => {
+            console.error('Retry sync failed:', err);
+          });
+        }, delay);
+      } else {
+        console.error(`❌ Empost sync failed for assignment ${assignmentId} after ${retryCount} attempts: ${empostResponse.error}`);
+      }
+    }
+    
+    await assignment.save();
+  } catch (error) {
+    console.error(`❌ Error in background Empost sync for assignment ${assignmentId}:`, error);
+    // Update assignment with error status
+    try {
+      const assignment = await DeliveryAssignment.findById(assignmentId);
+      if (assignment) {
+        assignment.empost_sync = {
+          status: 'failed',
+          reference: null,
+          synced_at: null,
+          error_message: error.message,
+          retry_count: (assignment.empost_sync?.retry_count || 0) + 1
+        };
+        await assignment.save();
+      }
+    } catch (updateError) {
+      console.error('Failed to update assignment sync status:', updateError);
+    }
+  }
+}
+
+// POST /api/delivery-assignments/:id/sync-empost - Manually sync cancelled assignment with Empost
+router.post('/:id/sync-empost', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Find the assignment
+    const assignment = await DeliveryAssignment.findById(id)
+      .populate('invoice_id', 'awb_number receiver_name receiver_phone receiver_address total_amount')
+      .populate('request_id', 'awb_number');
+    
+    if (!assignment) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Assignment not found' 
+      });
+    }
+    
+    // Verify assignment is cancelled
+    if (assignment.status !== 'CANCELLED') {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Assignment must be cancelled before syncing with Empost' 
+      });
+    }
+    
+    // Prepare data for Empost
+    const awbNumber = assignment.invoice_id?.awb_number || 
+                     assignment.request_id?.awb_number || 
+                     assignment.assignment_id;
+    
+    const empostData = {
+      assignment_id: assignment.assignment_id,
+      awb_number: awbNumber,
+      tracking_code: assignment.assignment_id,
+      customer_name: assignment.receiver_name || assignment.invoice_id?.receiver_name || 'N/A',
+      customer_phone: assignment.receiver_phone || assignment.invoice_id?.receiver_phone || 'N/A',
+      delivery_address: assignment.delivery_address || assignment.invoice_id?.receiver_address || 'N/A',
+      amount: assignment.amount ? parseFloat(assignment.amount.toString()) : 0,
+      status: 'CANCELLED',
+      cancellation_reason: assignment.cancellation_reason,
+      cancelled_at: assignment.cancelled_at || new Date().toISOString(),
+      invoice_id: assignment.invoice_id?._id?.toString(),
+      driver_id: assignment.driver_id?.toString(),
+      original_status: 'NOT_DELIVERED'
+    };
+    
+    // Call Empost API
+    const empostResponse = await empostService.cancelDelivery(empostData);
+    
+    if (empostResponse.success) {
+      // Update assignment with sync status
+      assignment.empost_sync = {
+        status: 'synced',
+        reference: empostResponse.reference,
+        synced_at: new Date(),
+        error_message: null,
+        retry_count: assignment.empost_sync?.retry_count || 0
+      };
+      await assignment.save();
+      
+      return res.json({
+        success: true,
+        data: {
+          assignment_id: assignment.assignment_id,
+          empost_sync_status: 'synced',
+          empost_reference: empostResponse.reference,
+          synced_at: assignment.empost_sync.synced_at
+        }
+      });
+    } else {
+      // Handle sync failure
+      const retryCount = (assignment.empost_sync?.retry_count || 0) + 1;
+      assignment.empost_sync = {
+        status: retryCount < 3 ? 'pending' : 'failed',
+        reference: null,
+        synced_at: null,
+        error_message: empostResponse.error,
+        retry_count: retryCount
+      };
+      await assignment.save();
+      
+      // Trigger retry in background if retry count < 3
+      if (retryCount < 3) {
+        const delay = retryCount === 1 ? 60000 : retryCount === 2 ? 300000 : 900000;
+        setTimeout(() => {
+          syncWithEmpostAsync(assignment._id).catch(err => {
+            console.error('Retry sync failed:', err);
+          });
+        }, delay);
+      }
+      
+      return res.status(500).json({
+        success: false,
+        error: `Failed to sync with Empost: ${empostResponse.error}`
+      });
+    }
+  } catch (error) {
+    console.error('Error syncing with Empost:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Internal server error during Empost sync',
+      details: error.message
+    });
+  }
+});
+
+module.exports = router;

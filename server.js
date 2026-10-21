@@ -1,0 +1,394 @@
+require('dotenv').config();
+const dns = require('dns');
+const { assertRequiredConfig, mongoUri } = require('./utils/config');
+try {
+  assertRequiredConfig();
+} catch (error) {
+  console.error(`❌ ${error.message}`);
+  process.exit(1);
+}
+const express = require('express');
+const http = require('http');
+const path = require('path');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const { sanitizeRequest, validateRequestSize, limitQueryComplexity } = require('./middleware/security');
+const {
+  storeBackendError,
+  attachConsoleErrorCapture,
+} = require('./utils/error-monitoring');
+
+// Import routes
+const authRoutes = require('./routes/auth');
+const userRoutes = require('./routes/users');
+const departmentRoutes = require('./routes/departments');
+const employeeRoutes = require('./routes/employees');
+const clientRoutes = require('./routes/clients');
+const requestRoutes = require('./routes/requests');
+const ticketRoutes = require('./routes/tickets');
+const reportRoutes = require('./routes/reports');
+const invoiceRequestRoutes = require('./routes/invoiceRequests');
+const collectionsRoutes = require('./routes/collections');
+const { router: notificationRoutes } = require('./routes/notifications');
+const performanceRoutes = require('./routes/performance');
+const invoiceRoutes = require('./routes/invoices');
+const invoiceUnifiedRoutes = require('./routes/invoices-unified');
+const priceBracketsRoutes = require('./routes/price-brackets');
+const quotationRoutes = require('./routes/quotations');
+
+// QR Payment Collection System routes
+const driverRoutes = require('./routes/drivers');
+const deliveryAssignmentRoutes = require('./routes/delivery-assignments');
+const qrPaymentSessionRoutes = require('./routes/qr-payment-sessions');
+const paymentRemittanceRoutes = require('./routes/payment-remittances');
+const csvUploadRoutes = require('./routes/csv-upload');
+const bookingsRoutes = require('./routes/bookings');
+const systemSettingsRoutes = require('./routes/system-settings');
+const activityRoutes = require('./routes/activity');
+const errorMonitoringRoutes = require('./routes/errors');
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+attachConsoleErrorCapture();
+
+// Security middleware - Enhanced Helmet configuration
+// Note: CSP is disabled for API backend - frontend should handle its own CSP
+app.use(helmet({
+  contentSecurityPolicy: false, // Disable CSP for API backend (frontend handles CSP)
+  crossOriginEmbedderPolicy: false, // Allow embedding if needed
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true
+  }
+}));
+
+// Request size validation
+app.use(validateRequestSize);
+
+// Query complexity limits
+app.use(limitQueryComplexity);
+
+// Input sanitization (must be before body parsing for some routes)
+app.use(sanitizeRequest);
+
+// CORS configuration - allow multiple origins
+const allowedOrigins = [
+  'https://finance-system-frontend.vercel.app',
+  'https://productionknexpress.com',
+  'https://www.productionknexpress.com',
+  'http://localhost:9002',
+  'http://localhost:3000',
+  ...(process.env.FRONTEND_URL || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean),
+  ...(process.env.FRONTEND_URLS || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+];
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV !== 'production') {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-csrf-token', 'X-CSRF-Token', 'X-Requested-With', 'Accept']
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+
+// Enhanced Rate Limiting - Stricter for DDoS protection
+const generalLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: process.env.NODE_ENV === 'production' ? 100 : 500, // Stricter limits
+  message: {
+    success: false,
+    error: 'Too many requests from this IP, please try again later.',
+    retryAfter: '1 minute'
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => {
+    return req.path === '/api/health';
+  },
+  // Use IP from headers if behind proxy
+  keyGenerator: (req) => {
+    return req.headers['x-forwarded-for']?.split(',')[0] || 
+           req.headers['x-real-ip'] || 
+           req.ip || 
+           req.connection.remoteAddress;
+  },
+  // Custom handler
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      error: 'Too many requests',
+      message: 'Rate limit exceeded. Please try again later.',
+      retryAfter: '1 minute'
+    });
+  }
+});
+
+    error: 'Too many authentication attempts',
+    message: 'Please try again after 15 minutes'
+  },
+  skipSuccessfulRequests: true,
+  keyGenerator: (req) => {
+    return req.headers['x-forwarded-for']?.split(',')[0] || 
+           req.headers['x-real-ip'] || 
+           req.ip || 
+           req.connection.remoteAddress;
+  }
+});
+    success: false,
+    error: 'Too many file uploads',
+    message: 'Maximum 10 file uploads per hour allowed'
+  },
+  keyGenerator: (req) => {
+    return req.headers['x-forwarded-for']?.split(',')[0] || 
+           req.headers['x-real-ip'] || 
+           req.ip || 
+           req.connection.remoteAddress;
+  }
+});
+
+// Apply rate limiters
+app.use('/api/auth', authLimiter);
+app.use('/api/csv-upload', uploadLimiter);
+app.use(generalLimiter);
+
+// Body parsing middleware with strict limits
+app.use(express.json({ 
+// Sanitize after the body is parsed so JSON keys can be inspected.
+app.use(sanitizeRequest);
+
+// Trust proxy for accurate IP addresses (if behind reverse proxy)
+app.set('trust proxy', 1);
+
+// MongoDB connection
+const MONGODB_URI = mongoUri();
+
+// mongodb+srv triggers SRV lookups; some routers/DNS return ECONNREFUSED for _mongodb._tcp.*
+if (/^mongodb\+srv:\/\//i.test(MONGODB_URI) && process.env.MONGO_USE_SYSTEM_DNS !== '1') {
+  const servers = (
+    process.env.MONGO_DNS_SERVERS ||
+    process.env.DNS_SERVERS ||
+    '1.1.1.1,8.8.8.8'
+  )
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (servers.length) {
+    dns.setServers(servers);
+    console.log(`🌐 DNS servers set for MongoDB SRV lookup: ${servers.join(', ')}`);
+  }
+}
+
+mongoose.connect(MONGODB_URI)
+.then(async () => {
+  console.log('✅ Connected to MongoDB');
+  try {
+    const { getBookingReviewDeps } = require('./routes/bookings');
+    const { refreshBookingAutoReviewWorker } = require('./services/booking-auto-review-worker');
+    await refreshBookingAutoReviewWorker(getBookingReviewDeps);
+  } catch (err) {
+    console.warn('[auto-review-worker] Startup init skipped:', err.message);
+  }
+
+  // Ensure Booking Forms name search indexes (non-blocking; text index can take minutes)
+  (async () => {
+    try {
+      const { Booking } = require('./models');
+      const col = mongoose.connection.collection('bookings');
+      const indexes = await col.indexes();
+      for (const idx of indexes) {
+        const isText = idx.key && Object.values(idx.key).includes('text');
+        if (isText && idx.name !== 'bookings_party_name_text') {
+          console.log(`🧹 Dropping legacy bookings text index: ${idx.name}`);
+          await col.dropIndex(idx.name);
+        }
+      }
+      // Prefer background-friendly index creation; do not block server startup
+      Booking.createIndexes()
+        .then(() => console.log('✅ Booking party-name search indexes ready'))
+        .catch((e) => console.warn('⚠️ Booking createIndexes:', e.message));
+    } catch (idxErr) {
+      console.warn('⚠️ Booking name-index sync skipped:', idxErr.message);
+    }
+  })();
+})
+.catch((error) => {
+  console.error('❌ MongoDB connection error:', error);
+  process.exit(1);
+});
+
+// Routes
+app.use('/api/auth', authRoutes);
+app.use('/api/users', userRoutes);
+app.use('/api/departments', departmentRoutes);
+app.use('/api/employees', employeeRoutes);
+app.use('/api/clients', clientRoutes);
+app.use('/api/requests', requestRoutes);
+app.use('/api/tickets', ticketRoutes);
+app.use('/api/reports', reportRoutes);
+app.use('/api/invoice-requests', invoiceRequestRoutes);
+app.use('/api/collections', collectionsRoutes);
+app.use('/api/notifications', notificationRoutes);
+app.use('/api/performance', performanceRoutes);
+app.use('/api/invoices', invoiceRoutes);
+app.use('/api/invoices-unified', invoiceUnifiedRoutes);
+app.use('/api/invoice-notes', require('./routes/invoice-notes'));
+app.use('/api/price-brackets', priceBracketsRoutes);
+app.use('/api/quotations', quotationRoutes);
+
+// QR Payment Collection System routes
+app.use('/api/drivers', driverRoutes);
+app.use('/api/delivery-assignments', deliveryAssignmentRoutes);
+app.use('/api/qr-payment-sessions', qrPaymentSessionRoutes);
+app.use('/api/payment-remittances', paymentRemittanceRoutes);
+
+// CSV Upload routes
+app.use('/api/csv-upload', csvUploadRoutes);
+
+// Bookings routes
+app.use('/api/bookings', bookingsRoutes);
+app.use('/api/system-settings', systemSettingsRoutes);
+app.use('/api/finance-setup', require('./routes/finance-setup'));
+app.use('/api/empost', require('./routes/empost-pending'));
+app.use('/api/accounting', require('./routes/accounting'));
+app.use('/api/accounting', require('./routes/bank-reconciliation'));
+app.use('/uploads/accounting', express.static(path.join(__dirname, 'uploads/accounting')));
+app.use('/uploads/finance-setup', express.static(path.join(__dirname, 'uploads/finance-setup')));
+// CSV Upload routes
+app.use('/api/csv-upload', csvUploadRoutes);
+
+// Bookings routes
+app.use('/api/bookings', bookingsRoutes);
+app.use('/api/system-settings', systemSettingsRoutes);
+app.use('/api/empost', require('./routes/empost-pending'));
+app.use('/api/accounting', require('./routes/accounting'));
+app.use('/api/accounting', require('./routes/bank-reconciliation'));
+app.use('/uploads/accounting', express.static(path.join(__dirname, 'uploads/accounting')));
+
+// Activity tracking routes
+app.use('/api/activity', activityRoutes);
+app.use('/api/errors', errorMonitoringRoutes);
+app.use('/api/motivation', require('./routes/motivation'));
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    database: mongoose.connection.readyState === 1 ? 'Connected' : 'Disconnected'
+  });
+});
+
+// Error handling middleware - Don't leak sensitive information
+app.use((err, req, res, next) => {
+  const stackTrace = err && err.stack ? err.stack : '';
+  void storeBackendError({
+    message: err?.message || 'Unknown server error',
+    stackTrace,
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'production',
+    errorType: 'runtime',
+    source: 'api',
+  });
+
+  console.error('Error:', {
+    message: err.message,
+    stack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
+    path: req.path,
+    method: req.method,
+    ip: req.ip
+  });
+  
+  // Don't expose error details in production
+  const isDevelopment = process.env.NODE_ENV === 'development';
+  
+  // Handle specific error types
+  if (err.name === 'ValidationError') {
+    return res.status(400).json({
+      success: false,
+      error: 'Validation error',
+      message: isDevelopment ? err.message : 'Invalid input data'
+    });
+  }
+  
+  if (err.name === 'CastError') {
+    return res.status(400).json({
+      success: false,
+      error: 'Invalid data format',
+      message: isDevelopment ? err.message : 'Invalid request format'
+    });
+  }
+  
+  if (err.name === 'MongoServerError' && err.code === 11000) {
+    return res.status(409).json({
+      success: false,
+      error: 'Duplicate entry',
+      message: 'This record already exists'
+    });
+  }
+  
+  // Generic error response
+  res.status(err.status || 500).json({ 
+    success: false,
+    error: 'Internal server error',
+    message: isDevelopment ? err.message : 'Something went wrong. Please try again later.'
+  });
+});
+
+process.on('unhandledRejection', (reason) => {
+  const message = reason instanceof Error ? reason.message : String(reason);
+  const stackTrace = reason instanceof Error ? reason.stack || '' : '';
+  void storeBackendError({
+    message,
+    stackTrace,
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'production',
+    errorType: 'runtime',
+    source: 'worker',
+  });
+});
+
+process.on('uncaughtException', (error) => {
+  void storeBackendError({
+    message: error?.message || 'Uncaught exception',
+    stackTrace: error?.stack || '',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'production',
+    errorType: 'script',
+    source: 'worker',
+  });
+});
+
+// 404 handler
+app.use('*', (req, res) => {
+  res.status(404).json({ error: 'Route not found' });
+});
+
+// Create HTTP server
+const server = http.createServer(app);
+
+server.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
+});
+
+module.exports = app;

@@ -1,0 +1,58 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Environment variables
+.env
+.env.local
+.env.staging
+.env.*.local
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build outputs
+dist/
+build/
+
+# Script exports (may contain customer data)
+exports/
+
+# Uploaded files / local data dumps
+uploads/
+*.xlsx
+
+# Temporary files and results
+*.pdf
+empost-*.json
+empost-*.xlsx
+EMPOST*.xlsx
+~$*.xlsx
+
+# Credentials and secrets
+client_secret_*.json
+credentials/
+*.pem
+*.key
+
+# Temporary scripts
+get-refresh-token.js
+pdfGenerator.ts
+
+# Scripts folder (excluded from version control)
+scripts/
+
