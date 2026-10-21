@@ -120,6 +120,72 @@ async function getPublicSystemSettings() {
   };
 }
 
+function maskRefreshToken(token) {
+  const value = String(token || '').trim();
+  if (!value) return '';
+  const tail = value.slice(-6);
+  return `••••••••${tail}`;
+}
+
+async function getDriveRefreshToken() {
+  const doc = await getOrCreateSettings();
+  const fromDb = String(doc.google_drive_refresh_token || '').trim();
+  if (fromDb) return fromDb;
+  return String(process.env.GOOGLE_DRIVE_REFRESH_TOKEN || '').trim();
+}
+
+async function getDriveRefreshTokenStatus() {
+  const doc = await getOrCreateSettings();
+  const fromDb = String(doc.google_drive_refresh_token || '').trim();
+  const fromEnv = String(process.env.GOOGLE_DRIVE_REFRESH_TOKEN || '').trim();
+  const token = fromDb || fromEnv;
+  return {
+    configured: Boolean(token),
+    source: fromDb ? 'database' : fromEnv ? 'environment' : 'none',
+    hint: maskRefreshToken(token),
+    updated_at: doc.google_drive_refresh_token_updated_at || null,
+  };
+}
+
+async function setDriveRefreshToken(refreshToken, userId) {
+  const token = String(refreshToken || '').trim();
+  if (!token || token.length < 20) {
+    const err = new Error('Refresh token is required and must be at least 20 characters.');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const doc = await getOrCreateSettings();
+  doc.google_drive_refresh_token = token;
+  doc.google_drive_refresh_token_updated_at = new Date();
+  const updaterId = toValidObjectIdString(userId);
+  if (updaterId) {
+    doc.google_drive_refresh_token_updated_by = updaterId;
+  }
+  await doc.save();
+
+  process.env.GOOGLE_DRIVE_REFRESH_TOKEN = token;
+
+  let connection = null;
+  let warning = null;
+  try {
+    const googleDrive = require('./google-drive');
+    if (typeof googleDrive.invalidate === 'function') {
+      googleDrive.invalidate();
+    }
+    connection = await googleDrive.testConnection();
+  } catch (err) {
+    warning = err.message || 'Token saved, but Google Drive could not be reached.';
+    console.warn('[system-settings] Drive token saved; connection test failed:', warning);
+  }
+
+  return {
+    ...await getDriveRefreshTokenStatus(),
+    connection,
+    warning,
+  };
+}
+
 module.exports = {
   getOrCreateSettings,
   isBookingAutoReviewEnabled,
@@ -127,5 +193,8 @@ module.exports = {
   isPendingReviewStatus,
   resolveAutoReviewReviewerId,
   getPublicSystemSettings,
+  getDriveRefreshToken,
+  getDriveRefreshTokenStatus,
+  setDriveRefreshToken,
   toValidObjectIdString,
 };

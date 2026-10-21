@@ -5,6 +5,7 @@ const { User, Employee } = require('../models');
 const auth = require('../middleware/auth');
 const requireAdmin = require('../middleware/roleAuth');
 const requireSuperAdmin = require('../middleware/roleAuth').requireSuperAdmin;
+const { canAssignRole, preventSelfEscalation } = require('../services/finance-setup/permissions-core');
 
 const router = express.Router();
 
@@ -12,6 +13,7 @@ const router = express.Router();
 router.get('/', auth, requireAdmin, async (req, res) => {
   try {
     const users = await User.find()
+      .select('-password')
       .populate('department_id')
       .populate('employee_id')
       .sort({ createdAt: -1 });
@@ -47,6 +49,11 @@ router.post('/', auth, requireAdmin, [
 
     const { email, password, employee_id, role } = req.body;
 
+    const roleCheck = canAssignRole(req.user.role, 'USER', role);
+    if (!roleCheck.ok) {
+      return res.status(403).json({ success: false, error: roleCheck.error });
+    }
+
     // Check if employee exists
     const employee = await Employee.findById(employee_id).populate('department_id');
     if (!employee) {
@@ -78,6 +85,7 @@ router.post('/', auth, requireAdmin, [
       employee_id: employee_id,
       role,
       isActive: true,
+      must_change_password: true,
     });
 
     await user.save();
@@ -121,7 +129,7 @@ router.put('/:id', auth, requireAdmin, [
       });
     }
 
-    const { email, role, isActive, password } = req.body;
+    const { email, role, isActive, password, finance_capabilities } = req.body;
     const userId = req.params.id;
 
     const user = await User.findById(userId);
@@ -129,11 +137,29 @@ router.put('/:id', auth, requireAdmin, [
       return res.status(404).json({ error: 'User not found' });
     }
 
+    if (role) {
+      const roleCheck = canAssignRole(req.user.role, user.role, role);
+      if (!roleCheck.ok) {
+        return res.status(403).json({ success: false, error: roleCheck.error });
+      }
+      const selfCheck = preventSelfEscalation(req.user, userId, role, finance_capabilities);
+      if (!selfCheck.ok) {
+        return res.status(403).json({ success: false, error: selfCheck.error });
+      }
+    }
+
     // Update fields
     if (email) user.email = email;
     if (role) user.role = role;
     if (typeof isActive === 'boolean') user.isActive = isActive;
-    if (password) user.password = password; // Will be hashed by pre-save hook
+    if (password) {
+      user.password = password; // Will be hashed by pre-save hook
+      user.must_change_password = password === 'password123';
+      user.password_changed_at = password === 'password123' ? undefined : new Date();
+    }
+    if (finance_capabilities && typeof finance_capabilities === 'object' && req.user.role === 'SUPERADMIN') {
+      user.finance_capabilities = finance_capabilities;
+    }
 
     await user.save();
 
@@ -230,6 +256,8 @@ router.post('/change-password', auth, async (req, res) => {
     // Set password as plain text - pre-save hook will hash it automatically
     // This prevents double-hashing issues
     user.password = password;
+    user.must_change_password = false;
+    user.password_changed_at = new Date();
     await user.save();
 
     res.json({
@@ -292,6 +320,8 @@ router.post('/:id/reset-password', auth, requireSuperAdmin, async (req, res) => 
 
     // Set the password (plain text - will be hashed by pre-save hook)
     user.password = newPassword;
+    user.must_change_password = newPassword === 'password123';
+    user.password_changed_at = newPassword === 'password123' ? undefined : new Date();
     await user.save();
 
     // Return user data without password

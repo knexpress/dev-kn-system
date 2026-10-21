@@ -11,29 +11,23 @@ const mongoose = require('mongoose');
  */
 function sanitizeInput(obj) {
   if (obj === null || obj === undefined) return obj;
-  
-  if (typeof obj === 'string') {
-    // Remove MongoDB operators from strings
-    return obj.replace(/\$|\{|\[|\]|\}|\$ne|\$gt|\$gte|\$lt|\$lte|\$in|\$nin|\$exists|\$regex|\$or|\$and/gi, '');
-  }
-  
+
+  // Leave string values intact so invoice memos, rates like "$5/kg", and
+  // document text are not corrupted. Operator injection is blocked on keys.
+  if (typeof obj !== 'object') return obj;
+
   if (Array.isArray(obj)) {
-    return obj.map(item => sanitizeInput(item));
+    return obj.map((item) => sanitizeInput(item));
   }
-  
-  if (typeof obj === 'object') {
-    const sanitized = {};
-    for (const [key, value] of Object.entries(obj)) {
-      // Block MongoDB operators as keys
-      if (key.startsWith('$') || key.includes('__proto__') || key.includes('constructor')) {
-        continue; // Skip dangerous keys
-      }
-      sanitized[key] = sanitizeInput(value);
+
+  const sanitized = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (key.startsWith('$') || key.includes('__proto__') || key.includes('constructor')) {
+      continue;
     }
-    return sanitized;
+    sanitized[key] = sanitizeInput(value);
   }
-  
-  return obj;
+  return sanitized;
 }
 
 /**
@@ -185,12 +179,9 @@ function handleValidationErrors(req, res, next) {
  * Get client IP address (handles proxies)
  */
 function getClientIP(req) {
-  return req.ip || 
-         req.connection.remoteAddress || 
-         req.socket.remoteAddress ||
-         (req.connection.socket ? req.connection.socket.remoteAddress : null) ||
-         req.headers['x-forwarded-for']?.split(',')[0] ||
-         req.headers['x-real-ip'] ||
+  return req.ip ||
+         req.socket?.remoteAddress ||
+         req.connection?.remoteAddress ||
          'unknown';
 }
 

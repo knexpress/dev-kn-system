@@ -90,12 +90,6 @@ const generalLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   skip: (req) => req.path === '/api/health',
-  keyGenerator: (req) => {
-    return req.headers['x-forwarded-for']?.split(',')[0] || 
-           req.headers['x-real-ip'] || 
-           req.ip || 
-           req.connection.remoteAddress;
-  }
 });
 
 const authLimiter = rateLimit({
@@ -107,12 +101,6 @@ const authLimiter = rateLimit({
     message: 'Please try again after 15 minutes'
   },
   skipSuccessfulRequests: true,
-  keyGenerator: (req) => {
-    return req.headers['x-forwarded-for']?.split(',')[0] || 
-           req.headers['x-real-ip'] || 
-           req.ip || 
-           req.connection.remoteAddress;
-  }
 });
 
 app.use('/api/auth', authLimiter);
@@ -134,7 +122,8 @@ app.use(express.urlencoded({
 }));
 
 // MongoDB connection
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://aliabdullah:knex22939@finance.gk7t9we.mongodb.net/finance?retryWrites=true&w=majority&appName=Finance';
+const { mongoUri } = require('./utils/config');
+const MONGODB_URI = mongoUri();
 
 if (MONGODB_URI.startsWith('mongodb+srv://')) {
   const dnsServers = (process.env.DNS_SERVERS || '8.8.8.8,1.1.1.1')

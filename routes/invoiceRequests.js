@@ -10,6 +10,7 @@ const { cleanupBookingIdentityDocumentsForDeliveredInvoiceRequest } = require('.
 const { applyQuoteDetailsToRequest } = require('../utils/quotation-request-sync');
 const auth = require('../middleware/auth');
 const jwt = require('jsonwebtoken');
+const { jwtSecret } = require('../utils/config');
 const {
   upsertQuoteDraftJournal,
   voidQuoteDraftJournal,
@@ -30,7 +31,7 @@ async function optionalUser(req) {
   try {
     const token = req.header('Authorization')?.replace('Bearer ', '');
     if (!token) return null;
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const decoded = jwt.verify(token, jwtSecret());
     const { User } = require('../models');
     return await User.findById(decoded.userId).select('full_name email').lean();
   } catch (_) {

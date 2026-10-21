@@ -8,7 +8,7 @@ The backend uses environment variables for configuration. The environment file i
 
 ```env
 # MongoDB Configuration
-MONGODB_URI=mongodb+srv://aliabdullah:knex22939@finance.gk7t9we.mongodb.net/finance?retryWrites=true&w=majority&appName=Finance
+MONGODB_URI=<set in environment>
 
 # Server Configuration
 PORT=5000

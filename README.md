@@ -34,7 +34,7 @@ cp config.env .env
 
 **Required Environment Variables:**
 ```env
-MONGODB_URI=mongodb+srv://aliabdullah:knex22939@finance.gk7t9we.mongodb.net/finance?retryWrites=true&w=majority&appName=Finance
+MONGODB_URI=<set in environment>
 PORT=5000
 NODE_ENV=development
 FRONTEND_URL=http://localhost:9002

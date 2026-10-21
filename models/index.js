@@ -79,8 +79,33 @@ const userSchema = new mongoose.Schema({
   lastLogin: {
     type: Date,
   },
+  must_change_password: {
+    type: Boolean,
+    default: false,
+  },
+  password_changed_at: {
+    type: Date,
+    required: false,
+  },
+  finance_capabilities: {
+    type: mongoose.Schema.Types.Mixed,
+    required: false,
+  },
 }, {
   timestamps: true,
+});
+
+userSchema.set('toJSON', {
+  transform(_doc, ret) {
+    delete ret.password;
+    return ret;
+  },
+});
+userSchema.set('toObject', {
+  transform(_doc, ret) {
+    delete ret.password;
+    return ret;
+  },
 });
 
 // Hash password before saving
@@ -1161,6 +1186,20 @@ const systemSettingsSchema = new mongoose.Schema({
     required: false,
   },
   booking_auto_review_updated_at: {
+    type: Date,
+    required: false,
+  },
+  google_drive_refresh_token: {
+    type: String,
+    required: false,
+    default: '',
+  },
+  google_drive_refresh_token_updated_by: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: false,
+  },
+  google_drive_refresh_token_updated_at: {
     type: Date,
     required: false,
   },

@@ -1,8 +1,10 @@
 const express = require('express');
 const { Ticket } = require('../models');
 const { createNotificationsForAllUsers } = require('./notifications');
+const auth = require('../middleware/auth');
 
 const router = express.Router();
+router.use(auth);
 
 // Get all tickets
 router.get('/', async (req, res) => {

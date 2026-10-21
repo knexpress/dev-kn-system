@@ -1,10 +1,11 @@
 const express = require('express');
 const { Client } = require('../models/unified-schema');
+const auth = require('../middleware/auth');
 
 const router = express.Router();
 
 // Get all clients
-router.get('/', async (req, res) => {
+router.get('/', auth, async (req, res) => {
   try {
     const clients = await Client.find().sort({ createdAt: -1 });
     res.json({

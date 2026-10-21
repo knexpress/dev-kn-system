@@ -1,5 +1,7 @@
 const mongoose = require('mongoose');
 const { Account, JournalEntry, BankCashAccount } = require('../models/accounting');
+const { glCode } = require('./coa-codes');
+const { assertPeriodOpen, nextOpenPeriodStart } = require('./period-lock');
 
 const SOURCE_LABEL = 'Finance invoice';
 const REVERSAL_LABEL = 'Finance invoice reversal';
@@ -11,28 +13,28 @@ const ADVANCE_LABEL = 'Quotation advance';
 const ADVANCE_APPLY_LABEL = 'Quotation advance applied';
 
 const glCodes = () => ({
-  ar: String(process.env.FINANCE_INVOICE_AR_CODE || '1300').trim(),
-  revenue: String(process.env.FINANCE_INVOICE_REVENUE_CODE || '4000').trim(),
-  shipping: String(process.env.FINANCE_SALES_SHIPPING_CODE || '4010').trim(),
-  pickup: String(process.env.FINANCE_SALES_PICKUP_CODE || '4020').trim(),
-  delivery: String(process.env.FINANCE_SALES_DELIVERY_CODE || '4030').trim(),
-  gateway: String(process.env.FINANCE_GATEWAY_REVENUE_CODE || '4040').trim(),
-  vat: String(process.env.FINANCE_INVOICE_VAT_CODE || '2200').trim(),
-  driverCash: String(process.env.FINANCE_DRIVER_CASH_CODE || '1020').trim(),
-  remitted: String(process.env.FINANCE_REMIT_ACCOUNT_CODE || '1000').trim(),
-  paid: String(process.env.FINANCE_PAID_ACCOUNT_CODE || '1100').trim(),
-  tabby: String(process.env.FINANCE_TABBY_CLEARING_CODE || '1320').trim(),
-  card: String(process.env.FINANCE_CARD_CLEARING_CODE || '1330').trim(),
-  customerAdvance: String(process.env.FINANCE_CUSTOMER_ADVANCE_CODE || '2310').trim(),
+  ar: String(process.env.FINANCE_INVOICE_AR_CODE || glCode('1300')).trim(),
+  revenue: String(process.env.FINANCE_INVOICE_REVENUE_CODE || glCode('4000')).trim(),
+  shipping: String(process.env.FINANCE_SALES_SHIPPING_CODE || glCode('4010')).trim(),
+  pickup: String(process.env.FINANCE_SALES_PICKUP_CODE || glCode('4020')).trim(),
+  delivery: String(process.env.FINANCE_SALES_DELIVERY_CODE || glCode('4030')).trim(),
+  gateway: String(process.env.FINANCE_GATEWAY_REVENUE_CODE || glCode('4040')).trim(),
+  vat: String(process.env.FINANCE_INVOICE_VAT_CODE || glCode('2200')).trim(),
+  driverCash: String(process.env.FINANCE_DRIVER_CASH_CODE || glCode('1020')).trim(),
+  remitted: String(process.env.FINANCE_REMIT_ACCOUNT_CODE || glCode('1000')).trim(),
+  paid: String(process.env.FINANCE_PAID_ACCOUNT_CODE || glCode('1100')).trim(),
+  tabby: String(process.env.FINANCE_TABBY_CLEARING_CODE || glCode('1320')).trim(),
+  card: String(process.env.FINANCE_CARD_CLEARING_CODE || glCode('1330')).trim(),
+  customerAdvance: String(process.env.FINANCE_CUSTOMER_ADVANCE_CODE || glCode('2310')).trim(),
 });
 
 const DEFAULT_ACCOUNTS = {
   ar: { name: 'Accounts Receivable', type: 'Asset', subtype: 'Receivables' },
   revenue: { name: 'Sales Revenue', type: 'Revenue', subtype: 'Operating' },
-  shipping: { name: 'Sale - Shipping Charge', type: 'Revenue', subtype: 'Operating', parent_code: '4000' },
-  pickup: { name: 'Sale - Pickup Charge', type: 'Revenue', subtype: 'Operating', parent_code: '4000' },
-  delivery: { name: 'Sale - Delivery Fee', type: 'Revenue', subtype: 'Operating', parent_code: '4000' },
-  gateway: { name: 'Payment Gateway Revenue', type: 'Revenue', subtype: 'Operating', parent_code: '4000' },
+  shipping: { name: 'Sales - Shipping Charge', type: 'Revenue', subtype: 'Revenue' },
+  pickup: { name: 'Sales - Pick up Charge', type: 'Revenue', subtype: 'Revenue' },
+  delivery: { name: 'Sales - Delivery Fee', type: 'Revenue', subtype: 'Revenue' },
+  gateway: { name: 'Payment getway revenue', type: 'Revenue', subtype: 'Revenue' },
   vat: { name: 'VAT Output Payable', type: 'Liability', subtype: 'Tax' },
   driverCash: { name: 'Cash with Drivers (in transit)', type: 'Asset', subtype: 'Cash' },
   remitted: { name: 'Cash on Hand', type: 'Asset', subtype: 'Cash' },
@@ -98,10 +100,33 @@ async function nextJournalEntryNo(entryDate) {
 
 // entry_no is unique; two invoices generated at the same moment can race for the same number.
 async function createJournalWithNextNo(entryDate, data) {
+  let when = entryDate;
+  const status = String(data?.status || 'POSTED').toUpperCase();
+  const source = String(data?.source || '').toUpperCase();
+  if (status === 'POSTED') {
+    const periodCheck = await assertPeriodOpen(when, 'Journal date');
+    if (periodCheck.error) {
+      if (source === 'ADJUSTMENT') {
+        const next = await nextOpenPeriodStart(when);
+        if (next.error) {
+          const err = new Error(next.error);
+          err.statusCode = 400;
+          throw err;
+        }
+        when = next.when;
+      } else {
+        const err = new Error(periodCheck.error);
+        err.statusCode = 400;
+        err.period_key = periodCheck.period_key;
+        throw err;
+      }
+    }
+  }
+
   for (let attempt = 0; attempt < 5; attempt += 1) {
-    const entry_no = await nextJournalEntryNo(entryDate);
+    const entry_no = await nextJournalEntryNo(when);
     try {
-      return await JournalEntry.create({ ...data, entry_no, entry_date: entryDate });
+      return await JournalEntry.create({ ...data, entry_no, entry_date: when });
     } catch (error) {
       const duplicateNo = error?.code === 11000 && String(error.message || '').includes('entry_no');
       if (!duplicateNo || attempt === 4) throw error;

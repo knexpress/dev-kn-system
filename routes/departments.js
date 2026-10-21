@@ -23,7 +23,7 @@ router.get('/', auth, requireAdmin, async (req, res) => {
 });
 
 // Create department
-router.post('/', async (req, res) => {
+router.post('/', auth, requireAdmin, async (req, res) => {
   try {
     const { name, description } = req.body;
     

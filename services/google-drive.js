@@ -10,17 +10,39 @@ class GoogleDriveService {
   constructor() {
     this.drive = null;
     this.initialized = false;
+    this.refreshTokenUsed = null;
+  }
+
+  invalidate() {
+    this.drive = null;
+    this.initialized = false;
+    this.refreshTokenUsed = null;
+  }
+
+  async testConnection() {
+    await this.initialize();
+    const about = await this.drive.about.get({
+      fields: 'user(displayName,emailAddress)',
+    });
+    return about.data?.user || null;
   }
 
   /**
    * Initialize Google Drive API client
    */
   async initialize() {
-    if (this.initialized) {
-      return;
-    }
-
     try {
+      let storedRefreshToken = '';
+      try {
+        const { getDriveRefreshToken } = require('./system-settings');
+        storedRefreshToken = await getDriveRefreshToken();
+      } catch (err) {
+        storedRefreshToken = String(process.env.GOOGLE_DRIVE_REFRESH_TOKEN || '').trim();
+        if (err) {
+          console.warn('⚠️  Could not read Drive token from settings, using environment:', err.message);
+        }
+      }
+
       // Check if using OAuth 2.0 (preferred for personal accounts)
       // Can be enabled via env var or by having OAuth 2.0 credentials file
       const oauth2CredentialsPath = process.env.GOOGLE_DRIVE_OAUTH2_CREDENTIALS_PATH || 
@@ -29,6 +51,7 @@ class GoogleDriveService {
       const useOAuth2 = process.env.GOOGLE_DRIVE_USE_OAUTH2 === 'true' || 
                        process.env.GOOGLE_DRIVE_CLIENT_ID ||
                        process.env.GOOGLE_DRIVE_CLIENT_SECRET ||
+                       storedRefreshToken ||
                        process.env.GOOGLE_DRIVE_REFRESH_TOKEN ||
                        fs.existsSync(oauth2CredentialsPath);
 
@@ -51,11 +74,15 @@ class GoogleDriveService {
           }
         }
         
-        // Fall back to environment variables (trim to avoid newline/space from env)
+        // Prefer Super Admin-saved token, then environment / file
         const trimEnv = (v) => (v && typeof v === 'string' ? v.trim() : v);
         clientId = clientId || trimEnv(process.env.GOOGLE_DRIVE_CLIENT_ID);
         clientSecret = clientSecret || trimEnv(process.env.GOOGLE_DRIVE_CLIENT_SECRET);
-        refreshToken = refreshToken || trimEnv(process.env.GOOGLE_DRIVE_REFRESH_TOKEN);
+        refreshToken = storedRefreshToken || refreshToken || trimEnv(process.env.GOOGLE_DRIVE_REFRESH_TOKEN);
+
+        if (this.initialized && this.drive && this.refreshTokenUsed === refreshToken) {
+          return;
+        }
         const redirectUri = trimEnv(process.env.GOOGLE_DRIVE_REDIRECT_URI) || 
           (fs.existsSync(oauth2CredentialsPath) ? 
             JSON.parse(fs.readFileSync(oauth2CredentialsPath, 'utf8')).web?.redirect_uris?.[0] : 
@@ -76,9 +103,13 @@ class GoogleDriveService {
         auth.setCredentials({
           refresh_token: refreshToken,
         });
+        this.refreshTokenUsed = refreshToken;
 
         console.log('✅ Using OAuth 2.0 authentication');
       } else {
+        if (this.initialized && this.drive) {
+          return;
+        }
         // Service account authentication (with optional domain-wide delegation)
         const credentialsPath = process.env.GOOGLE_DRIVE_CREDENTIALS_PATH || path.join(__dirname, '../credentials/google-drive-credentials.json');
         

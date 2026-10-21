@@ -155,6 +155,8 @@ const inventoryItemSchema = new mongoose.Schema(
     cogs_account_code: { type: String, default: '5000' },
     income_account_code: { type: String, default: '4000' },
     is_active: { type: Boolean, default: true },
+    is_opening: { type: Boolean, default: false },
+    opening_batch_id: { type: String, required: false },
     created_by_name: { type: String, required: false },
     created_by_email: { type: String, required: false },
     created_by_user_id: {
@@ -231,6 +233,15 @@ const bankCashAccountSchema = new mongoose.Schema(
     last_reconciled_at: { type: Date, required: false },
     last_reconciled_to: { type: Date, required: false },
     last_reconciliation_id: { type: mongoose.Schema.Types.ObjectId, ref: 'BankReconciliation', required: false },
+    purpose: {
+      type: String,
+      enum: ['BANK', 'CASH_BOX', 'PETTY', 'DRIVER', 'CLEARING'],
+      required: false,
+    },
+    recon_start_date: { type: Date, required: false },
+    recon_start_balance: { type: Number, required: false },
+    opening_posted_batch_id: { type: String, required: false },
+    opening_posted_at: { type: Date, required: false },
     created_by_name: { type: String, required: false },
     created_by_email: { type: String, required: false },
     created_by_user_id: {
@@ -419,6 +430,8 @@ const purchaseOrderSchema = new mongoose.Schema(
     ],
     cancelled_at: { type: Date, required: false },
     cancellation_reason: { type: String, required: false },
+    is_opening: { type: Boolean, default: false },
+    opening_batch_id: { type: String, required: false },
   },
   { timestamps: true }
 );
@@ -667,6 +680,8 @@ const fixedAssetSchema = new mongoose.Schema(
       required: false,
     },
     acquisition_journal_no: { type: String, required: false },
+    is_opening: { type: Boolean, default: false },
+    opening_batch_id: { type: String, required: false },
     notes: { type: String, required: false },
     created_by_name: { type: String, required: false },
     created_by_email: { type: String, required: false },
@@ -865,6 +880,8 @@ const salesInvoiceSchema = new mongoose.Schema(
     },
     invoice_journal_no: { type: String, required: false },
     payments: { type: [salesInvoicePaymentSchema], default: [] },
+    is_opening: { type: Boolean, default: false },
+    opening_batch_id: { type: String, required: false },
   },
   { timestamps: true }
 );

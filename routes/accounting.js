@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
 const auth = require('../middleware/auth');
+const requireAdmin = require('../middleware/roleAuth');
 const {
   Account,
   JournalEntry,
@@ -32,6 +33,15 @@ const {
   listPeriodsAround,
   setPeriodStatus,
 } = require('../services/period-lock');
+const {
+  glCode,
+  useFiveDigitCoa,
+  isValidAccountCode,
+  accountCodeError,
+  ensureKnexChartOfAccounts,
+  systemCodes,
+} = require('../services/coa-codes');
+const { upsertAccountToPostgres, suggestNextCode } = require('../services/pg-coa');
 
 const router = express.Router();
 
@@ -106,11 +116,46 @@ function actorFromReq(req) {
 // Chart of Accounts
 router.get('/accounts', auth, async (req, res) => {
   try {
+    await ensureKnexChartOfAccounts(actorFromReq(req));
     const accounts = await Account.find({}).sort({ code: 1 }).lean();
-    res.json({ success: true, data: accounts });
+    res.json({ success: true, data: accounts, meta: { five_digit: useFiveDigitCoa(), system: systemCodes() } });
   } catch (error) {
     console.error('Error fetching accounts:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch accounts' });
+  }
+});
+
+router.get('/accounts/next-code', auth, async (req, res) => {
+  try {
+    await ensureKnexChartOfAccounts(actorFromReq(req));
+    const type = String(req.query.type || 'Asset').trim();
+    const subtype = String(req.query.subtype || '').trim();
+    const existing = await Account.find({}).select('code').lean();
+    const suggested = suggestNextCode(
+      existing.map((a) => a.code),
+      type,
+      subtype
+    );
+    res.json({ success: true, data: { suggested, type, subtype } });
+  } catch (error) {
+    console.error('Error suggesting next account code:', error);
+    res.status(500).json({ success: false, error: 'Failed to suggest account code' });
+  }
+});
+
+router.get('/accounts/system-codes', auth, async (req, res) => {
+  try {
+    await ensureKnexChartOfAccounts(actorFromReq(req));
+    res.json({
+      success: true,
+      data: {
+        five_digit: useFiveDigitCoa(),
+        codes: systemCodes(),
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching system account codes:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch system account codes' });
   }
 });
 
@@ -135,10 +180,10 @@ router.post('/accounts', auth, async (req, res) => {
     if (!accountCode) {
       return res.status(400).json({ success: false, error: 'Account code is required' });
     }
-    if (!/^[A-Za-z0-9.-]{2,20}$/.test(accountCode)) {
+    if (!isValidAccountCode(accountCode)) {
       return res.status(400).json({
         success: false,
-        error: 'Account code must be 2–20 characters (letters, numbers, . or -)',
+        error: accountCodeError(),
       });
     }
     if (!accountName) {
@@ -196,6 +241,12 @@ router.post('/accounts', auth, async (req, res) => {
       created_by_email: createdByEmail,
       created_by_user_id: createdByUserId,
     });
+
+    try {
+      await upsertAccountToPostgres(account.toObject ? account.toObject() : account);
+    } catch (pgError) {
+      console.warn('Could not sync new account to staging Postgres:', pgError.message);
+    }
 
     res.status(201).json({ success: true, data: account });
   } catch (error) {
@@ -670,22 +721,30 @@ router.get('/periods/:periodKey', auth, async (req, res) => {
   }
 });
 
-router.put('/periods/:periodKey', auth, async (req, res) => {
+router.put('/periods/:periodKey', auth, requireAdmin, async (req, res) => {
   try {
     const key = String(req.params.periodKey || '').trim();
-    const { status, notes } = req.body || {};
+    const { status, notes, reason } = req.body || {};
     if (!['OPEN', 'LOCKED'].includes(String(status || '').toUpperCase())) {
       return res.status(400).json({ success: false, error: 'status must be OPEN or LOCKED' });
+    }
+    const nextStatus = String(status).toUpperCase();
+    const unlockReason = String(reason || notes || '').trim();
+    if (nextStatus === 'OPEN' && unlockReason.length < 8) {
+      return res.status(400).json({
+        success: false,
+        error: 'Unlocking a period requires a written reason of at least 8 characters.',
+      });
     }
     const actor = actorFromReq(req);
     const result = await setPeriodStatus(
       key,
-      String(status).toUpperCase(),
+      nextStatus,
       {
         name: actor.created_by_name,
         email: actor.created_by_email,
       },
-      notes
+      unlockReason
     );
     if (result.error) {
       return res.status(400).json({ success: false, error: result.error });
@@ -798,9 +857,9 @@ router.post('/inventory/items', auth, async (req, res) => {
       });
     }
 
-    const assetCode = String(asset_account_code || '1200').trim();
-    const cogsCode = String(cogs_account_code || '5000').trim();
-    const incomeCode = String(income_account_code || '4000').trim();
+    const assetCode = String(asset_account_code || glCode('1200')).trim();
+    const cogsCode = String(cogs_account_code || glCode('5000')).trim();
+    const incomeCode = String(income_account_code || glCode('4000')).trim();
 
     for (const [label, code] of [
       ['Asset', assetCode],
@@ -1109,8 +1168,8 @@ router.post('/inventory/transactions', auth, async (req, res) => {
     let journal = null;
 
     if (shouldPostJournal) {
-      const invAcct = await loadPostableAccount(item.asset_account_code || '1200');
-      const cogsAcct = await loadPostableAccount(item.cogs_account_code || '5000');
+      const invAcct = await loadPostableAccount(item.asset_account_code || glCode('1200'));
+      const cogsAcct = await loadPostableAccount(item.cogs_account_code || glCode('5000'));
       if (!invAcct) {
         return res.status(400).json({
           success: false,
@@ -1130,7 +1189,7 @@ router.post('/inventory/transactions', auth, async (req, res) => {
       const desc = `${txnType} ${item.sku}`;
 
       if (txnType === 'RECEIPT') {
-        const offsetCode = String(offset_account_code || '2000').trim();
+        const offsetCode = String(offset_account_code || glCode('2000')).trim();
         offsetAcct = await loadPostableAccount(offsetCode);
         if (!offsetAcct) {
           return res.status(400).json({
@@ -1173,7 +1232,7 @@ router.post('/inventory/transactions', auth, async (req, res) => {
         };
       } else if (signedQty > 0) {
         // Adjustment increase — same as receipt against COGS/expense recovery or offset
-        const offsetCode = String(offset_account_code || item.cogs_account_code || '5000').trim();
+        const offsetCode = String(offset_account_code || item.cogs_account_code || glCode('5000')).trim();
         offsetAcct = await loadPostableAccount(offsetCode);
         if (!offsetAcct) {
           return res.status(400).json({
@@ -1511,13 +1570,18 @@ async function nextSalesReceiptNo(paymentDate) {
 }
 
 async function ensureDefaultBankCashAccounts(actor = {}) {
+  if (useFiveDigitCoa()) {
+    await ensureKnexChartOfAccounts(actor);
+    return;
+  }
+
   const count = await BankCashAccount.countDocuments();
   if (count > 0) return;
 
-  const existingAp = await Account.findOne({ code: '2000' });
+  const existingAp = await Account.findOne({ code: glCode('2000') });
   if (!existingAp) {
     await Account.create({
-      code: '2000',
+      code: glCode('2000'),
       name: 'Accounts Payable',
       type: 'Liability',
       subtype: 'Payables',
@@ -1532,7 +1596,7 @@ async function ensureDefaultBankCashAccounts(actor = {}) {
       code: 'CASH-MAIN',
       name: 'Petty Cash',
       account_type: 'CASH',
-      gl_account_code: '1000',
+      gl_account_code: glCode('1000'),
       opening_balance: 0,
       current_balance: 0,
       notes: 'Default cash account',
@@ -1543,7 +1607,7 @@ async function ensureDefaultBankCashAccounts(actor = {}) {
       account_type: 'BANK',
       bank_name: 'Primary Bank',
       account_number_masked: '****0001',
-      gl_account_code: '1100',
+      gl_account_code: glCode('1100'),
       opening_balance: 0,
       current_balance: 0,
       notes: 'Default bank account',
@@ -1716,7 +1780,7 @@ router.post('/bank-cash/payments', auth, async (req, res) => {
 
     let supplierName = String(supplier_name || '').trim();
     const payAmount = Number(toNum(amount).toFixed(2));
-    let debitCode = String(debit_account_code || '2000').trim();
+    let debitCode = String(debit_account_code || glCode('2000')).trim();
     const payDate = payment_date ? new Date(payment_date) : new Date();
 
     let linkedPo = null;
@@ -1744,7 +1808,7 @@ router.post('/bank-cash/payments', auth, async (req, res) => {
         });
       }
       supplierName = linkedPo.supplier_name;
-      debitCode = linkedPo.credit_account_code || '2000';
+      debitCode = linkedPo.credit_account_code || glCode('2000');
     }
 
     if (!supplierName) {
@@ -2124,7 +2188,7 @@ router.get('/payables/summary', auth, async (req, res) => {
         .sort({ po_date: -1 })
         .lean(),
       SupplierPayment.find({ status: { $in: ['PENDING_APPROVAL', 'APPROVED'] } }).lean(),
-      Account.findOne({ code: '2000' }).lean(),
+      Account.findOne({ code: glCode('2000') }).lean(),
     ]);
 
     const pendingByPo = new Map();
@@ -2220,9 +2284,9 @@ router.get('/payables/summary', auth, async (req, res) => {
     let ap_gl_balance = 0;
     if (apAccount) {
       const [agg] = await JournalEntry.aggregate([
-        { $match: { status: 'POSTED', 'lines.account_code': '2000' } },
+        { $match: { status: 'POSTED', 'lines.account_code': glCode('2000') } },
         { $unwind: '$lines' },
-        { $match: { 'lines.account_code': '2000' } },
+        { $match: { 'lines.account_code': glCode('2000') } },
         { $group: { _id: null, bal: { $sum: { $subtract: ['$lines.credit', '$lines.debit'] } } } },
       ]);
       ap_gl_balance = Number((agg?.bal || 0).toFixed(2));
@@ -2449,7 +2513,7 @@ function buildPoLines(rawLines) {
 }
 
 function poLineAccountCode(po, line) {
-  return String(line.account_code || po.debit_account_code || '1200').trim();
+  return String(line.account_code || po.debit_account_code || glCode('1200')).trim();
 }
 
 // Splits `net` across debit accounts in proportion to `weights` (Map code -> amount); rounding
@@ -2459,7 +2523,7 @@ async function poDebitJournalLines(po, net, weights, description) {
   const entries =
     total > 0
       ? [...weights.entries()].filter(([, v]) => v > 0)
-      : [[String(po.debit_account_code || '1200'), 1]];
+      : [[String(po.debit_account_code || glCode('1200')), 1]];
   const weightSum = entries.reduce((s, [, v]) => s + v, 0);
   const lines = [];
   let allocated = 0;
@@ -2486,12 +2550,16 @@ async function poDebitJournalLines(po, net, weights, description) {
 }
 
 async function ensurePoAccounts(actor = {}) {
+  if (useFiveDigitCoa()) {
+    await ensureKnexChartOfAccounts(actor);
+    return;
+  }
   const needed = [
-    { code: '1200', name: 'Inventory Asset', type: 'Asset', subtype: 'Inventory' },
-    { code: '1310', name: 'VAT Input Recoverable', type: 'Asset', subtype: 'Tax' },
-    { code: '2000', name: 'Accounts Payable', type: 'Liability', subtype: 'Payables' },
-    { code: '2200', name: 'VAT Output Payable', type: 'Liability', subtype: 'Tax' },
-    { code: '5000', name: 'Cost of Goods Sold', type: 'Expense', subtype: 'COGS' },
+    { code: glCode('1200'), name: 'Inventory Asset', type: 'Asset', subtype: 'Inventory' },
+    { code: glCode('1310'), name: 'VAT Input Recoverable', type: 'Asset', subtype: 'Tax' },
+    { code: glCode('2000'), name: 'Accounts Payable', type: 'Liability', subtype: 'Payables' },
+    { code: glCode('2200'), name: 'VAT Output Payable', type: 'Liability', subtype: 'Tax' },
+    { code: glCode('5000'), name: 'Cost of Goods Sold', type: 'Expense', subtype: 'COGS' },
   ];
   for (const row of needed) {
     const existing = await Account.findOne({ code: row.code });
@@ -2865,8 +2933,8 @@ router.post('/purchase-orders', auth, async (req, res) => {
         ? new Date(invoiceDate.getTime() + termsDays * 24 * 60 * 60 * 1000)
         : undefined;
 
-    const debitCode = String(debit_account_code || '1200').trim();
-    const creditCode = String(credit_account_code || '2000').trim();
+    const debitCode = String(debit_account_code || glCode('1200')).trim();
+    const creditCode = String(credit_account_code || glCode('2000')).trim();
     const debitAccount = await loadPostableAccount(debitCode);
     const creditAccount = await loadPostableAccount(creditCode);
     if (!debitAccount || !creditAccount) {
@@ -3035,8 +3103,8 @@ router.post('/purchase-orders/:id/approve', auth, async (req, res) => {
 
     await ensurePoAccounts(actorFromReq(req));
 
-    const debitAccount = await loadPostableAccount(po.debit_account_code || '1200');
-    const creditAccount = await loadPostableAccount(po.credit_account_code || '2000');
+    const debitAccount = await loadPostableAccount(po.debit_account_code || glCode('1200'));
+    const creditAccount = await loadPostableAccount(po.credit_account_code || glCode('2000'));
     if (!debitAccount || !creditAccount) {
       return res.status(400).json({ success: false, error: 'Linked GL accounts are not postable' });
     }
@@ -3241,8 +3309,8 @@ router.post('/purchase-orders/:id/receive', auth, async (req, res) => {
 async function receiveIntoPo(po, receipts, actor) {
   await ensurePoAccounts(actor);
   const [debitAccount, creditAccount, vatInput] = await Promise.all([
-    loadPostableAccount(po.debit_account_code || '1200'),
-    loadPostableAccount(po.credit_account_code || '2000'),
+    loadPostableAccount(po.debit_account_code || glCode('1200')),
+    loadPostableAccount(po.credit_account_code || glCode('2000')),
     loadPostableAccount('1310'),
   ]);
   if (!debitAccount || !creditAccount || (toNum(po.tax_amount) > 0 && !vatInput)) {
@@ -3565,7 +3633,7 @@ router.post('/petty-cash/fund', auth, async (req, res) => {
     }
 
     const amount = toNum(req.body?.amount);
-    const fundingCode = String(req.body?.funding_account_code || '1100').trim();
+    const fundingCode = String(req.body?.funding_account_code || glCode('1100')).trim();
     const fundDate = req.body?.entry_date ? new Date(req.body.entry_date) : new Date();
     const memo = String(req.body?.memo || '').trim() || 'Petty cash funding';
 
@@ -3573,7 +3641,7 @@ router.post('/petty-cash/fund', auth, async (req, res) => {
       return res.status(400).json({ success: false, error: 'Amount must be greater than zero' });
     }
 
-    const pettyGl = await loadPostableAccount(wallet.gl_account_code || '1000');
+    const pettyGl = await loadPostableAccount(wallet.gl_account_code || glCode('1000'));
     const fundingGl = await loadPostableAccount(fundingCode);
     if (!pettyGl || !fundingGl) {
       return res.status(400).json({ success: false, error: 'GL accounts not postable' });
@@ -3660,7 +3728,7 @@ router.post('/petty-cash/vouchers', auth, async (req, res) => {
     let rawLines = Array.isArray(req.body?.lines) ? req.body.lines : null;
     if (!rawLines || !rawLines.length) {
       const legacyAmount = toNum(req.body?.amount);
-      const legacyCode = String(req.body?.expense_account_code || '5100').trim();
+      const legacyCode = String(req.body?.expense_account_code || glCode('5100')).trim();
       if (!(legacyAmount > 0)) {
         return res.status(400).json({ success: false, error: 'Add at least one line with an amount' });
       }
@@ -3712,7 +3780,7 @@ router.post('/petty-cash/vouchers', auth, async (req, res) => {
       });
     }
 
-    const pettyGl = await loadPostableAccount(wallet.gl_account_code || '1000');
+    const pettyGl = await loadPostableAccount(wallet.gl_account_code || glCode('1000'));
     if (!pettyGl) {
       return res.status(400).json({ success: false, error: 'Petty cash GL account is not postable' });
     }
@@ -3875,12 +3943,12 @@ router.post('/petty-cash/replenishments/:id/approve', auth, async (req, res) => 
     }
 
     const amount = toNum(req.body?.approved_amount ?? row.requested_amount);
-    const fundingCode = String(req.body?.funding_account_code || '1100').trim();
+    const fundingCode = String(req.body?.funding_account_code || glCode('1100')).trim();
     if (!(amount > 0)) {
       return res.status(400).json({ success: false, error: 'Approved amount must be greater than zero' });
     }
 
-    const pettyGl = await loadPostableAccount(wallet.gl_account_code || '1000');
+    const pettyGl = await loadPostableAccount(wallet.gl_account_code || glCode('1000'));
     const fundingGl = await loadPostableAccount(fundingCode);
     if (!pettyGl || !fundingGl) {
       return res.status(400).json({ success: false, error: 'GL accounts not postable' });
@@ -4317,24 +4385,28 @@ router.post('/budgets/:id/close', auth, async (req, res) => {
 });
 
 async function ensureFixedAssetAccounts(actor = {}) {
+  if (useFiveDigitCoa()) {
+    await ensureKnexChartOfAccounts(actor);
+    return;
+  }
   const needed = [
-    { code: '1500', name: 'Fixed Assets', type: 'Asset', subtype: 'Fixed Assets' },
+    { code: glCode('1500'), name: 'Fixed Assets', type: 'Asset', subtype: 'Fixed Assets' },
     {
-      code: '1510',
+      code: glCode('1510'),
       name: 'Accumulated Depreciation',
       type: 'Asset',
       subtype: 'Contra Asset',
     },
     {
-      code: '5200',
+      code: glCode('5200'),
       name: 'Depreciation Expense',
       type: 'Expense',
       subtype: 'Operating',
     },
-    { code: '1100', name: 'Cash at Bank', type: 'Asset', subtype: 'Bank' },
-    { code: '2000', name: 'Accounts Payable', type: 'Liability', subtype: 'Payables' },
+    { code: glCode('1100'), name: 'Cash at Bank', type: 'Asset', subtype: 'Bank' },
+    { code: glCode('2000'), name: 'Accounts Payable', type: 'Liability', subtype: 'Payables' },
     {
-      code: '4900',
+      code: glCode('4900'),
       name: 'Gain/Loss on Asset Disposal',
       type: 'Revenue',
       subtype: 'Other',
@@ -4383,8 +4455,8 @@ async function runAssetDepreciation(asset, periodDate, actor) {
     return { skipped: true, reason: 'Zero depreciation amount' };
   }
 
-  const expenseGl = await loadPostableAccount(asset.depr_expense_account_code || '5200');
-  const accumGl = await loadPostableAccount(asset.accum_depr_account_code || '1510');
+  const expenseGl = await loadPostableAccount(asset.depr_expense_account_code || glCode('5200'));
+  const accumGl = await loadPostableAccount(asset.accum_depr_account_code || glCode('1510'));
   if (!expenseGl || !accumGl) {
     return { skipped: true, reason: 'Depreciation GL accounts not postable' };
   }
@@ -4571,14 +4643,14 @@ router.post('/fixed-assets', auth, async (req, res) => {
       return res.status(400).json({ success: false, error: 'Salvage cannot exceed cost' });
     }
 
-    const assetGl = await loadPostableAccount(String(asset_account_code || '1500').trim());
+    const assetGl = await loadPostableAccount(String(asset_account_code || glCode('1500')).trim());
     if (!assetGl) {
       return res.status(400).json({ success: false, error: 'Asset GL account not postable' });
     }
 
     let acquisitionJournal = null;
     if (post_acquisition_journal) {
-      const fundingGl = await loadPostableAccount(String(funding_account_code || '1100').trim());
+      const fundingGl = await loadPostableAccount(String(funding_account_code || glCode('1100')).trim());
       if (!fundingGl) {
         return res.status(400).json({ success: false, error: 'Funding GL account not postable' });
       }
@@ -4628,8 +4700,8 @@ router.post('/fixed-assets', auth, async (req, res) => {
       useful_life_months: life,
       depreciation_method: 'STRAIGHT_LINE',
       asset_account_code: assetGl.code,
-      accum_depr_account_code: String(accum_depr_account_code || '1510').trim(),
-      depr_expense_account_code: String(depr_expense_account_code || '5200').trim(),
+      accum_depr_account_code: String(accum_depr_account_code || glCode('1510')).trim(),
+      depr_expense_account_code: String(depr_expense_account_code || glCode('5200')).trim(),
       accumulated_depreciation: 0,
       book_value: cost,
       status: 'ACTIVE',
@@ -4731,12 +4803,12 @@ router.post('/fixed-assets/:id/dispose', auth, async (req, res) => {
 
     const proceeds = Math.max(0, toNum(req.body?.proceeds));
     const disposeDate = req.body?.disposal_date ? new Date(req.body.disposal_date) : new Date();
-    const proceedsAccountCode = String(req.body?.proceeds_account_code || '1100').trim();
-    const gainLossCode = String(req.body?.gain_loss_account_code || '4900').trim();
+    const proceedsAccountCode = String(req.body?.proceeds_account_code || glCode('1100')).trim();
+    const gainLossCode = String(req.body?.gain_loss_account_code || glCode('4900')).trim();
     const actor = actorFromReq(req);
 
-    const assetGl = await loadPostableAccount(asset.asset_account_code || '1500');
-    const accumGl = await loadPostableAccount(asset.accum_depr_account_code || '1510');
+    const assetGl = await loadPostableAccount(asset.asset_account_code || glCode('1500'));
+    const accumGl = await loadPostableAccount(asset.accum_depr_account_code || glCode('1510'));
     const proceedsGl = await loadPostableAccount(proceedsAccountCode);
     const gainLossGl = await loadPostableAccount(gainLossCode);
 
@@ -4927,14 +4999,18 @@ router.post('/finance-invoices/post-pending', auth, async (req, res) => {
 // ─── Sales: VAT traders (customers) + invoices ───────────────────────────────
 
 async function ensureSalesAccounts(actor = {}) {
+  if (useFiveDigitCoa()) {
+    await ensureKnexChartOfAccounts(actor);
+    return;
+  }
   const needed = [
-    { code: '1300', name: 'Accounts Receivable', type: 'Asset', subtype: 'Receivables' },
-    { code: '1310', name: 'VAT Input Recoverable', type: 'Asset', subtype: 'Tax' },
-    { code: '4000', name: 'Sales Revenue', type: 'Revenue', subtype: 'Operating' },
-    { code: '2200', name: 'VAT Output Payable', type: 'Liability', subtype: 'Tax' },
-    { code: '1100', name: 'Cash at Bank', type: 'Asset', subtype: 'Bank' },
-    { code: '2210', name: 'VAT Settlement', type: 'Liability', subtype: 'Tax' },
-    { code: '2310', name: 'Customer Payment Due', type: 'Liability', subtype: 'Current' },
+    { code: glCode('1300'), name: 'Accounts Receivable', type: 'Asset', subtype: 'Receivables' },
+    { code: glCode('1310'), name: 'VAT Input Recoverable', type: 'Asset', subtype: 'Tax' },
+    { code: glCode('4000'), name: 'Sales Revenue', type: 'Revenue', subtype: 'Operating' },
+    { code: glCode('2200'), name: 'VAT Output Payable', type: 'Liability', subtype: 'Tax' },
+    { code: glCode('1100'), name: 'Cash at Bank', type: 'Asset', subtype: 'Bank' },
+    { code: glCode('2210'), name: 'VAT Settlement', type: 'Liability', subtype: 'Tax' },
+    { code: glCode('2310'), name: 'Customer Payment Due', type: 'Liability', subtype: 'Current' },
   ];
   for (const row of needed) {
     const existing = await Account.findOne({ code: row.code });
@@ -5510,9 +5586,9 @@ router.post('/sales/invoices', auth, async (req, res) => {
       return res.status(400).json({ success: false, error: 'Customer name is required' });
     }
 
-    const arCode = String(ar_account_code || '1300').trim();
-    const revCode = String(revenue_account_code || '4000').trim();
-    const vatCode = String(vat_account_code || '2200').trim();
+    const arCode = String(ar_account_code || glCode('1300')).trim();
+    const revCode = String(revenue_account_code || glCode('4000')).trim();
+    const vatCode = String(vat_account_code || glCode('2200')).trim();
     const [arGl, revGl, vatGl] = await Promise.all([
       loadPostableAccount(arCode),
       loadPostableAccount(revCode),
@@ -5602,9 +5678,9 @@ router.post('/sales/invoices/:id/approve', auth, async (req, res) => {
       });
     }
 
-    const arGl = await loadPostableAccount(invoice.ar_account_code || '1300');
-    const revGl = await loadPostableAccount(invoice.revenue_account_code || '4000');
-    const vatGl = await loadPostableAccount(invoice.vat_account_code || '2200');
+    const arGl = await loadPostableAccount(invoice.ar_account_code || glCode('1300'));
+    const revGl = await loadPostableAccount(invoice.revenue_account_code || glCode('4000'));
+    const vatGl = await loadPostableAccount(invoice.vat_account_code || glCode('2200'));
     if (!arGl || !revGl || !vatGl) {
       return res.status(400).json({ success: false, error: 'Linked GL accounts are not postable' });
     }
@@ -5755,14 +5831,14 @@ router.post('/sales/invoices/:id/pay', auth, async (req, res) => {
       }
       receiptGl = await loadPostableAccount(wallet.gl_account_code);
     } else {
-      const receiptCode = String(req.body?.receipt_account_code || '1100').trim();
+      const receiptCode = String(req.body?.receipt_account_code || glCode('1100')).trim();
       receiptGl = await loadPostableAccount(receiptCode);
     }
     if (!receiptGl) {
       return res.status(400).json({ success: false, error: 'Receipt GL account is not postable' });
     }
 
-    const arGl = await loadPostableAccount(invoice.ar_account_code || '1300');
+    const arGl = await loadPostableAccount(invoice.ar_account_code || glCode('1300'));
     if (!arGl) {
       return res.status(400).json({ success: false, error: 'AR account is not postable' });
     }
@@ -6415,7 +6491,7 @@ router.post('/vat201/returns/:id/settle', auth, async (req, res) => {
 
     const outputGl = await loadPostableAccount('2200');
     const inputGl = await loadPostableAccount('1310');
-    const bankCode = String(req.body?.bank_account_code || '1100').trim();
+    const bankCode = String(req.body?.bank_account_code || glCode('1100')).trim();
     const bankGl = await loadPostableAccount(bankCode);
 
     if (!outputGl || !inputGl || !bankGl) {

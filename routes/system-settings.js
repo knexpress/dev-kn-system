@@ -1,9 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const auth = require('../middleware/auth');
+const { requireSuperAdmin } = require('../middleware/roleAuth');
 const {
   getPublicSystemSettings,
   setBookingAutoReviewEnabled,
+  getDriveRefreshTokenStatus,
+  setDriveRefreshToken,
 } = require('../services/system-settings');
 
 function canManageSystemSettings(req) {
@@ -72,6 +75,46 @@ router.put('/booking-auto-review', auth, requireSettingsManager, async (req, res
     res.status(500).json({
       success: false,
       error: 'Failed to update system settings',
+      details: error.message,
+    });
+  }
+});
+
+/** GET /api/system-settings/google-drive-refresh-token — SUPERADMIN only */
+router.get('/google-drive-refresh-token', auth, requireSuperAdmin, async (req, res) => {
+  try {
+    const data = await getDriveRefreshTokenStatus();
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('Error reading Drive refresh token status:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to read Google Drive token status',
+      details: error.message,
+    });
+  }
+});
+
+/** PUT /api/system-settings/google-drive-refresh-token — SUPERADMIN only */
+router.put('/google-drive-refresh-token', auth, requireSuperAdmin, async (req, res) => {
+  try {
+    const refreshToken = req.body?.refresh_token ?? req.body?.refreshToken;
+    const data = await setDriveRefreshToken(refreshToken, req.user.id);
+    res.json({
+      success: true,
+      data,
+      message: data.warning
+        ? `Refresh token saved. Drive check failed: ${data.warning}`
+        : 'Google Drive refresh token updated.',
+    });
+  } catch (error) {
+    const status = error.statusCode || 500;
+    if (status >= 500) {
+      console.error('Error updating Drive refresh token:', error);
+    }
+    res.status(status).json({
+      success: false,
+      error: error.statusCode ? error.message : 'Failed to update Google Drive refresh token',
       details: error.message,
     });
   }

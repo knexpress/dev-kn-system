@@ -1,7 +1,9 @@
 const express = require('express');
 const { Request } = require('../models');
+const auth = require('../middleware/auth');
 
 const router = express.Router();
+router.use(auth);
 
 // Get all requests
 router.get('/', async (req, res) => {

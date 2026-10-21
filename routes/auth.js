@@ -3,6 +3,7 @@ const { body, validationResult } = require('express-validator');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { User } = require('../models');
+const { jwtSecret } = require('../utils/config');
 
 const router = express.Router();
 
@@ -54,7 +55,7 @@ router.post('/login', [
     // Generate JWT token
     const token = jwt.sign(
       { userId: user._id, email: user.email },
-      process.env.JWT_SECRET || 'your-secret-key',
+      jwtSecret(),
       { expiresIn: '24h' }
     );
 
@@ -68,6 +69,7 @@ router.post('/login', [
       isActive: user.isActive,
       lastLogin: user.lastLogin,
       employee_id: user.employee_id,
+      must_change_password: user.must_change_password === true || requiresPasswordChange,
     };
 
     res.json({ 

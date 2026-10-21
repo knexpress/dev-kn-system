@@ -1,5 +1,12 @@
 require('dotenv').config();
 const dns = require('dns');
+const { assertRequiredConfig, mongoUri } = require('./utils/config');
+try {
+  assertRequiredConfig();
+} catch (error) {
+  console.error(`❌ ${error.message}`);
+  process.exit(1);
+}
 const express = require('express');
 const http = require('http');
 const path = require('path');
@@ -136,12 +143,6 @@ const generalLimiter = rateLimit({
   }
 });
 
-// Stricter rate limiting for authentication endpoints
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // 5 login attempts per 15 minutes
-  message: {
-    success: false,
     error: 'Too many authentication attempts',
     message: 'Please try again after 15 minutes'
   },
@@ -153,12 +154,6 @@ const authLimiter = rateLimit({
            req.connection.remoteAddress;
   }
 });
-
-// Stricter rate limiting for file uploads
-const uploadLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 hour
-  max: 10, // 10 uploads per hour
-  message: {
     success: false,
     error: 'Too many file uploads',
     message: 'Maximum 10 file uploads per hour allowed'
@@ -178,21 +173,14 @@ app.use(generalLimiter);
 
 // Body parsing middleware with strict limits
 app.use(express.json({ 
-  limit: '10mb',
-  strict: true, // Only parse arrays and objects
-  type: 'application/json'
-}));
-app.use(express.urlencoded({ 
-  extended: true,
-  limit: '10mb',
-  parameterLimit: 50 // Limit number of parameters
-}));
+// Sanitize after the body is parsed so JSON keys can be inspected.
+app.use(sanitizeRequest);
 
 // Trust proxy for accurate IP addresses (if behind reverse proxy)
 app.set('trust proxy', 1);
 
 // MongoDB connection
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://aliabdullah:knex22939@finance.gk7t9we.mongodb.net/finance?retryWrites=true&w=majority&appName=Finance';
+const MONGODB_URI = mongoUri();
 
 // mongodb+srv triggers SRV lookups; some routers/DNS return ECONNREFUSED for _mongodb._tcp.*
 if (/^mongodb\+srv:\/\//i.test(MONGODB_URI) && process.env.MONGO_USE_SYSTEM_DNS !== '1') {
@@ -273,6 +261,18 @@ app.use('/api/delivery-assignments', deliveryAssignmentRoutes);
 app.use('/api/qr-payment-sessions', qrPaymentSessionRoutes);
 app.use('/api/payment-remittances', paymentRemittanceRoutes);
 
+// CSV Upload routes
+app.use('/api/csv-upload', csvUploadRoutes);
+
+// Bookings routes
+app.use('/api/bookings', bookingsRoutes);
+app.use('/api/system-settings', systemSettingsRoutes);
+app.use('/api/finance-setup', require('./routes/finance-setup'));
+app.use('/api/empost', require('./routes/empost-pending'));
+app.use('/api/accounting', require('./routes/accounting'));
+app.use('/api/accounting', require('./routes/bank-reconciliation'));
+app.use('/uploads/accounting', express.static(path.join(__dirname, 'uploads/accounting')));
+app.use('/uploads/finance-setup', express.static(path.join(__dirname, 'uploads/finance-setup')));
 // CSV Upload routes
 app.use('/api/csv-upload', csvUploadRoutes);
 

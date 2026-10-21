@@ -2,8 +2,10 @@ const express = require('express');
 const { Report } = require('../models');
 const { Invoice } = require('../models/unified-schema');
 const { InvoiceRequest } = require('../models');
+const auth = require('../middleware/auth');
 
 const router = express.Router();
+router.use(auth);
 
 // Memory management utilities
 function getMemoryUsage() {
