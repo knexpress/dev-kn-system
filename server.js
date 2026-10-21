@@ -72,9 +72,6 @@ app.use(validateRequestSize);
 // Query complexity limits
 app.use(limitQueryComplexity);
 
-// Input sanitization (must be before body parsing for some routes)
-app.use(sanitizeRequest);
-
 // CORS configuration - allow multiple origins
 const allowedOrigins = [
   'https://finance-system-frontend.vercel.app',
@@ -111,6 +108,9 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 
+// Trust proxy so req.ip is the Render client IP (do not read X-Forwarded-For by hand).
+app.set('trust proxy', 1);
+
 // Enhanced Rate Limiting - Stricter for DDoS protection
 const generalLimiter = rateLimit({
   windowMs: 1 * 60 * 1000, // 1 minute
@@ -125,14 +125,6 @@ const generalLimiter = rateLimit({
   skip: (req) => {
     return req.path === '/api/health';
   },
-  // Use IP from headers if behind proxy
-  keyGenerator: (req) => {
-    return req.headers['x-forwarded-for']?.split(',')[0] || 
-           req.headers['x-real-ip'] || 
-           req.ip || 
-           req.connection.remoteAddress;
-  },
-  // Custom handler
   handler: (req, res) => {
     res.status(429).json({
       success: false,
@@ -143,27 +135,25 @@ const generalLimiter = rateLimit({
   }
 });
 
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // 5 login attempts per 15 minutes
+  message: {
+    success: false,
     error: 'Too many authentication attempts',
     message: 'Please try again after 15 minutes'
   },
   skipSuccessfulRequests: true,
-  keyGenerator: (req) => {
-    return req.headers['x-forwarded-for']?.split(',')[0] || 
-           req.headers['x-real-ip'] || 
-           req.ip || 
-           req.connection.remoteAddress;
-  }
 });
+
+const uploadLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 10, // 10 uploads per hour
+  message: {
     success: false,
     error: 'Too many file uploads',
     message: 'Maximum 10 file uploads per hour allowed'
   },
-  keyGenerator: (req) => {
-    return req.headers['x-forwarded-for']?.split(',')[0] || 
-           req.headers['x-real-ip'] || 
-           req.ip || 
-           req.connection.remoteAddress;
-  }
 });
 
 // Apply rate limiters
@@ -172,12 +162,18 @@ app.use('/api/csv-upload', uploadLimiter);
 app.use(generalLimiter);
 
 // Body parsing middleware with strict limits
-app.use(express.json({ 
+app.use(express.json({
+  limit: '10mb',
+  strict: true,
+  type: 'application/json'
+}));
+app.use(express.urlencoded({
+  extended: true,
+  limit: '10mb',
+  parameterLimit: 50
+}));
 // Sanitize after the body is parsed so JSON keys can be inspected.
 app.use(sanitizeRequest);
-
-// Trust proxy for accurate IP addresses (if behind reverse proxy)
-app.set('trust proxy', 1);
 
 // MongoDB connection
 const MONGODB_URI = mongoUri();
@@ -273,16 +269,6 @@ app.use('/api/accounting', require('./routes/accounting'));
 app.use('/api/accounting', require('./routes/bank-reconciliation'));
 app.use('/uploads/accounting', express.static(path.join(__dirname, 'uploads/accounting')));
 app.use('/uploads/finance-setup', express.static(path.join(__dirname, 'uploads/finance-setup')));
-// CSV Upload routes
-app.use('/api/csv-upload', csvUploadRoutes);
-
-// Bookings routes
-app.use('/api/bookings', bookingsRoutes);
-app.use('/api/system-settings', systemSettingsRoutes);
-app.use('/api/empost', require('./routes/empost-pending'));
-app.use('/api/accounting', require('./routes/accounting'));
-app.use('/api/accounting', require('./routes/bank-reconciliation'));
-app.use('/uploads/accounting', express.static(path.join(__dirname, 'uploads/accounting')));
 
 // Activity tracking routes
 app.use('/api/activity', activityRoutes);
