@@ -99,7 +99,13 @@ function parseLines(rawLines) {
 }
 
 async function loadPostableAccount(code) {
-  const account = await Account.findOne({ code: String(code || '').trim(), is_active: true });
+  const raw = String(code || '').trim();
+  if (!raw) return null;
+  const resolved = glCode(raw);
+  let account = await Account.findOne({ code: resolved, is_active: true });
+  if (!account && resolved !== raw) {
+    account = await Account.findOne({ code: raw, is_active: true });
+  }
   if (!account) return null;
   if (account.is_postable === false) return null;
   return account;
@@ -1773,7 +1779,7 @@ router.post('/bank-cash/payments', auth, async (req, res) => {
       description = '',
       amount,
       bank_cash_account_id,
-      debit_account_code = '2000',
+      debit_account_code = glCode('2000'),
       currency = 'AED',
       purchase_order_id = '',
     } = req.body || {};
@@ -2513,7 +2519,7 @@ function buildPoLines(rawLines) {
 }
 
 function poLineAccountCode(po, line) {
-  return String(line.account_code || po.debit_account_code || glCode('1200')).trim();
+  return glCode(String(line.account_code || po.debit_account_code || '1200').trim());
 }
 
 // Splits `net` across debit accounts in proportion to `weights` (Map code -> amount); rounding
@@ -2883,8 +2889,8 @@ router.post('/purchase-orders', auth, async (req, res) => {
       currency = 'AED',
       tax_amount = 0,
       notes = '',
-      debit_account_code = '1200',
-      credit_account_code = '2000',
+      debit_account_code = glCode('1200'),
+      credit_account_code = glCode('2000'),
       lines: rawLines,
       supplier_invoice_no = '',
       supplier_invoice_date,
@@ -3124,11 +3130,11 @@ router.post('/purchase-orders/:id/approve', auth, async (req, res) => {
     }
     const lines = [];
     if (tax > 0) {
-      const vatInput = await loadPostableAccount('1310');
+      const vatInput = await loadPostableAccount(glCode('1310'));
       if (!vatInput) {
         return res.status(400).json({
           success: false,
-          error: 'VAT Input account 1310 is not postable',
+          error: `VAT Input account ${glCode('1310')} is not postable`,
         });
       }
       const netDebit = Number((amount - tax).toFixed(2));
@@ -3311,7 +3317,7 @@ async function receiveIntoPo(po, receipts, actor) {
   const [debitAccount, creditAccount, vatInput] = await Promise.all([
     loadPostableAccount(po.debit_account_code || glCode('1200')),
     loadPostableAccount(po.credit_account_code || glCode('2000')),
-    loadPostableAccount('1310'),
+    loadPostableAccount(glCode('1310')),
   ]);
   if (!debitAccount || !creditAccount || (toNum(po.tax_amount) > 0 && !vatInput)) {
     return { error: 'Linked GL accounts are not postable' };
@@ -6023,7 +6029,10 @@ async function computeVat201Period(period_start, period_end) {
     JournalEntry.find({
       status: 'POSTED',
       entry_date: { $gte: period_start, $lte: period_end },
-      $or: [{ 'lines.account_code': '2200' }, { 'lines.account_code': '1310' }],
+      $or: [
+        { 'lines.account_code': { $in: [...new Set(['2200', glCode('2200')])] } },
+        { 'lines.account_code': { $in: [...new Set(['1310', glCode('1310')])] } },
+      ],
       // Settling a filed return clears 2200/1310 against the bank; it is not tax for this period.
       source_label: { $ne: 'VAT201 settlement' },
     })
@@ -6110,7 +6119,7 @@ async function computeVat201Period(period_start, period_end) {
     for (const line of je.lines || []) {
       const code = String(line.account_code || '');
       const net = toNum(line.credit) - toNum(line.debit);
-      if (code === '2200') vat += net;
+      if (code === '2200' || code === glCode('2200')) vat += net;
       else if (code.startsWith('4')) revenue += net;
     }
     vat = Number(vat.toFixed(2));
@@ -6188,7 +6197,7 @@ async function computeVat201Period(period_start, period_end) {
       const code = String(line.account_code || '');
       const debit = toNum(line.debit);
       const credit = toNum(line.credit);
-      if (code === '2200') {
+      if (code === '2200' || code === glCode('2200')) {
         glOutputCredits += credit;
         glOutputDebits += debit;
         if (credit > 0 || debit > 0) {
@@ -6202,7 +6211,7 @@ async function computeVat201Period(period_start, period_end) {
           });
         }
       }
-      if (code === '1310') {
+      if (code === '1310' || code === glCode('1310')) {
         glInputDebits += debit;
         glInputCredits += credit;
         if (credit > 0 || debit > 0) {
@@ -6273,8 +6282,8 @@ async function computeVat201Period(period_start, period_end) {
       purchase_count: purchaseSources.length,
     },
     gl_reconciliation: {
-      output_account: '2200',
-      input_account: '1310',
+      output_account: glCode('2200'),
+      input_account: glCode('1310'),
       gl_output_vat_net: glOutputNet,
       gl_input_vat_net: glInputNet,
       doc_output_vat: box4,
@@ -6311,8 +6320,8 @@ router.get('/vat201/overview', auth, async (req, res) => {
           sales: '/dashboard/accounting/sales',
           purchase_orders: '/dashboard/accounting/purchase-orders',
           journals: '/dashboard/accounting/journals',
-          output_gl: '2200',
-          input_gl: '1310',
+          output_gl: glCode('2200'),
+          input_gl: glCode('1310'),
         },
       },
     });
@@ -6489,8 +6498,8 @@ router.post('/vat201/returns/:id/settle', auth, async (req, res) => {
       ? new Date(req.body.settlement_date)
       : new Date();
 
-    const outputGl = await loadPostableAccount('2200');
-    const inputGl = await loadPostableAccount('1310');
+    const outputGl = await loadPostableAccount(glCode('2200'));
+    const inputGl = await loadPostableAccount(glCode('1310'));
     const bankCode = String(req.body?.bank_account_code || glCode('1100')).trim();
     const bankGl = await loadPostableAccount(bankCode);
 
