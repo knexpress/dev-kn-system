@@ -44,6 +44,9 @@ function quoteDetailFields(quotation) {
     'quotation_request.quotation_pickup_vat': quotation.pickup_vat,
     'quotation_request.quotation_delivery_charge': quotation.delivery_charge,
     'quotation_request.quotation_insurance_charge': quotation.insurance_charge,
+    'quotation_request.quotation_discount_type': quotation.discount_type || '',
+    'quotation_request.quotation_discount_value': quotation.discount_value || 0,
+    'quotation_request.quotation_discount_amount': quotation.discount_amount || 0,
   };
 }
 
@@ -66,6 +69,9 @@ function applyQuoteDetailsToRequest(invoiceRequest, quotation) {
   qr.quotation_pickup_vat = quotation.pickup_vat;
   qr.quotation_delivery_charge = quotation.delivery_charge;
   qr.quotation_insurance_charge = quotation.insurance_charge;
+  qr.quotation_discount_type = quotation.discount_type || '';
+  qr.quotation_discount_value = quotation.discount_value || 0;
+  qr.quotation_discount_amount = quotation.discount_amount || 0;
   if (typeof invoiceRequest.markModified === 'function') {
     invoiceRequest.markModified('quotation_request');
   }

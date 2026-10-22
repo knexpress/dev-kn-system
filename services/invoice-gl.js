@@ -18,6 +18,7 @@ const glCodes = () => ({
   shipping: String(process.env.FINANCE_SALES_SHIPPING_CODE || glCode('4010')).trim(),
   pickup: String(process.env.FINANCE_SALES_PICKUP_CODE || glCode('4020')).trim(),
   delivery: String(process.env.FINANCE_SALES_DELIVERY_CODE || glCode('4030')).trim(),
+  salesDiscount: String(process.env.FINANCE_SALES_DISCOUNT_CODE || glCode('salesDiscount') || glCode('40030')).trim(),
   gateway: String(process.env.FINANCE_GATEWAY_REVENUE_CODE || glCode('4040')).trim(),
   vat: String(process.env.FINANCE_INVOICE_VAT_CODE || glCode('2200')).trim(),
   driverCash: String(process.env.FINANCE_DRIVER_CASH_CODE || glCode('1020')).trim(),
@@ -34,6 +35,7 @@ const DEFAULT_ACCOUNTS = {
   shipping: { name: 'Sales - Shipping Charge', type: 'Revenue', subtype: 'Revenue' },
   pickup: { name: 'Sales - Pick up Charge', type: 'Revenue', subtype: 'Revenue' },
   delivery: { name: 'Sales - Delivery Fee', type: 'Revenue', subtype: 'Revenue' },
+  salesDiscount: { name: 'Sales Discount', type: 'Revenue', subtype: 'Revenue' },
   gateway: { name: 'Payment getway revenue', type: 'Revenue', subtype: 'Revenue' },
   vat: { name: 'VAT Output Payable', type: 'Liability', subtype: 'Tax' },
   driverCash: { name: 'Cash with Drivers (in transit)', type: 'Asset', subtype: 'Cash' },
@@ -50,7 +52,21 @@ const PAYMENT_MODES = {
   CASH: { label: 'Cash', rate: 0, debitRole: 'driverCash' },
   BANK_TRANSFER: { label: 'Bank transfer', rate: 0, debitRole: 'paid' },
 };
+const SETTLEMENT_DAYS = { CARD: 1, TABBY: 10 };
 const GATEWAY_VAT_RATE = 0.05;
+
+function isGatewayMode(mode) {
+  const key = String(mode || '').toUpperCase();
+  return key === 'TABBY' || key === 'CARD';
+}
+
+function expectedSettlementAt(mode, collectedAt) {
+  const days = SETTLEMENT_DAYS[String(mode || '').toUpperCase()];
+  if (!days) return null;
+  const expected = new Date(parsePaymentDate(collectedAt));
+  expected.setDate(expected.getDate() + days);
+  return expected;
+}
 
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
@@ -313,7 +329,8 @@ async function postInvoiceJournal(invoice, { actorId, customerName, draftJournal
 
     const total = toAmount(invoice.total_amount);
     const tax = Math.min(toAmount(invoice.tax_amount), total);
-    const revenue = round2(total - tax);
+    const discount = toAmount(invoice.discount_amount);
+    const revenue = round2(total - tax + discount);
     if (total <= 0) {
       await saveGlSync(invoice, { status: 'SKIPPED', last_error: 'Invoice total is zero' });
       return { status: 'SKIPPED', reason: 'Invoice total is zero' };
@@ -328,9 +345,10 @@ async function postInvoiceJournal(invoice, { actorId, customerName, draftJournal
       total
     );
     const needsVat = tax > 0 || gatewayVat > 0;
-    const [arGl, vatGl, ...revenueGls] = await Promise.all([
+    const [arGl, vatGl, discountGl, ...revenueGls] = await Promise.all([
       resolveAccount('ar'),
       needsVat ? resolveAccount('vat') : Promise.resolve(null),
+      discount > 0 ? resolveAccount('salesDiscount') : Promise.resolve(null),
       ...split.map((part) => resolveAccount(part.role)),
     ]);
     const ref = invoiceRef(invoice);
@@ -359,6 +377,21 @@ async function postInvoiceJournal(invoice, { actorId, customerName, draftJournal
         credit: part.amount,
       })),
     ];
+    if (discount > 0 && discountGl) {
+      const pct = Number(invoice.discount_value);
+      const label =
+        String(invoice.discount_type || '').toUpperCase() === 'PERCENT' && pct > 0
+          ? `Sales discount ${pct}% ${ref}${awb}`
+          : `Sales discount ${ref}${awb}`;
+      lines.push({
+        account_id: discountGl._id,
+        account_code: discountGl.code,
+        account_name: discountGl.name,
+        description: label,
+        debit: discount,
+        credit: 0,
+      });
+    }
     if (tax > 0) {
       lines.push({
         account_id: vatGl._id,
@@ -387,8 +420,8 @@ async function postInvoiceJournal(invoice, { actorId, customerName, draftJournal
       source: 'INVOICE',
       status: 'POSTED',
       lines,
-      total_debit: total,
-      total_credit: total,
+      total_debit: round2(total + discount),
+      total_credit: round2(total + discount),
       posted_at: new Date(),
       source_reference: ref,
       source_label: SOURCE_LABEL,
@@ -473,10 +506,14 @@ async function upsertQuoteDraftJournal(request, { actorId } = {}) {
     const pickup = toAmount(q.quotation_pickup_charge);
     const deliveryFee = toAmount(q.quotation_delivery_charge);
     const insurance = toAmount(q.quotation_insurance_charge);
+    const discount = toAmount(q.quotation_discount_amount);
     const total = toAmount(q.quotation_total);
     if (total <= 0) return { status: 'SKIPPED', reason: 'Quotation total is zero' };
-    const tax = round2(Math.max(0, total - (shipping + pickup + deliveryFee + insurance)));
-    const revenue = round2(total - tax);
+    const quotedVat = toAmount(q.quotation_pickup_vat);
+    const tax = quotedVat > 0
+      ? quotedVat
+      : round2(Math.max(0, total - (shipping + pickup + deliveryFee + insurance - discount)));
+    const revenue = round2(total - tax + discount);
     const baseSplit = scaleRevenueParts({ shipping: shipping + deliveryFee + insurance, pickup, delivery: 0 }, revenue);
 
     // Tabby/Card advance already recorded (fee not booked on the advance JE): preview the VAT-inclusive
@@ -511,9 +548,10 @@ async function upsertQuoteDraftJournal(request, { actorId } = {}) {
     };
 
     const needsVat = tax > 0 || gatewayVat > 0;
-    const [arGl, vatGl, ...revenueGls] = await Promise.all([
+    const [arGl, vatGl, discountGl, ...revenueGls] = await Promise.all([
       resolveAccount('ar'),
       needsVat ? resolveAccount('vat') : Promise.resolve(null),
+      discount > 0 ? resolveAccount('salesDiscount') : Promise.resolve(null),
       ...split.map((part) => resolveAccount(part.role)),
     ]);
     const lines = [
@@ -534,6 +572,20 @@ async function upsertQuoteDraftJournal(request, { actorId } = {}) {
         credit: part.amount,
       })),
     ];
+    if (discount > 0 && discountGl) {
+      const pct = Number(q.quotation_discount_value);
+      lines.push({
+        account_id: discountGl._id,
+        account_code: discountGl.code,
+        account_name: discountGl.name,
+        description:
+          String(q.quotation_discount_type || '').toUpperCase() === 'PERCENT' && pct > 0
+            ? `Sales discount ${pct}% ${qno}${awbText}`
+            : `Sales discount ${qno}${awbText}`,
+        debit: discount,
+        credit: 0,
+      });
+    }
     if (tax > 0) {
       lines.push({
         account_id: vatGl._id,
@@ -561,8 +613,8 @@ async function upsertQuoteDraftJournal(request, { actorId } = {}) {
       source: 'INVOICE',
       status: 'DRAFT',
       lines,
-      total_debit: total,
-      total_credit: total,
+      total_debit: round2(total + discount),
+      total_credit: round2(total + discount),
       source_reference: awb || qno,
       source_label: QUOTE_DRAFT_LABEL,
     };
@@ -1048,6 +1100,7 @@ async function recordInvoicePayment(
     gateway_vat: gatewayVat,
     reference: reference ? String(reference).trim() : undefined,
     collected_at: when,
+    expected_settlement_at: expectedSettlementAt(modeKey, when),
     status: 'POSTED',
     journal_id: journal._id,
     journal_no: journal.entry_no,
@@ -1091,6 +1144,9 @@ async function updateInvoicePaymentDate(invoice, paymentId, collectedAt) {
   if (payment.status === 'VOID') return { error: 'This payment was voided' };
 
   payment.collected_at = when;
+  if (isGatewayMode(payment.mode) && !payment.settle_journal_id) {
+    payment.expected_settlement_at = expectedSettlementAt(payment.mode, when);
+  }
   if (payment.journal_id) {
     const journal = await JournalEntry.findById(payment.journal_id);
     if (journal && journal.status !== 'VOID') {
@@ -1212,16 +1268,17 @@ async function recordQuoteAdvance(
 
   const advance = {
     amount: applied,
+    amount_collected: collected,
     mode: modeKey,
     reference: reference ? String(reference).trim() : undefined,
     collected_at: when,
+    expected_settlement_at: expectedSettlementAt(modeKey, when),
     recorded_at: when,
     recorded_by_name: actor.created_by_name,
     journal_id: journal._id,
     journal_no: journal.entry_no,
     ...(gatewayCharge > 0
       ? {
-          amount_collected: collected,
           gateway_charge: gatewayCharge,
           gateway_net: gatewayNet,
           gateway_vat: gatewayVat,
@@ -1399,6 +1456,9 @@ async function applyQuoteAdvanceToInvoice(invoice, invoiceRequest, { actorId } =
 async function reverseQuoteAdvance(invoiceRequest, { actorId, reason } = {}) {
   const adv = quoteAdvanceOf(invoiceRequest);
   if (!adv?.journal_id || adv.void_journal_id) return { skipped: true };
+  if (adv.settle_journal_id) {
+    return { error: `This ${adv.mode || 'gateway'} advance has already been closed to the bank (${adv.settle_journal_no || 'settled'})` };
+  }
   if (adv.applied_journal_id) return { error: 'Advance already applied to an invoice' };
   const original = await JournalEntry.findById(adv.journal_id).lean();
   if (!original || original.status !== 'POSTED') return { skipped: true };
@@ -1424,6 +1484,9 @@ async function voidInvoicePayment(invoice, paymentId, { actorId, reason } = {}) 
   if (!payment) return { error: 'Payment not found on this invoice' };
   if (payment.status === 'VOID') return { error: 'This payment is already voided' };
   if (payment.remitted) return { error: 'This cash has already been remitted, so the payment cannot be voided' };
+  if (payment.settle_journal_id) {
+    return { error: `This ${payment.mode || 'gateway'} payment has already been closed to the bank (${payment.settle_journal_no || 'settled'})` };
+  }
 
   const actor = await resolveActor(actorId);
   let reversal = null;
@@ -1494,5 +1557,8 @@ module.exports = {
   voidQuoteDraftJournal,
   isUaeToPhCode,
   PAYMENT_MODES,
+  SETTLEMENT_DAYS,
+  expectedSettlementAt,
+  isGatewayMode,
   SOURCE_LABEL,
 };

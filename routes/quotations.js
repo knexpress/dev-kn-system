@@ -4,6 +4,7 @@ const { ManualQuotation, InvoiceRequest } = require('../models');
 const auth = require('../middleware/auth');
 const { upsertQuoteDraftJournal, recordManualQuotationAdvance } = require('../services/invoice-gl');
 const { quoteDetailFields } = require('../utils/quotation-request-sync');
+const { computeSalesDiscount } = require('../utils/sales-discount');
 
 const router = express.Router();
 
@@ -227,6 +228,7 @@ function buildQuotationFields(body) {
   const pickupVat = roundMoney(pickupCharge * 0.05);
   const delivery = roundMoney(deliveryCharge);
   const insurance = roundMoney(insuranceCharge);
+  const discount = computeSalesDiscount(shippingAmount, body.discount_type, body.discount_value);
 
   return {
     fields: {
@@ -251,7 +253,10 @@ function buildQuotationFields(body) {
       pickup_vat: pickupVat,
       delivery_charge: delivery,
       insurance_charge: insurance,
-      total_amount: roundMoney(shippingAmount + pickupCharge + pickupVat + delivery + insurance),
+      discount_type: discount.type || '',
+      discount_value: discount.value,
+      discount_amount: discount.amount,
+      total_amount: roundMoney(shippingAmount + pickupCharge + pickupVat + delivery + insurance - discount.amount),
       currency: 'AED',
       notes,
     },
@@ -469,6 +474,9 @@ router.delete('/:id', auth, async (req, res) => {
               'quotation_request.quotation_pickup_vat': '',
               'quotation_request.quotation_delivery_charge': '',
               'quotation_request.quotation_insurance_charge': '',
+              'quotation_request.quotation_discount_type': '',
+              'quotation_request.quotation_discount_value': '',
+              'quotation_request.quotation_discount_amount': '',
             },
           }
         );

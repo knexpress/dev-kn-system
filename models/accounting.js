@@ -28,6 +28,18 @@ const accountSchema = new mongoose.Schema(
 accountSchema.index({ type: 1, code: 1 });
 accountSchema.index({ is_active: 1 });
 
+const supportingDocumentSchema = new mongoose.Schema(
+  {
+    filename: { type: String, required: true },
+    original_name: { type: String, required: true },
+    mime_type: { type: String, required: false },
+    size: { type: Number, required: false },
+    url: { type: String, required: true },
+    uploaded_at: { type: Date, default: Date.now },
+  },
+  { _id: true }
+);
+
 const journalLineSchema = new mongoose.Schema(
   {
     account_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Account', required: true },
@@ -77,16 +89,7 @@ const journalEntrySchema = new mongoose.Schema(
     // Traceability: where this journal originated
     source_reference: { type: String, required: false }, // e.g. INV-001234, IR id, manual note
     source_label: { type: String, required: false }, // human-readable origin
-    supporting_documents: [
-      {
-        filename: { type: String, required: true },
-        original_name: { type: String, required: true },
-        mime_type: { type: String, required: false },
-        size: { type: Number, required: false },
-        url: { type: String, required: true },
-        uploaded_at: { type: Date, default: Date.now },
-      },
-    ],
+    supporting_documents: { type: [supportingDocumentSchema], default: [] },
     // Period-lock corrections: adjustment JE that corrects a locked-period entry
     adjusts_journal_id: {
       type: mongoose.Schema.Types.ObjectId,
@@ -323,6 +326,7 @@ supplierPaymentSchema.add({
   reversal_reason: { type: String, required: false },
   reversal_journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
   reversal_journal_no: { type: String, required: false },
+  supporting_documents: { type: [supportingDocumentSchema], default: [] },
 });
 
 const purchaseOrderLineSchema = new mongoose.Schema(
@@ -333,7 +337,7 @@ const purchaseOrderLineSchema = new mongoose.Schema(
     unit_cost: { type: Number, required: true, min: 0 },
     received_qty: { type: Number, default: 0, min: 0 },
     line_total: { type: Number, required: true, min: 0 },
-    // Debit GL account for this line; falls back to the PO's debit_account_code when absent
+    // Debit GL for this line; falls back to the PO header debit only when that header is set
     account_code: { type: String, required: false, trim: true },
     account_name: { type: String, required: false },
   },
@@ -388,7 +392,8 @@ const purchaseOrderSchema = new mongoose.Schema(
     tax_amount: { type: Number, default: 0 },
     total_amount: { type: Number, default: 0 },
     amount_paid: { type: Number, default: 0 },
-    debit_account_code: { type: String, default: '1200' }, // Inventory / expense
+    // Header fallback for new lines / journals. Null when line items have their own debit GLs.
+    debit_account_code: { type: String, required: false, default: undefined },
     debit_account_name: { type: String, required: false },
     credit_account_code: { type: String, default: '2000' }, // AP
     credit_account_name: { type: String, required: false },
@@ -432,6 +437,7 @@ const purchaseOrderSchema = new mongoose.Schema(
     cancellation_reason: { type: String, required: false },
     is_opening: { type: Boolean, default: false },
     opening_batch_id: { type: String, required: false },
+    supporting_documents: { type: [supportingDocumentSchema], default: [] },
   },
   { timestamps: true }
 );
@@ -523,6 +529,7 @@ const pettyCashVoucherSchema = new mongoose.Schema(
       required: false,
     },
     journal_entry_no: { type: String, required: false },
+    supporting_documents: { type: [supportingDocumentSchema], default: [] },
   },
   { timestamps: true }
 );
@@ -882,6 +889,7 @@ const salesInvoiceSchema = new mongoose.Schema(
     payments: { type: [salesInvoicePaymentSchema], default: [] },
     is_opening: { type: Boolean, default: false },
     opening_batch_id: { type: String, required: false },
+    supporting_documents: { type: [supportingDocumentSchema], default: [] },
   },
   { timestamps: true }
 );
@@ -1096,6 +1104,7 @@ const invoiceNoteSchema = new mongoose.Schema(
     void_reason: { type: String, required: false },
     void_journal_no: { type: String, required: false },
     void_refund_journal_no: { type: String, required: false },
+    supporting_documents: { type: [supportingDocumentSchema], default: [] },
   },
   { timestamps: true }
 );
