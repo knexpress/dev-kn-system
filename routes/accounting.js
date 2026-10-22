@@ -23,10 +23,18 @@ const {
   SalesInvoice,
   Vat201Return,
   EInvoice,
+  InvoiceNote,
 } = require('../models/accounting');
 const crypto = require('crypto');
 const einvoicing = require('../services/einvoicing');
-const { nextJournalEntryNo, postInvoiceJournal, syncInvoiceReceipts } = require('../services/invoice-gl');
+const {
+  nextJournalEntryNo,
+  postInvoiceJournal,
+  syncInvoiceReceipts,
+  createJournalWithNextNo,
+  adjustWalletBalances,
+} = require('../services/invoice-gl');
+const { listGatewayClearance, settleGatewayClearance } = require('../services/gateway-clearance');
 const {
   assertPeriodOpen,
   nextOpenPeriodStart,
@@ -693,6 +701,71 @@ router.put('/journals/:id', auth, upload.array('documents', 5), async (req, res)
       success: false,
       error: error.message || 'Failed to update journal entry',
     });
+  }
+});
+
+function mapUploadedDocs(files) {
+  return (files || []).map((file) => ({
+    filename: file.filename,
+    original_name: file.originalname,
+    mime_type: file.mimetype,
+    size: file.size,
+    url: `/uploads/accounting/${file.filename}`,
+    uploaded_at: new Date(),
+  }));
+}
+
+function attachmentModel(kind) {
+  const models = {
+    'purchase-order': PurchaseOrder,
+    'sales-invoice': SalesInvoice,
+    'supplier-payment': SupplierPayment,
+    'petty-cash': PettyCashVoucher,
+    'invoice-note': InvoiceNote,
+    journal: JournalEntry,
+  };
+  if (kind === 'shipment-invoice') {
+    return require('../models/unified-schema').Invoice;
+  }
+  return models[kind] || null;
+}
+
+// Supporting files on drafts, unpaid invoices, POs, payments, notes, journals.
+router.post('/attachments/:kind/:id', auth, upload.array('documents', 5), async (req, res) => {
+  try {
+    const Model = attachmentModel(String(req.params.kind || ''));
+    if (!Model) return res.status(400).json({ success: false, error: 'Unknown document type' });
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, error: 'Invalid id' });
+    }
+    const docs = mapUploadedDocs(req.files);
+    if (!docs.length) {
+      return res.status(400).json({ success: false, error: 'Choose at least one file' });
+    }
+    const record = await Model.findById(req.params.id);
+    if (!record) return res.status(404).json({ success: false, error: 'Record not found' });
+    record.supporting_documents = [...(record.supporting_documents || []), ...docs];
+    await record.save();
+    res.json({ success: true, data: record.supporting_documents });
+  } catch (error) {
+    console.error('Error uploading supporting documents:', error);
+    res.status(500).json({ success: false, error: error.message || 'Failed to upload documents' });
+  }
+});
+
+router.delete('/attachments/:kind/:id/:docId', auth, async (req, res) => {
+  try {
+    const Model = attachmentModel(String(req.params.kind || ''));
+    if (!Model) return res.status(400).json({ success: false, error: 'Unknown document type' });
+    const record = await Model.findById(req.params.id);
+    if (!record) return res.status(404).json({ success: false, error: 'Record not found' });
+    const before = record.supporting_documents || [];
+    record.supporting_documents = before.filter((d) => String(d._id) !== String(req.params.docId));
+    await record.save();
+    res.json({ success: true, data: record.supporting_documents });
+  } catch (error) {
+    console.error('Error removing supporting document:', error);
+    res.status(500).json({ success: false, error: 'Failed to remove document' });
   }
 });
 
@@ -1755,6 +1828,175 @@ router.post('/bank-cash/accounts', auth, async (req, res) => {
   }
 });
 
+const BANK_CASH_ENTRY_LABEL = 'Bank & cash entry';
+
+function parseEntryDate(value) {
+  if (!value) return new Date();
+  const text = String(value).trim();
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (match) return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 12, 0, 0);
+  const parsed = new Date(text);
+  return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+}
+
+router.get('/bank-cash/entries', auth, async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
+    const entries = await JournalEntry.find({
+      source_label: BANK_CASH_ENTRY_LABEL,
+      status: { $ne: 'VOID' },
+    })
+      .sort({ entry_date: -1, createdAt: -1 })
+      .limit(limit)
+      .lean();
+    res.json({ success: true, data: entries });
+  } catch (error) {
+    console.error('Error listing bank-cash entries:', error);
+    res.status(500).json({ success: false, error: 'Failed to load bank & cash entries' });
+  }
+});
+
+router.post('/bank-cash/entries', auth, async (req, res) => {
+  try {
+    const {
+      entry_date,
+      direction,
+      amount,
+      bank_cash_account_id,
+      to_bank_cash_account_id,
+      counter_account_code,
+      reference = '',
+      memo = '',
+    } = req.body || {};
+
+    const kind = String(direction || '').toUpperCase();
+    const payAmount = Number(toNum(amount).toFixed(2));
+    const when = parseEntryDate(entry_date);
+    const note = String(memo || '').trim();
+    const ref = String(reference || '').trim();
+
+    if (!['IN', 'OUT', 'TRANSFER'].includes(kind)) {
+      return res.status(400).json({ success: false, error: 'Choose money in, money out, or transfer' });
+    }
+    if (!(payAmount > 0)) {
+      return res.status(400).json({ success: false, error: 'Enter an amount greater than 0' });
+    }
+
+    const wallet = await BankCashAccount.findById(bank_cash_account_id);
+    if (!wallet || wallet.is_active === false) {
+      return res.status(400).json({ success: false, error: 'Bank or cash account not found or inactive' });
+    }
+    const walletGl = await loadPostableAccount(wallet.gl_account_code);
+    if (!walletGl) {
+      return res.status(400).json({ success: false, error: `Linked GL ${wallet.gl_account_code} is not postable` });
+    }
+
+    let otherGl = null;
+    let otherWallet = null;
+    if (kind === 'TRANSFER') {
+      if (String(to_bank_cash_account_id) === String(wallet._id)) {
+        return res.status(400).json({ success: false, error: 'Choose a different account to transfer into' });
+      }
+      otherWallet = await BankCashAccount.findById(to_bank_cash_account_id);
+      if (!otherWallet || otherWallet.is_active === false) {
+        return res.status(400).json({ success: false, error: 'Destination bank or cash account not found or inactive' });
+      }
+      otherGl = await loadPostableAccount(otherWallet.gl_account_code);
+      if (!otherGl) {
+        return res.status(400).json({ success: false, error: `Linked GL ${otherWallet.gl_account_code} is not postable` });
+      }
+    } else {
+      otherGl = await loadPostableAccount(counter_account_code);
+      if (!otherGl) {
+        return res.status(400).json({ success: false, error: 'Choose a postable counterpart account' });
+      }
+      if (otherGl.code === walletGl.code) {
+        return res.status(400).json({ success: false, error: 'Counterpart cannot be the same as the bank or cash GL' });
+      }
+    }
+
+    if (kind !== 'IN' && toNum(wallet.current_balance) + 0.009 < payAmount) {
+      return res.status(400).json({
+        success: false,
+        error: `Insufficient balance in ${wallet.name} (available AED ${toNum(wallet.current_balance).toFixed(2)})`,
+      });
+    }
+
+    const actor = actorFromReq(req);
+    const directionLabel = kind === 'IN' ? 'Money in' : kind === 'OUT' ? 'Money out' : 'Transfer';
+    const what = note || (kind === 'TRANSFER' ? `Transfer ${wallet.name} → ${otherWallet.name}` : `${directionLabel} ${wallet.name}`);
+    const refText = ref ? ` · ${ref}` : '';
+
+    const debitGl = kind === 'OUT' ? otherGl : kind === 'TRANSFER' ? otherGl : walletGl;
+    const creditGl = kind === 'OUT' ? walletGl : kind === 'TRANSFER' ? walletGl : otherGl;
+    const debitText =
+      kind === 'IN'
+        ? `${wallet.name} received${refText}`
+        : kind === 'OUT'
+          ? `${otherGl.name} paid from ${wallet.name}${refText}`
+          : `${otherWallet.name} from ${wallet.name}${refText}`;
+    const creditText =
+      kind === 'IN'
+        ? `${otherGl.name} against ${wallet.name}${refText}`
+        : kind === 'OUT'
+          ? `Paid from ${wallet.name}${refText}`
+          : `${wallet.name} to ${otherWallet.name}${refText}`;
+
+    const journal = await createJournalWithNextNo(when, {
+      memo: what,
+      source: 'MANUAL',
+      status: 'POSTED',
+      lines: [
+        {
+          account_id: debitGl._id,
+          account_code: debitGl.code,
+          account_name: debitGl.name,
+          description: debitText,
+          debit: payAmount,
+          credit: 0,
+        },
+        {
+          account_id: creditGl._id,
+          account_code: creditGl.code,
+          account_name: creditGl.name,
+          description: creditText,
+          debit: 0,
+          credit: payAmount,
+        },
+      ],
+      total_debit: payAmount,
+      total_credit: payAmount,
+      posted_at: new Date(),
+      source_reference: ref || wallet.code,
+      source_label: BANK_CASH_ENTRY_LABEL,
+      ...actor,
+    });
+    await adjustWalletBalances(journal.lines);
+
+    res.status(201).json({
+      success: true,
+      data: {
+        journal,
+        direction: kind,
+        amount: payAmount,
+        bank_cash_account_id: wallet._id,
+        bank_cash_account_name: wallet.name,
+        to_bank_cash_account_name: otherWallet?.name,
+        counter_account_code: otherGl.code,
+        counter_account_name: otherGl.name,
+      },
+    });
+  } catch (error) {
+    const status = error.statusCode || 500;
+    console.error('Error creating bank-cash entry:', error);
+    res.status(status).json({
+      success: false,
+      error: status === 400 ? error.message : 'Failed to post bank & cash entry',
+      period_key: error.period_key,
+    });
+  }
+});
+
 router.get('/bank-cash/payments', auth, async (req, res) => {
   try {
     const status = String(req.query.status || '').trim().toUpperCase();
@@ -2108,6 +2350,59 @@ router.post('/bank-cash/payments/:id/reject', auth, async (req, res) => {
   } catch (error) {
     console.error('Error rejecting supplier payment:', error);
     res.status(500).json({ success: false, error: 'Failed to reject supplier payment' });
+  }
+});
+
+// Tabby / card receipts sitting in 11030 / 11020 until the merchant remits to the bank.
+router.get('/gateway-clearance', auth, async (req, res) => {
+  try {
+    const data = await listGatewayClearance({ status: req.query.status });
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('Error listing gateway clearance:', error);
+    res.status(500).json({ success: false, error: 'Failed to load Tabby / card clearance' });
+  }
+});
+
+router.post('/gateway-clearance/settle', auth, async (req, res) => {
+  try {
+    if (!isFinanceManager(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only Finance Manager / Admin can close a Tabby or card remittance',
+      });
+    }
+    const result = await settleGatewayClearance(
+      {
+        id: req.body?.id,
+        bank_cash_account_id: req.body?.bank_cash_account_id,
+        settled_at: req.body?.settled_at,
+      },
+      actorFromReq(req)
+    );
+    if (result.error) {
+      return res.status(result.already ? 409 : 400).json({
+        success: false,
+        error: result.error,
+        journal_no: result.journal_no,
+      });
+    }
+    res.json({
+      success: true,
+      data: {
+        item: result.item,
+        journal_no: result.journal?.entry_no,
+        invoice: result.invoice,
+      },
+    });
+  } catch (error) {
+    const status = error.statusCode || 500;
+    console.error('Error settling gateway clearance:', error);
+    res.status(status).json({
+      success: false,
+      error: status === 400 ? error.message : 'Failed to close Tabby / card remittance',
+      period_key: error.period_key,
+    });
   }
 });
 
@@ -2518,8 +2813,27 @@ function buildPoLines(rawLines) {
     .filter((l) => l.description && l.quantity > 0);
 }
 
+function uniqueLineDebitCodes(lines) {
+  return [
+    ...new Set(
+      (lines || [])
+        .map((line) => glCode(String(line.account_code || '').trim()))
+        .filter(Boolean)
+    ),
+  ];
+}
+
+function resolvePoHeaderDebit(requested, lines) {
+  const unique = uniqueLineDebitCodes(lines);
+  const requestedCode = String(requested || '').trim();
+  if (unique.length > 1) return '';
+  if (unique.length === 1 && requestedCode && glCode(requestedCode) !== unique[0]) return '';
+  return requestedCode;
+}
+
 function poLineAccountCode(po, line) {
-  return glCode(String(line.account_code || po.debit_account_code || '1200').trim());
+  const raw = String(line.account_code || po.debit_account_code || '').trim();
+  return raw ? glCode(raw) : '';
 }
 
 // Splits `net` across debit accounts in proportion to `weights` (Map code -> amount); rounding
@@ -2529,7 +2843,10 @@ async function poDebitJournalLines(po, net, weights, description) {
   const entries =
     total > 0
       ? [...weights.entries()].filter(([, v]) => v > 0)
-      : [[String(po.debit_account_code || glCode('1200')), 1]];
+      : po.debit_account_code
+        ? [[String(po.debit_account_code), 1]]
+        : [];
+  if (!entries.length) return { error: 'No debit account on line items' };
   const weightSum = entries.reduce((s, [, v]) => s + v, 0);
   const lines = [];
   let allocated = 0;
@@ -2889,7 +3206,7 @@ router.post('/purchase-orders', auth, async (req, res) => {
       currency = 'AED',
       tax_amount = 0,
       notes = '',
-      debit_account_code = glCode('1200'),
+      debit_account_code = '',
       credit_account_code = glCode('2000'),
       lines: rawLines,
       supplier_invoice_no = '',
@@ -2939,19 +3256,27 @@ router.post('/purchase-orders', auth, async (req, res) => {
         ? new Date(invoiceDate.getTime() + termsDays * 24 * 60 * 60 * 1000)
         : undefined;
 
-    const debitCode = String(debit_account_code || glCode('1200')).trim();
+    const debitCode = resolvePoHeaderDebit(debit_account_code, lines);
     const creditCode = String(credit_account_code || glCode('2000')).trim();
-    const debitAccount = await loadPostableAccount(debitCode);
+    const debitAccount = debitCode ? await loadPostableAccount(debitCode) : null;
     const creditAccount = await loadPostableAccount(creditCode);
-    if (!debitAccount || !creditAccount) {
+    if ((debitCode && !debitAccount) || !creditAccount) {
       return res.status(400).json({
         success: false,
         error: 'Debit/credit GL accounts must be postable',
       });
     }
     for (const line of lines) {
-      const code = line.account_code || debitCode;
-      const account = code === debitCode ? debitAccount : await loadPostableAccount(code);
+      const code = String(line.account_code || debitCode || '').trim();
+      if (!code) {
+        return res.status(400).json({
+          success: false,
+          error: `Choose a debit GL on line "${line.description}"`,
+        });
+      }
+      const account = debitAccount && code === debitAccount.code
+        ? debitAccount
+        : await loadPostableAccount(code);
       if (!account) {
         return res.status(400).json({
           success: false,
@@ -2985,8 +3310,8 @@ router.post('/purchase-orders', auth, async (req, res) => {
       subtotal,
       tax_amount: tax,
       total_amount: total,
-      debit_account_code: debitCode,
-      debit_account_name: debitAccount.name,
+      debit_account_code: debitAccount ? debitAccount.code : null,
+      debit_account_name: debitAccount ? debitAccount.name : null,
       credit_account_code: creditCode,
       credit_account_name: creditAccount.name,
       notes: String(notes || '').trim(),
@@ -3109,10 +3434,23 @@ router.post('/purchase-orders/:id/approve', auth, async (req, res) => {
 
     await ensurePoAccounts(actorFromReq(req));
 
-    const debitAccount = await loadPostableAccount(po.debit_account_code || glCode('1200'));
+    const headerDebit = resolvePoHeaderDebit(po.debit_account_code, po.lines);
+    if (headerDebit !== String(po.debit_account_code || '').trim()) {
+      po.debit_account_code = headerDebit || null;
+      po.debit_account_name = null;
+    }
+    const debitAccount = headerDebit ? await loadPostableAccount(headerDebit) : null;
     const creditAccount = await loadPostableAccount(po.credit_account_code || glCode('2000'));
-    if (!debitAccount || !creditAccount) {
+    if ((headerDebit && !debitAccount) || !creditAccount) {
       return res.status(400).json({ success: false, error: 'Linked GL accounts are not postable' });
+    }
+    for (const line of po.lines) {
+      if (!poLineAccountCode(po, line)) {
+        return res.status(400).json({
+          success: false,
+          error: `Choose a debit GL on line "${line.description}"`,
+        });
+      }
     }
 
     const actor = actorFromReq(req);
@@ -3314,15 +3652,22 @@ router.post('/purchase-orders/:id/receive', auth, async (req, res) => {
 // newly received value. Mutates and saves the PO; returns { error } when nothing can be posted.
 async function receiveIntoPo(po, receipts, actor) {
   await ensurePoAccounts(actor);
+  const headerDebit = resolvePoHeaderDebit(po.debit_account_code, po.lines);
+  if (headerDebit !== String(po.debit_account_code || '').trim()) {
+    po.debit_account_code = headerDebit || null;
+    po.debit_account_name = null;
+  }
   const [debitAccount, creditAccount, vatInput] = await Promise.all([
-    loadPostableAccount(po.debit_account_code || glCode('1200')),
+    headerDebit ? loadPostableAccount(headerDebit) : Promise.resolve(null),
     loadPostableAccount(po.credit_account_code || glCode('2000')),
     loadPostableAccount(glCode('1310')),
   ]);
-  if (!debitAccount || !creditAccount || (toNum(po.tax_amount) > 0 && !vatInput)) {
+  if ((headerDebit && !debitAccount) || !creditAccount || (toNum(po.tax_amount) > 0 && !vatInput)) {
     return { error: 'Linked GL accounts are not postable' };
   }
-  for (const code of new Set(po.lines.map((l) => poLineAccountCode(po, l)))) {
+  for (const line of po.lines) {
+    const code = poLineAccountCode(po, line);
+    if (!code) return { error: `Choose a debit GL on line "${line.description}"` };
     if (!(await loadPostableAccount(code))) return { error: `GL account ${code} is not postable` };
   }
 

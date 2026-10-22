@@ -22,6 +22,7 @@ const {
   PAYMENT_MODES,
 } = require('../services/invoice-gl');
 const { raiseCancellationInvoice } = require('../services/cancellation-invoice');
+const { computeSalesDiscount } = require('../utils/sales-discount');
 const auth = require('../middleware/auth');
 const { blockingNotesFor } = require('../services/invoice-notes');
 
@@ -154,6 +155,9 @@ const transformInvoice = (invoice) => {
     pickup_base_amount: convertDecimal128(invoiceObj.pickup_base_amount),
     pickup_charge: convertDecimal128(invoiceObj.pickup_charge),
     insurance_charge: convertDecimal128(invoiceObj.insurance_charge),
+    discount_type: invoiceObj.discount_type || '',
+    discount_value: convertDecimal128(invoiceObj.discount_value) || 0,
+    discount_amount: convertDecimal128(invoiceObj.discount_amount) || 0,
     base_amount: convertDecimal128(invoiceObj.base_amount),
     base_rate: convertDecimal128(invoiceObj.base_rate), // CRITICAL: Convert base_rate from Decimal128 to number
     tax_amount: convertDecimal128(invoiceObj.tax_amount),
@@ -749,6 +753,9 @@ router.post('/', async (req, res) => {
       total_amount_cod, // NEW: COD Invoice total (PH_TO_UAE only)
       total_amount_tax_invoice, // NEW: Tax Invoice total (PH_TO_UAE only)
       prepaid_payment, // UAE_TO_PH: { mode, reference, collected_at } — customer already paid; invoice is settled on creation
+      discount_type: providedDiscountType,
+      discount_value: providedDiscountValue,
+      discount_amount: providedDiscountAmount,
     } = req.body;
 
     const prepaidMode = prepaid_payment?.mode ? String(prepaid_payment.mode).toUpperCase() : null;
@@ -1183,8 +1190,22 @@ router.post('/', async (req, res) => {
     // Calculate subtotal (all charges combined)
     // IMPORTANT: For UAE_TO_PH Flomic shipments, pickup charge MUST be included in subtotal
     // Ensure pickupCharge is the final value (from pickup_base_amount or line_items)
+    const quotedDiscount = invoiceRequest?.quotation_request || {};
+    const discount = computeSalesDiscount(
+      shippingCharge,
+      providedDiscountType || quotedDiscount.quotation_discount_type,
+      providedDiscountValue != null && providedDiscountValue !== ''
+        ? providedDiscountValue
+        : quotedDiscount.quotation_discount_value
+    );
+    if (providedDiscountAmount != null && Number(providedDiscountAmount) > 0 && !discount.amount) {
+      discount.amount = Math.round(Math.min(Number(providedDiscountAmount), shippingCharge) * 100) / 100;
+      discount.type = String(providedDiscountType || quotedDiscount.quotation_discount_type || 'AMOUNT').toUpperCase();
+      discount.value = Number(providedDiscountValue != null ? providedDiscountValue : discount.amount) || discount.amount;
+    }
+
     const subtotal = shippingCharge + pickupCharge + deliveryCharge + insuranceCharge;
-    const baseAmount = Math.round(subtotal * 100) / 100;
+    const baseAmount = Math.round((subtotal - discount.amount) * 100) / 100;
     
     console.log('📊 Charge Extraction Summary:');
     console.log(`   Service Code: ${serviceCode || 'N/A'}`);
@@ -1203,7 +1224,7 @@ router.post('/', async (req, res) => {
     
     // Verify insurance charge is included in subtotal for UAE_TO_PH
     if (isUaeToPhForVerification && insuranceCharge > 0) {
-      const expectedSubtotal = shippingCharge + pickupCharge + deliveryCharge + insuranceCharge;
+      const expectedSubtotal = shippingCharge + pickupCharge + deliveryCharge + insuranceCharge - (discount.amount || 0);
       if (Math.abs(baseAmount - expectedSubtotal) < 0.01) {
         console.log(`   ✅ VERIFIED: Insurance charge (${insuranceCharge} AED) is correctly included in baseAmount`);
       } else {
@@ -1361,7 +1382,9 @@ router.post('/', async (req, res) => {
       // IMPORTANT: Use pickupCharge (final value) which includes pickup from pickup_base_amount OR line_items
       // pickupCharge is already calculated above (line 984) and includes pickup from either source
       const codPickupCharge = pickupCharge; // Use the final pickupCharge value (from pickup_base_amount or line_items)
-      calculatedTotalAmountCod = Math.round((shippingCharge + codPickupCharge + codDeliveryCharge) * 100) / 100;
+      calculatedTotalAmountCod = Math.round(
+        (shippingCharge + codPickupCharge + codDeliveryCharge - (discount.amount || 0)) * 100
+      ) / 100;
       
       // Store cod_delivery_charge separately for COD invoices (independent from Tax invoice delivery_charge)
       // This allows COD and Tax invoice delivery charges to be edited independently
@@ -1551,6 +1574,7 @@ router.post('/', async (req, res) => {
       updatedLineItems = updatedLineItems.map(item => {
         const description = (item.description || '').toLowerCase();
         // Update shipping charge line item to match calculated value
+        if (description.includes('discount')) return item;
         if (description.includes('shipping') || 
             (!description.includes('pickup') && !description.includes('delivery') && !description.includes('insurance'))) {
           // This is a shipping charge line item - update it to match calculated value
@@ -1599,6 +1623,9 @@ router.post('/', async (req, res) => {
       pickup_charge: mongoose.Types.Decimal128.fromString(pickupCharge.toFixed(2)), // Pickup charge (from pickup_base_amount if provided, otherwise from line_items) - INCLUDED in base_amount and total_amount for all service types
       base_amount: mongoose.Types.Decimal128.fromString(subtotalForStorage.toFixed(2)), // Subtotal (for UAE_TO_PH Flomic: baseAmount/1.05, otherwise: baseAmount)
       insurance_charge: mongoose.Types.Decimal128.fromString((isPhToUae ? 0 : insuranceCharge).toFixed(2)), // Force 0 for PH_TO_UAE
+      discount_type: discount.type || '',
+      discount_value: mongoose.Types.Decimal128.fromString((discount.value || 0).toFixed(2)),
+      discount_amount: mongoose.Types.Decimal128.fromString((discount.amount || 0).toFixed(2)),
       due_date: invoiceDueDate,
       status: 'UNPAID',
       line_items: filteredLineItems, // Filtered to exclude pickup charge
