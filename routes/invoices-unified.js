@@ -2621,6 +2621,16 @@ router.put('/:id', async (req, res) => {
     if (updateData.notes !== undefined) {
       preparedUpdate.notes = updateData.notes ? String(updateData.notes).trim() : null;
     }
+    if (updateData.disclaimer !== undefined) {
+      preparedUpdate.disclaimer = updateData.disclaimer ? String(updateData.disclaimer).trim() : '';
+    }
+    if (updateData.include_notes !== undefined) {
+      preparedUpdate.include_notes = updateData.include_notes === true || updateData.include_notes === 'true';
+    }
+    if (updateData.include_disclaimer !== undefined) {
+      preparedUpdate.include_disclaimer =
+        updateData.include_disclaimer === true || updateData.include_disclaimer === 'true';
+    }
 
     if (updateData.agent_name !== undefined) {
       // Store agent_name - may need to map to appropriate field in schema

@@ -423,7 +423,7 @@ router.post('/journals', auth, upload.array('documents', 5), async (req, res) =>
       entry_date,
       memo,
       source = 'MANUAL',
-      status = 'POSTED',
+      status,
       source_reference = '',
       source_label = '',
     } = req.body || {};
@@ -449,10 +449,14 @@ router.post('/journals', auth, upload.array('documents', 5), async (req, res) =>
       });
     }
 
-    const allowedStatus = ['DRAFT', 'POSTED'];
-    const finalStatus = allowedStatus.includes(status) ? status : 'POSTED';
     const allowedSources = ['MANUAL', 'INVOICE', 'INVENTORY', 'PAYMENT', 'ADJUSTMENT', 'OPENING'];
-    const finalSource = allowedSources.includes(source) ? source : 'MANUAL';
+    const finalSource = allowedSources.includes(String(source || '').toUpperCase())
+      ? String(source).toUpperCase()
+      : 'MANUAL';
+    const allowedStatus = ['DRAFT', 'POSTED'];
+    const requestedStatus = String(status || '').toUpperCase();
+    const defaultStatus = finalSource === 'MANUAL' ? 'DRAFT' : 'POSTED';
+    const finalStatus = allowedStatus.includes(requestedStatus) ? requestedStatus : defaultStatus;
 
     const built = await buildJournalLinesFromRaw(lines);
     if (built.error) {
@@ -665,7 +669,14 @@ router.put('/journals/:id', auth, upload.array('documents', 5), async (req, res)
     }
 
     const allowedStatus = ['DRAFT', 'POSTED'];
-    const nextStatus = allowedStatus.includes(status) ? status : journal.status;
+    const requestedStatus = String(status || '').toUpperCase();
+    const nextStatus = allowedStatus.includes(requestedStatus) ? requestedStatus : journal.status;
+    if (journal.status === 'POSTED' && nextStatus === 'DRAFT') {
+      return res.status(400).json({
+        success: false,
+        error: 'Posted journals cannot be saved as draft. Post a reversing entry instead.',
+      });
+    }
 
     journal.entry_date = new Date(entry_date);
     journal.memo = String(memo || '').trim();
@@ -700,6 +711,49 @@ router.put('/journals/:id', auth, upload.array('documents', 5), async (req, res)
     res.status(500).json({
       success: false,
       error: error.message || 'Failed to update journal entry',
+    });
+  }
+});
+
+router.post('/journals/:id/post', auth, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, error: 'Invalid journal id' });
+    }
+    const journal = await JournalEntry.findById(req.params.id);
+    if (!journal) {
+      return res.status(404).json({ success: false, error: 'Journal entry not found' });
+    }
+    if (journal.status === 'POSTED') {
+      return res.status(400).json({ success: false, error: 'Journal is already posted' });
+    }
+    if (journal.status === 'VOID') {
+      return res.status(400).json({ success: false, error: 'Voided journals cannot be posted' });
+    }
+    if (Math.abs(toNum(journal.total_debit) - toNum(journal.total_credit)) > 0.009 || toNum(journal.total_debit) <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Journal must be balanced before it can be posted',
+      });
+    }
+    const dateCheck = await assertPeriodOpen(journal.entry_date, 'Journal date');
+    if (dateCheck.error) {
+      return res.status(400).json({
+        success: false,
+        error: dateCheck.error,
+        period_key: dateCheck.period_key,
+        locked: true,
+      });
+    }
+    journal.status = 'POSTED';
+    journal.posted_at = new Date();
+    await journal.save();
+    res.json({ success: true, data: journal });
+  } catch (error) {
+    console.error('Error posting journal:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to post journal entry',
     });
   }
 });
@@ -5899,6 +5953,27 @@ router.get('/sales/invoices/:id', auth, async (req, res) => {
   }
 });
 
+router.put('/sales/invoices/:id', auth, async (req, res) => {
+  try {
+    const invoice = await SalesInvoice.findById(req.params.id);
+    if (!invoice) return res.status(404).json({ success: false, error: 'Invoice not found' });
+    if (req.body?.notes !== undefined) invoice.notes = String(req.body.notes || '').trim();
+    if (req.body?.disclaimer !== undefined) invoice.disclaimer = String(req.body.disclaimer || '').trim();
+    if (req.body?.include_notes !== undefined) {
+      invoice.include_notes = req.body.include_notes === true || req.body.include_notes === 'true';
+    }
+    if (req.body?.include_disclaimer !== undefined) {
+      invoice.include_disclaimer =
+        req.body.include_disclaimer === true || req.body.include_disclaimer === 'true';
+    }
+    await invoice.save();
+    res.json({ success: true, data: invoice });
+  } catch (error) {
+    console.error('Error updating sales invoice:', error);
+    res.status(500).json({ success: false, error: 'Failed to update invoice' });
+  }
+});
+
 router.post('/sales/invoices', auth, async (req, res) => {
   try {
     const actor = actorFromReq(req);
@@ -5911,6 +5986,9 @@ router.post('/sales/invoices', auth, async (req, res) => {
       customer_name,
       currency = 'AED',
       notes = '',
+      disclaimer = '',
+      include_notes = false,
+      include_disclaimer = false,
       ar_account_code = '1300',
       revenue_account_code = '4000',
       vat_account_code = '2200',
@@ -5985,6 +6063,9 @@ router.post('/sales/invoices', auth, async (req, res) => {
       revenue_account_code: revCode,
       vat_account_code: vatCode,
       notes: String(notes || '').trim(),
+      disclaimer: String(disclaimer || '').trim(),
+      include_notes: include_notes === true || include_notes === 'true',
+      include_disclaimer: include_disclaimer === true || include_disclaimer === 'true',
       ...actor,
     });
 

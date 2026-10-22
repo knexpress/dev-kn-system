@@ -688,6 +688,19 @@ const invoiceSchema = new mongoose.Schema({
     type: String,
     required: false,
   },
+  disclaimer: {
+    type: String,
+    required: false,
+    default: '',
+  },
+  include_notes: {
+    type: Boolean,
+    default: false,
+  },
+  include_disclaimer: {
+    type: Boolean,
+    default: false,
+  },
   created_by: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Employee',

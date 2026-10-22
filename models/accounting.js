@@ -864,6 +864,9 @@ const salesInvoiceSchema = new mongoose.Schema(
     revenue_account_code: { type: String, default: '4000' },
     vat_account_code: { type: String, default: '2200' },
     notes: { type: String, required: false },
+    disclaimer: { type: String, required: false, default: '' },
+    include_notes: { type: Boolean, default: false },
+    include_disclaimer: { type: Boolean, default: false },
     created_by_name: { type: String, required: false },
     created_by_email: { type: String, required: false },
     created_by_user_id: {
