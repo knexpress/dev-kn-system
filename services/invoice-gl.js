@@ -1300,10 +1300,13 @@ async function recordQuoteAdvance(
       /* quotation copy is optional */
     }
   }
-  // Refresh the UAE→PH draft invoice JE so Tabby/Card (fee included in quote total) shows 4040 immediately.
-  if (config.rate > 0 && !(gatewayCharge > 0)) {
+  // Always refresh the UAE→PH draft after an advance, including after send-to-Operations.
+  // Tabby/Card collected on top of the quote is already on the advance JE, so the draft
+  // will not carve it again (advanceGatewayAlreadyBooked). Included Tabby still previews 4040.
+  if (quote.draft_journal_id || quote.sent_to_operations_at || (config.rate > 0 && !(gatewayCharge > 0))) {
     await upsertQuoteDraftJournal(invoiceRequest, { actorId });
   }
+  if (global.awbCache) global.awbCache.clear();
   return { journal, advance };
 }
 
