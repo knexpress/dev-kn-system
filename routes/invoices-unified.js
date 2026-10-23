@@ -1829,6 +1829,7 @@ router.post('/', async (req, res) => {
     const quote = invoiceRequest?.quotation_request;
     const quoteHasAdvance = remainingQuoteAdvance(invoiceRequest) > 0;
     // Tabby/Card advance with no fee-on-top booked yet: carve VAT-inclusive gateway into the invoice JE.
+    // Fee collected on top of the quote stays on the invoice JE as extra AR + 4040 (same as the draft).
     const advanceModeKey = quote?.advance?.mode ? String(quote.advance.mode).toUpperCase() : '';
     const gatewayFromAdvance =
       quoteHasAdvance &&
@@ -1836,12 +1837,21 @@ router.post('/', async (req, res) => {
       PAYMENT_MODES[advanceModeKey]?.rate > 0
         ? advanceModeKey
         : undefined;
+    const onTopAdvance = quoteHasAdvance && advanceGatewayAlreadyBooked(quote?.advance)
+      ? {
+          mode: advanceModeKey,
+          gross: Number(quote.advance.gateway_charge) || 0,
+          net: Number(quote.advance.gateway_net) || 0,
+          vat: Number(quote.advance.gateway_vat) || 0,
+        }
+      : undefined;
     const gl = await postInvoiceJournal(invoice, {
       actorId: created_by,
       customerName: populatedInvoice?.client_id?.company_name,
       draftJournalId: quote?.draft_journal_id,
       quotationNumber: quote?.draft_journal_id ? quote.quotation_number : undefined,
       gatewayMode: (prepaid && !quoteHasAdvance ? prepaidMode : undefined) || gatewayFromAdvance,
+      onTopGateway: onTopAdvance,
     });
     populatedInvoice.gl_sync = invoice.gl_sync;
     if (gl.status === 'POSTED') {

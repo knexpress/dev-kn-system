@@ -3301,14 +3301,18 @@ router.post('/:id/advance-payment', auth, async (req, res) => {
     if (result.error) return res.status(400).json({ success: false, error: result.error });
 
     requestCache.clear();
+    const draftNo = result.draft_journal?.journal_no;
     res.json({
       success: true,
       data: {
         invoice_request: normalizeInvoiceRequest(invoiceRequest),
         advance: result.advance,
         journal_no: result.journal?.entry_no,
+        draft_journal: result.draft_journal,
       },
-      message: `Advance recorded · ${result.journal?.entry_no || ''} credited to Customer Payment Due`.trim(),
+      message: `Advance recorded · ${result.journal?.entry_no || ''} credited to Customer Payment Due${
+        draftNo ? `. Draft invoice ${draftNo} updated` : ''
+      }`.trim(),
     });
   } catch (error) {
     console.error('Error recording quotation advance:', error);

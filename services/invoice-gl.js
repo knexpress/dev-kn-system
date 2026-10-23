@@ -312,7 +312,7 @@ async function saveGlSync(invoice, patch) {
  * into Cr 4040 (net) + Cr VAT output (5%), reducing sales revenue by the gross fee.
  * Never throws: failures are recorded on invoice.gl_sync so invoice generation is not blocked.
  */
-async function postInvoiceJournal(invoice, { actorId, customerName, draftJournalId, gatewayMode, quotationNumber } = {}) {
+async function postInvoiceJournal(invoice, { actorId, customerName, draftJournalId, gatewayMode, onTopGateway, quotationNumber } = {}) {
   try {
     if (invoice.status === 'CANCELLED') {
       return { status: 'SKIPPED', reason: 'Invoice is cancelled' };
@@ -353,11 +353,22 @@ async function postInvoiceJournal(invoice, { actorId, customerName, draftJournal
       gatewayConfig?.rate || 0,
       total
     );
-    const needsVat = tax > 0 || gatewayVat > 0;
-    const [arGl, vatGl, discountGl, ...revenueGls] = await Promise.all([
+    const onTopModeKey = onTopGateway?.mode ? String(onTopGateway.mode).toUpperCase() : '';
+    const onTopConfig = onTopModeKey ? PAYMENT_MODES[onTopModeKey] : null;
+    const onTopGross = onTopConfig ? round2(Number(onTopGateway.gross) || 0) : 0;
+    const onTopNet = onTopGross > 0
+      ? round2(Number(onTopGateway.net) || onTopGross / (1 + GATEWAY_VAT_RATE))
+      : 0;
+    const onTopVat = onTopGross > 0
+      ? round2(Number(onTopGateway.vat) || onTopGross - onTopNet)
+      : 0;
+    const arDebit = round2(total + (onTopGross > 0.009 ? onTopGross : 0));
+    const needsVat = tax > 0 || gatewayVat > 0 || onTopVat > 0;
+    const [arGl, vatGl, discountGl, onTopGatewayGl, ...revenueGls] = await Promise.all([
       resolveAccount('ar'),
       needsVat ? resolveAccount('vat') : Promise.resolve(null),
       discount > 0 ? resolveAccount('salesDiscount') : Promise.resolve(null),
+      onTopNet > 0 ? resolveAccount('gateway') : Promise.resolve(null),
       ...split.map((part) => resolveAccount(part.role)),
     ]);
     const ref = invoiceRef(invoice);
@@ -371,7 +382,7 @@ async function postInvoiceJournal(invoice, { actorId, customerName, draftJournal
         account_code: arGl.code,
         account_name: arGl.name,
         description: `AR ${ref} — ${customer}`,
-        debit: total,
+        debit: arDebit,
         credit: 0,
       },
       ...split.map((part, i) => ({
@@ -386,6 +397,16 @@ async function postInvoiceJournal(invoice, { actorId, customerName, draftJournal
         credit: part.amount,
       })),
     ];
+    if (onTopNet > 0 && onTopGatewayGl && onTopConfig) {
+      lines.push({
+        account_id: onTopGatewayGl._id,
+        account_code: onTopGatewayGl.code,
+        account_name: onTopGatewayGl.name,
+        description: `${onTopConfig.label} charge ${Math.round(onTopConfig.rate * 100)}% VAT-inclusive (net) ${ref}${awb}`,
+        debit: 0,
+        credit: onTopNet,
+      });
+    }
     if (discount > 0 && discountGl) {
       const pct = Number(invoice.discount_value);
       const label =
@@ -421,6 +442,16 @@ async function postInvoiceJournal(invoice, { actorId, customerName, draftJournal
         credit: gatewayVat,
       });
     }
+    if (onTopVat > 0 && vatGl && onTopConfig) {
+      lines.push({
+        account_id: vatGl._id,
+        account_code: vatGl.code,
+        account_name: vatGl.name,
+        description: `VAT 5% on ${onTopConfig.label.toLowerCase()} charge ${ref}`,
+        debit: 0,
+        credit: onTopVat,
+      });
+    }
 
     const quoteText = quotationNumber ? ` · ${quotationNumber}` : '';
     const entryDate = invoice.issue_date || new Date();
@@ -429,8 +460,8 @@ async function postInvoiceJournal(invoice, { actorId, customerName, draftJournal
       source: 'INVOICE',
       status: 'POSTED',
       lines,
-      total_debit: round2(total + discount),
-      total_credit: round2(total + discount),
+      total_debit: round2(arDebit + discount),
+      total_credit: round2(arDebit + discount),
       posted_at: new Date(),
       source_reference: ref,
       source_label: SOURCE_LABEL,
@@ -520,20 +551,35 @@ async function upsertQuoteDraftJournal(request, { actorId } = {}) {
     const revenue = round2(total - tax + discount);
     const baseSplit = scaleRevenueParts({ shipping: shipping + deliveryFee + insurance, pickup, delivery: 0 }, revenue);
 
-    // Tabby/Card advance already recorded (fee not booked on the advance JE): preview the VAT-inclusive
-    // carve on this draft so Payment Gateway Revenue shows before the invoice is generated.
+    // Tabby/Card advance:
+    // - fee included in the quote total → carve 4040 from shipping on this draft.
+    // - fee collected on top (already on the advance JE) → add extra AR + 4040 on this draft only
+    //   so Journals show the edited invoice. Invoice generation rewrites the draft to the goods
+    //   total and skips the carve, so 4040 is not posted twice.
     const adv = q.advance;
     const advanceModeKey = adv?.mode ? String(adv.mode).toUpperCase() : '';
-    const advanceGatewayConfig =
-      adv?.journal_id && !adv?.void_journal_id && !advanceGatewayAlreadyBooked(adv)
-        ? PAYMENT_MODES[advanceModeKey]
-        : null;
-    const { lines: split, gatewayNet, gatewayVat, gatewayGross } = carveGatewayCharge(
+    const liveAdvance = Boolean(adv?.journal_id) && !adv?.void_journal_id;
+    const includedGatewayConfig =
+      liveAdvance && !advanceGatewayAlreadyBooked(adv) ? PAYMENT_MODES[advanceModeKey] : null;
+    const { lines: split, gatewayNet, gatewayVat } = carveGatewayCharge(
       baseSplit,
       revenue,
-      advanceGatewayConfig?.rate || 0,
+      includedGatewayConfig?.rate || 0,
       total
     );
+    const onTopGross = liveAdvance && advanceGatewayAlreadyBooked(adv)
+      ? (Number(adv.gateway_charge) > 0.009
+          ? round2(Number(adv.gateway_charge))
+          : round2((Number(adv.amount_collected) || 0) - (Number(adv.amount) || 0)))
+      : 0;
+    const onTopConfig = onTopGross > 0.009 ? PAYMENT_MODES[advanceModeKey] : null;
+    const onTopNet = onTopConfig ? round2(onTopGross / (1 + GATEWAY_VAT_RATE)) : 0;
+    const onTopVat = onTopConfig ? round2(onTopGross - onTopNet) : 0;
+    const gatewayConfig = includedGatewayConfig || onTopConfig;
+    const arDebit = round2(total + (onTopGross > 0.009 ? onTopGross : 0));
+    const collected = liveAdvance
+      ? round2(Number(adv.amount_collected) || Number(adv.amount) || 0)
+      : 0;
 
     const awb = request.tracking_code || request.awb_number || '';
     const awbText = awb ? ` · AWB ${awb}` : '';
@@ -546,25 +592,29 @@ async function upsertQuoteDraftJournal(request, { actorId } = {}) {
       shipping: `Shipping ${q.quotation_chargeable_weight || 0} kg × AED ${q.quotation_rate_per_kg || 0}/kg${extras.length ? ` (incl. ${extras.join(', ')})` : ''}${awbText}`,
       pickup: `Pickup charge (${PICKUP_LOCATION_TEXT[q.quotation_pickup_location] || 'pickup'})${awbText}`,
       delivery: `Delivery fee${awbText}`,
-      gateway: advanceGatewayConfig
-        ? `${advanceGatewayConfig.label} charge ${Math.round(advanceGatewayConfig.rate * 100)}% VAT-inclusive (net) ${qno}${awbText}`
+      gateway: gatewayConfig
+        ? `${gatewayConfig.label} charge ${Math.round(gatewayConfig.rate * 100)}% VAT-inclusive (net) ${qno}${awbText}`
         : `Payment gateway charge ${qno}${awbText}`,
     };
 
-    const needsVat = tax > 0 || gatewayVat > 0;
-    const [arGl, vatGl, discountGl, ...revenueGls] = await Promise.all([
+    const needsVat = tax > 0 || gatewayVat > 0 || onTopVat > 0;
+    const [arGl, vatGl, discountGl, onTopGatewayGl, ...revenueGls] = await Promise.all([
       resolveAccount('ar'),
       needsVat ? resolveAccount('vat') : Promise.resolve(null),
       discount > 0 ? resolveAccount('salesDiscount') : Promise.resolve(null),
+      onTopNet > 0 ? resolveAccount('gateway') : Promise.resolve(null),
       ...split.map((part) => resolveAccount(part.role)),
     ]);
+    const arDescription = liveAdvance
+      ? `AR ${qno} — ${customer} (advance ${gatewayConfig?.label || adv.mode} AED ${collected.toFixed(2)})`
+      : `AR ${qno} — ${customer} (payment not yet received)`;
     const lines = [
       {
         account_id: arGl._id,
         account_code: arGl.code,
         account_name: arGl.name,
-        description: `AR ${qno} — ${customer} (payment not yet received)`,
-        debit: total,
+        description: arDescription,
+        debit: arDebit,
         credit: 0,
       },
       ...split.map((part, i) => ({
@@ -576,6 +626,16 @@ async function upsertQuoteDraftJournal(request, { actorId } = {}) {
         credit: part.amount,
       })),
     ];
+    if (onTopNet > 0 && onTopGatewayGl) {
+      lines.push({
+        account_id: onTopGatewayGl._id,
+        account_code: onTopGatewayGl.code,
+        account_name: onTopGatewayGl.name,
+        description: lineText.gateway,
+        debit: 0,
+        credit: onTopNet,
+      });
+    }
     if (discount > 0 && discountGl) {
       const pct = Number(q.quotation_discount_value);
       lines.push({
@@ -600,25 +660,38 @@ async function upsertQuoteDraftJournal(request, { actorId } = {}) {
         credit: tax,
       });
     }
-    if (gatewayVat > 0 && advanceGatewayConfig) {
+    if (gatewayVat > 0 && includedGatewayConfig) {
       lines.push({
         account_id: vatGl._id,
         account_code: vatGl.code,
         account_name: vatGl.name,
-        description: `VAT 5% on ${advanceGatewayConfig.label.toLowerCase()} charge ${qno}`,
+        description: `VAT 5% on ${includedGatewayConfig.label.toLowerCase()} charge ${qno}`,
         debit: 0,
         credit: gatewayVat,
       });
     }
+    if (onTopVat > 0 && vatGl && onTopConfig) {
+      lines.push({
+        account_id: vatGl._id,
+        account_code: vatGl.code,
+        account_name: vatGl.name,
+        description: `VAT 5% on ${onTopConfig.label.toLowerCase()} charge ${qno}`,
+        debit: 0,
+        credit: onTopVat,
+      });
+    }
 
     const items = (q.items || []).map((item) => `${item.name} ×${item.quantity}`).join(', ');
+    const advanceNote = liveAdvance
+      ? ` Advance ${adv.journal_no || ''} via ${PAYMENT_MODES[advanceModeKey]?.label || adv.mode} AED ${collected.toFixed(2)}.`
+      : '';
     const draft = {
-      memo: `Quotation ${qno}${awbText} — ${customer}${items ? ` · Items: ${items}` : ''}. Draft until the invoice is generated.`,
+      memo: `Quotation ${qno}${awbText} — ${customer}${items ? ` · Items: ${items}` : ''}. Draft until the invoice is generated.${advanceNote}`,
       source: 'INVOICE',
       status: 'DRAFT',
       lines,
-      total_debit: round2(total + discount),
-      total_credit: round2(total + discount),
+      total_debit: round2(arDebit + discount),
+      total_credit: round2(arDebit + discount),
       source_reference: awb || qno,
       source_label: QUOTE_DRAFT_LABEL,
     };
@@ -641,11 +714,13 @@ async function upsertQuoteDraftJournal(request, { actorId } = {}) {
       journal = await createJournalWithNextNo(new Date(), { ...draft, ...(await resolveActor(actorId)) });
     }
 
-    const InvoiceRequest = mongoose.models.InvoiceRequest;
-    await InvoiceRequest.updateOne(
-      { _id: request._id },
-      { $set: { 'quotation_request.draft_journal_id': journal._id, 'quotation_request.draft_journal_no': journal.entry_no } }
-    );
+    if (request?._id) {
+      const InvoiceRequest = mongoose.models.InvoiceRequest;
+      await InvoiceRequest.updateOne(
+        { _id: request._id },
+        { $set: { 'quotation_request.draft_journal_id': journal._id, 'quotation_request.draft_journal_no': journal.entry_no } }
+      );
+    }
     return { status: 'DRAFT', journal_id: journal._id, journal_no: journal.entry_no };
   } catch (error) {
     console.error(`❌ Quotation draft journal failed for request ${request?._id}:`, error.message);
@@ -1230,8 +1305,6 @@ async function recordQuoteAdvance(
   const when = dated.when;
   const actor = await resolveActor(actorId);
   const roles = [config.debitRole, 'customerAdvance'];
-  if (gatewayNet > 0) roles.push('gateway');
-  if (gatewayVat > 0) roles.push('vat');
   const accounts = {};
   for (const role of roles) accounts[role] = await resolveAccount(role);
   const quoteNo = quote.quotation_number || 'quotation';
@@ -1244,16 +1317,12 @@ async function recordQuoteAdvance(
     debit,
     credit,
   });
+  // Park the full amount collected in Customer Payment Due. Tabby/Card extra is booked on the
+  // invoice / draft JE so generating the invoice does not strip those charges.
   const lines = [
     line(config.debitRole, collected, 0, `${config.label} advance ${quoteNo}${refText}`),
-    line('customerAdvance', 0, applied, `Customer Payment Due ${quoteNo}`),
+    line('customerAdvance', 0, collected, `Customer Payment Due ${quoteNo}`),
   ];
-  if (gatewayNet > 0) {
-    lines.push(line('gateway', 0, gatewayNet, `${config.label} charge ${Math.round(config.rate * 100)}% VAT-inclusive (net) ${quoteNo}`));
-  }
-  if (gatewayVat > 0) {
-    lines.push(line('vat', 0, gatewayVat, `VAT 5% on ${config.label.toLowerCase()} charge ${quoteNo}`));
-  }
   const journal = await createJournalWithNextNo(when, {
     memo: `Advance on ${quoteNo} via ${config.label}`,
     source: 'PAYMENT',
@@ -1271,7 +1340,7 @@ async function recordQuoteAdvance(
   await adjustWalletBalances(journal.lines);
 
   const advance = {
-    amount: applied,
+    amount: collected,
     amount_collected: collected,
     mode: modeKey,
     reference: reference ? String(reference).trim() : undefined,
@@ -1300,14 +1369,14 @@ async function recordQuoteAdvance(
       /* quotation copy is optional */
     }
   }
-  // Always refresh the UAE→PH draft after an advance, including after send-to-Operations.
-  // Tabby/Card collected on top of the quote is already on the advance JE, so the draft
-  // will not carve it again (advanceGatewayAlreadyBooked). Included Tabby still previews 4040.
-  if (quote.draft_journal_id || quote.sent_to_operations_at || (config.rate > 0 && !(gatewayCharge > 0))) {
-    await upsertQuoteDraftJournal(invoiceRequest, { actorId });
+  // Rewrite the UAE→PH draft invoice journal so Tabby/Card extras and the advance note appear
+  // on the same draft that was raised at send-to-Operations.
+  let draftJournal = null;
+  if (quote.draft_journal_id || quote.sent_to_operations_at) {
+    draftJournal = await upsertQuoteDraftJournal(invoiceRequest, { actorId });
   }
   if (global.awbCache) global.awbCache.clear();
-  return { journal, advance };
+  return { journal, advance, draft_journal: draftJournal };
 }
 
 async function recordManualQuotationAdvance(quotation, opts = {}) {
@@ -1372,7 +1441,13 @@ async function applyQuoteAdvanceToInvoice(invoice, invoiceRequest, { actorId } =
     return { skipped: true, reason: 'advance fully applied', journal_no: adv.applied_journal_no };
   }
   const { total, paid, balance } = invoicePaymentSummary(invoice);
-  const applied = round2(Math.min(remainingAdvance, Math.max(0, balance)));
+  const onTopForGl = alreadyApplied > 0.009
+    ? 0
+    : (advanceGatewayAlreadyBooked(adv)
+        ? round2(Number(adv.gateway_charge) || 0)
+        : 0);
+  const glDue = round2(Math.max(0, balance) + onTopForGl);
+  const applied = round2(Math.min(remainingAdvance, glDue));
   if (!(applied > 0.009)) {
     return { skipped: true, reason: 'invoice already settled', journal_no: adv.applied_journal_no };
   }
@@ -1430,11 +1505,12 @@ async function applyQuoteAdvanceToInvoice(invoice, invoiceRequest, { actorId } =
   const gatewayVat = onTopGateway > 0
     ? round2(Number(adv.gateway_vat) || onTopGateway - gatewayNet)
     : 0;
+  const paidTowardInvoice = round2(Math.min(applied, Math.max(0, balance)));
   const payment = {
     mode: modeKey,
-    payment_type: applied >= balance - 0.009 || balance <= 0.009 ? 'FULL' : 'PARTIAL',
-    amount_collected: round2(applied + onTopGateway),
-    amount_applied: applied,
+    payment_type: paidTowardInvoice >= balance - 0.009 || balance <= 0.009 ? 'FULL' : 'PARTIAL',
+    amount_collected: applied,
+    amount_applied: paidTowardInvoice,
     gateway_charge: onTopGateway,
     gateway_net: gatewayNet,
     gateway_vat: gatewayVat,
@@ -1449,7 +1525,7 @@ async function applyQuoteAdvanceToInvoice(invoice, invoiceRequest, { actorId } =
     recorded_by_name: actor.created_by_name,
     recorded_by_email: actor.created_by_email,
   };
-  const newPaid = round2(paid + applied);
+  const newPaid = round2(paid + paidTowardInvoice);
   const remaining = round2(Math.max(0, total - newPaid));
   const set = {
     amount_paid: newPaid,
