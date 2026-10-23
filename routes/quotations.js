@@ -191,8 +191,13 @@ function buildQuotationFields(body) {
   if (!Number.isFinite(actualWeight) || actualWeight <= 0 || !Number.isFinite(volumetricWeight) || volumetricWeight <= 0) {
     return { error: 'Actual weight and volumetric weight must be greater than 0 kg' };
   }
-  if (pickupLocation !== 'INSIDE_DUBAI' && pickupLocation !== 'OUTSIDE_DUBAI' && pickupLocation !== 'DROP_OFF') {
-    return { error: 'Choose inside Dubai, outside Dubai, or drop off' };
+  if (
+    pickupLocation !== 'INSIDE_DUBAI' &&
+    pickupLocation !== 'OUTSIDE_DUBAI' &&
+    pickupLocation !== 'DROP_OFF' &&
+    pickupLocation !== 'FREE_PICKUP'
+  ) {
+    return { error: 'Choose inside Dubai, outside Dubai, drop off, or free pickup' };
   }
   if (!Number.isFinite(deliveryCharge) || deliveryCharge < 0 || !Number.isFinite(insuranceCharge) || insuranceCharge < 0) {
     return { error: 'Delivery and insurance charges must be 0 or more' };

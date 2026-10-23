@@ -161,6 +161,7 @@ const LEGACY_TO_FIVE = {
   4020: '40010',
   4030: '40020',
   4040: '40050',
+  40030: '40030', // Sales Discount (already 5-digit)
   4900: '69060', // Disposal gain/loss
   5000: '50000', // COGS
   5100: '60170', // Office Expenses (petty cash default)

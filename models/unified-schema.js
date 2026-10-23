@@ -814,6 +814,7 @@ const invoiceSchema = new mongoose.Schema({
     journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
     journal_no: { type: String, required: false },
     remitted: { type: Boolean, default: false },
+    from_quote_advance: { type: Boolean, default: false },
     remit_journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
     remit_journal_no: { type: String, required: false },
     void_journal_no: { type: String, required: false },

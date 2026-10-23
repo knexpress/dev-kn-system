@@ -18,7 +18,14 @@ function glCode(legacyOrRole, fallback) {
   const raw = String(legacyOrRole || fallback || '').trim();
   if (!raw) return '';
   const legacy = SYSTEM_ROLES[raw] || raw;
-  if (useFiveDigitCoa()) return LEGACY_TO_FIVE[legacy] || (LEGACY_TO_FIVE[raw] || raw);
+  if (useFiveDigitCoa()) {
+    const mapped = LEGACY_TO_FIVE[legacy] || LEGACY_TO_FIVE[raw];
+    if (mapped) return mapped;
+    // Roles already stored as 5-digit codes (e.g. salesDiscount → 40030)
+    if (/^\d{5}$/.test(legacy)) return legacy;
+    if (/^\d{5}$/.test(raw)) return raw;
+    return raw;
+  }
   return legacy;
 }
 

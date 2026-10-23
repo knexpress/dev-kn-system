@@ -532,6 +532,9 @@ const invoiceRequestSchema = new mongoose.Schema({
       applied_amount: { type: Number, required: false },
       void_journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
       void_journal_no: { type: String, required: false },
+      gateway_charge: { type: Number, required: false },
+      gateway_net: { type: Number, required: false },
+      gateway_vat: { type: Number, required: false },
     },
   },
   
@@ -1385,7 +1388,7 @@ const manualQuotationSchema = new mongoose.Schema({
   pickup_location: {
     type: String,
     required: true,
-    enum: ['INSIDE_DUBAI', 'OUTSIDE_DUBAI', 'DROP_OFF'],
+    enum: ['INSIDE_DUBAI', 'OUTSIDE_DUBAI', 'DROP_OFF', 'FREE_PICKUP'],
   },
   pickup_charge: {
     type: Number,
@@ -1464,6 +1467,9 @@ const manualQuotationSchema = new mongoose.Schema({
     applied_amount: { type: Number, required: false },
     void_journal_id: { type: mongoose.Schema.Types.ObjectId, required: false },
     void_journal_no: { type: String, required: false },
+    gateway_charge: { type: Number, required: false },
+    gateway_net: { type: Number, required: false },
+    gateway_vat: { type: Number, required: false },
   },
 }, {
   timestamps: true,

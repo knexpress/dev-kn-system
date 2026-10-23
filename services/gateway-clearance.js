@@ -163,9 +163,18 @@ async function listGatewayClearance({ status = 'open' } = {}) {
   const metaFor = (mode) => (String(mode).toUpperCase() === 'TABBY' ? tabbyMeta : cardMeta);
   const items = [];
 
+  const appliedAdvanceJournalIds = new Set();
+  for (const request of advances) {
+    const appliedId = request.quotation_request?.advance?.applied_journal_id;
+    if (appliedId) appliedAdvanceJournalIds.add(String(appliedId));
+  }
+
   for (const invoice of invoices) {
     for (const payment of invoice.payments || []) {
       if (!isGatewayMode(payment.mode) || payment.status === 'VOID') continue;
+      // Advance apply only clears AR; Tabby/Card cash already sits on the quotation advance.
+      if (payment.from_quote_advance) continue;
+      if (payment.journal_id && appliedAdvanceJournalIds.has(String(payment.journal_id))) continue;
       const mode = String(payment.mode).toUpperCase();
       const clearing = metaFor(mode);
       items.push(

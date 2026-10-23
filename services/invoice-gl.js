@@ -60,6 +60,15 @@ function isGatewayMode(mode) {
   return key === 'TABBY' || key === 'CARD';
 }
 
+/** Tabby/Card fee was already booked on the quotation advance JE (fee collected on top of the quote). */
+function advanceGatewayAlreadyBooked(adv) {
+  if (!adv) return false;
+  if (Number(adv.gateway_charge) > 0.009) return true;
+  const collected = round2(Number(adv.amount_collected) || 0);
+  const amount = round2(Number(adv.amount) || 0);
+  return collected > amount + 0.009;
+}
+
 function expectedSettlementAt(mode, collectedAt) {
   const days = SETTLEMENT_DAYS[String(mode || '').toUpperCase()];
   if (!days) return null;
@@ -430,21 +439,15 @@ async function postInvoiceJournal(invoice, { actorId, customerName, draftJournal
     if (draftJournalId && mongoose.isValidObjectId(draftJournalId)) {
       const draftDoc = await JournalEntry.findById(draftJournalId).select('status entry_no').lean();
       if (draftDoc?.status === 'POSTED') {
-        await saveGlSync(invoice, {
-          status: 'POSTED',
-          journal_id: draftDoc._id,
-          journal_no: draftDoc.entry_no,
-          posted_total: total,
-          posted_tax: tax,
-          last_error: undefined,
-        });
-        return { status: 'POSTED', journal_id: draftDoc._id, journal_no: draftDoc.entry_no, already_posted: true };
+        // Draft already consumed. Never attach those figures to a new invoice.
+        journal = null;
+      } else {
+        journal = await JournalEntry.findOneAndUpdate(
+          { _id: draftJournalId, status: 'DRAFT' },
+          { $set: { ...posting, entry_date: entryDate } },
+          { new: true, runValidators: true }
+        );
       }
-      journal = await JournalEntry.findOneAndUpdate(
-        { _id: draftJournalId, status: 'DRAFT' },
-        { $set: { ...posting, entry_date: entryDate } },
-        { new: true, runValidators: true }
-      );
     }
     if (!journal) {
       journal = await createJournalWithNextNo(entryDate, { ...posting, ...actor });
@@ -456,15 +459,11 @@ async function postInvoiceJournal(invoice, { actorId, customerName, draftJournal
       journal_no: journal.entry_no,
       posted_total: total,
       posted_tax: tax,
-      ...(gatewayGross > 0
-        ? {
-            gateway_included_mode: modeKey,
-            gateway_included_rate: gatewayConfig.rate,
-            gateway_included_gross: gatewayGross,
-            gateway_included_net: gatewayNet,
-            gateway_included_vat: gatewayVat,
-          }
-        : {}),
+      gateway_included_mode: gatewayGross > 0 ? modeKey : undefined,
+      gateway_included_rate: gatewayGross > 0 ? gatewayConfig.rate : undefined,
+      gateway_included_gross: gatewayGross > 0 ? gatewayGross : undefined,
+      gateway_included_net: gatewayGross > 0 ? gatewayNet : undefined,
+      gateway_included_vat: gatewayGross > 0 ? gatewayVat : undefined,
       last_error: undefined,
     });
     return {
@@ -487,7 +486,12 @@ async function postInvoiceJournal(invoice, { actorId, customerName, draftJournal
 }
 
 const QUOTE_DRAFT_LABEL = 'Finance quotation (draft until invoiced)';
-const PICKUP_LOCATION_TEXT = { INSIDE_DUBAI: 'inside Dubai', OUTSIDE_DUBAI: 'outside Dubai', DROP_OFF: 'drop off' };
+const PICKUP_LOCATION_TEXT = {
+  INSIDE_DUBAI: 'inside Dubai',
+  OUTSIDE_DUBAI: 'outside Dubai',
+  DROP_OFF: 'drop off',
+  FREE_PICKUP: 'free pickup',
+};
 
 /**
  * UAE→PH: when Finance sends a quoted request to Operations, raise (or refresh) a DRAFT journal from the
@@ -521,7 +525,7 @@ async function upsertQuoteDraftJournal(request, { actorId } = {}) {
     const adv = q.advance;
     const advanceModeKey = adv?.mode ? String(adv.mode).toUpperCase() : '';
     const advanceGatewayConfig =
-      adv?.journal_id && !adv?.void_journal_id && !(Number(adv?.gateway_charge) > 0.009)
+      adv?.journal_id && !adv?.void_journal_id && !advanceGatewayAlreadyBooked(adv)
         ? PAYMENT_MODES[advanceModeKey]
         : null;
     const { lines: split, gatewayNet, gatewayVat, gatewayGross } = carveGatewayCharge(
@@ -1277,7 +1281,7 @@ async function recordQuoteAdvance(
     recorded_by_name: actor.created_by_name,
     journal_id: journal._id,
     journal_no: journal.entry_no,
-    ...(gatewayCharge > 0
+    ...(config.rate > 0
       ? {
           gateway_charge: gatewayCharge,
           gateway_net: gatewayNet,
@@ -1365,7 +1369,10 @@ async function applyQuoteAdvanceToInvoice(invoice, invoiceRequest, { actorId } =
     return { skipped: true, reason: 'advance fully applied', journal_no: adv.applied_journal_no };
   }
   const { total, paid, balance } = invoicePaymentSummary(invoice);
-  const applied = remainingAdvance;
+  const applied = round2(Math.min(remainingAdvance, Math.max(0, balance)));
+  if (!(applied > 0.009)) {
+    return { skipped: true, reason: 'invoice already settled', journal_no: adv.applied_journal_no };
+  }
   const when = parsePaymentDate(adv.collected_at || adv.recorded_at || new Date());
   const actor = await resolveActor(actorId);
   const [advanceGl, arGl] = await Promise.all([
@@ -1408,26 +1415,44 @@ async function applyQuoteAdvanceToInvoice(invoice, invoiceRequest, { actorId } =
   const modeKey = PAYMENT_MODES[String(adv.mode || '').toUpperCase()]
     ? String(adv.mode).toUpperCase()
     : 'BANK_TRANSFER';
+  const onTopGateway = advanceGatewayAlreadyBooked(adv)
+    ? round2(
+        Number(adv.gateway_charge) ||
+          Math.max(0, round2(Number(adv.amount_collected) || 0) - round2(Number(adv.amount) || 0))
+      )
+    : 0;
+  const gatewayNet = onTopGateway > 0
+    ? round2(Number(adv.gateway_net) || onTopGateway / (1 + GATEWAY_VAT_RATE))
+    : 0;
+  const gatewayVat = onTopGateway > 0
+    ? round2(Number(adv.gateway_vat) || onTopGateway - gatewayNet)
+    : 0;
   const payment = {
     mode: modeKey,
     payment_type: applied >= balance - 0.009 || balance <= 0.009 ? 'FULL' : 'PARTIAL',
-    amount_collected: applied,
+    amount_collected: round2(applied + onTopGateway),
     amount_applied: applied,
-    gateway_charge: 0,
-    gateway_net: 0,
-    gateway_vat: 0,
+    gateway_charge: onTopGateway,
+    gateway_net: gatewayNet,
+    gateway_vat: gatewayVat,
     reference: adv.reference,
     collected_at: when,
+    expected_settlement_at: adv.expected_settlement_at || expectedSettlementAt(modeKey, when),
     status: 'POSTED',
     journal_id: journal._id,
     journal_no: journal.entry_no,
     remitted: true,
+    from_quote_advance: true,
     recorded_by_name: actor.created_by_name,
     recorded_by_email: actor.created_by_email,
   };
   const newPaid = round2(paid + applied);
   const remaining = round2(Math.max(0, total - newPaid));
-  const set = { amount_paid: newPaid, payment_mode: modeKey };
+  const set = {
+    amount_paid: newPaid,
+    payment_mode: modeKey,
+    gateway_charges_total: round2((invoice.gateway_charges_total || 0) + onTopGateway),
+  };
   if (remaining <= 0.009) {
     set.status = 'PAID';
     set.paid_at = when;
@@ -1560,5 +1585,6 @@ module.exports = {
   SETTLEMENT_DAYS,
   expectedSettlementAt,
   isGatewayMode,
+  advanceGatewayAlreadyBooked,
   SOURCE_LABEL,
 };

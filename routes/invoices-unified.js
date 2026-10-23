@@ -20,6 +20,7 @@ const {
   invoicePaymentSummary,
   isUaeToPhCode,
   PAYMENT_MODES,
+  advanceGatewayAlreadyBooked,
 } = require('../services/invoice-gl');
 const { raiseCancellationInvoice } = require('../services/cancellation-invoice');
 const { computeSalesDiscount } = require('../utils/sales-discount');
@@ -35,7 +36,7 @@ async function notesBlockMessage(invoiceId, action) {
 
 const router = express.Router();
 
-const REQUEST_POPULATE_FIELDS = 'request_id awb_number customer route status shipment verification number_of_boxes origin_place destination_place receiver_name receiver_address receiver_phone';
+const REQUEST_POPULATE_FIELDS = 'request_id awb_number customer route status shipment verification number_of_boxes origin_place destination_place receiver_name receiver_address receiver_phone quotation_request';
 
 const normalizeServiceCode = (code = '') =>
   code.toString().toUpperCase().replace(/[\s-]+/g, '_');
@@ -1028,11 +1029,21 @@ router.post('/', async (req, res) => {
     // Note: total_amount_cod and total_amount_tax_invoice are now calculated automatically
     // Frontend can optionally send them for override, but backend will calculate if not provided
 
-    // If a delivery charge exists via items or provided, treat as delivery enabled
+    const quotedDeliveryChargeRaw = Number(invoiceRequest?.quotation_request?.quotation_delivery_charge);
+    const quotedDeliveryCharge = Number.isFinite(quotedDeliveryChargeRaw) && quotedDeliveryChargeRaw > 0
+      ? Math.round(quotedDeliveryChargeRaw * 100) / 100
+      : 0;
+    const isUaeQuotedRoute =
+      isUaeToPinas ||
+      isUaeToPhService(serviceCode) ||
+      isUaeToPhCode(serviceCode);
+
+    // If a delivery charge exists via items, payload, or the UAE→PH quote, treat as delivery enabled
     const hasDeliveryComputed =
       !!has_delivery ||
       (providedDeliveryCharge !== undefined && providedDeliveryCharge !== null && !isNaN(parseFloat(providedDeliveryCharge))) ||
-      deliveryChargeFromItems > 0;
+      deliveryChargeFromItems > 0 ||
+      (isUaeQuotedRoute && quotedDeliveryCharge > 0);
     
     // Preferred base: request body -> stored on invoiceRequest -> derived from deliveryChargeFromItems -> fallback 20
     if (isPhToUae) {
@@ -1065,14 +1076,20 @@ router.post('/', async (req, res) => {
     }
     
     if (hasDeliveryComputed) {
-      if (isUaeToPinas) {
-        // UAE_TO_PINAS: Use manual delivery charge from request body
+      if (isUaeQuotedRoute) {
+        // UAE→PH / UAE→PINAS: manual delivery, then line items, then the quoted delivery
         if (providedDeliveryCharge !== undefined && providedDeliveryCharge !== null) {
           deliveryCharge = parseFloat(providedDeliveryCharge) || 0;
-          console.log(`✅ Using manual delivery charge for UAE_TO_PINAS: ${deliveryCharge} AED`);
+          console.log(`✅ Using manual delivery charge for UAE_TO_PH: ${deliveryCharge} AED`);
+        } else if (deliveryChargeFromItems > 0) {
+          deliveryCharge = deliveryChargeFromItems;
+          console.log(`✅ Using delivery charge from line_items: ${deliveryCharge} AED`);
+        } else if (quotedDeliveryCharge > 0) {
+          deliveryCharge = quotedDeliveryCharge;
+          console.log(`✅ Using quoted delivery charge: ${deliveryCharge} AED`);
         } else {
           deliveryCharge = 0;
-          console.log('ℹ️ No delivery charge provided for UAE_TO_PINAS, using 0');
+          console.log('ℹ️ No delivery charge provided for UAE_TO_PH, using 0');
         }
       } else if (isPhToUae) {
         // PH_TO_UAE: Delivery charge calculation depends on invoice type (COD vs Tax)
@@ -1177,7 +1194,13 @@ router.post('/', async (req, res) => {
         console.log(`   📋 UAE_TO_PH: Pickup charge from line_items will be included in totals`);
       }
     } else if (isUaeToPhForPickup) {
-      console.log(`ℹ️ UAE_TO_PH: No pickup charge provided (pickup_base_amount: ${pickupBaseAmount}, line_items pickup: ${pickupCharge})`);
+      const quotedPickup = Number(invoiceRequest?.quotation_request?.quotation_pickup_charge);
+      if (Number.isFinite(quotedPickup) && quotedPickup > 0) {
+        finalPickupCharge = Math.round(quotedPickup * 100) / 100;
+        console.log(`✅ Using quoted pickup charge: ${finalPickupCharge} AED`);
+      } else {
+        console.log(`ℹ️ UAE_TO_PH: No pickup charge provided (pickup_base_amount: ${pickupBaseAmount}, line_items pickup: ${pickupCharge})`);
+      }
     }
     
     // Round all charges to 2 decimal places
@@ -1611,6 +1634,15 @@ router.post('/', async (req, res) => {
     if (pickupCharge > 0) {
       console.log(`✅ Pickup charge (${pickupCharge} AED) stored in invoice.pickup_charge field, NOT in line_items`);
     }
+    if (deliveryCharge > 0 && !filteredLineItems.some((item) => (item.description || '').toLowerCase().includes('delivery'))) {
+      filteredLineItems.push({
+        description: 'Delivery Charge',
+        quantity: 1,
+        unit_price: mongoose.Types.Decimal128.fromString(deliveryCharge.toFixed(2)),
+        total: mongoose.Types.Decimal128.fromString(deliveryCharge.toFixed(2)),
+      });
+      console.log(`✅ Added quoted/computed delivery charge to line_items: ${deliveryCharge} AED`);
+    }
 
     const invoiceData = {
       request_id,
@@ -1798,10 +1830,9 @@ router.post('/', async (req, res) => {
     const quoteHasAdvance = remainingQuoteAdvance(invoiceRequest) > 0;
     // Tabby/Card advance with no fee-on-top booked yet: carve VAT-inclusive gateway into the invoice JE.
     const advanceModeKey = quote?.advance?.mode ? String(quote.advance.mode).toUpperCase() : '';
-    const advanceAlreadyBookedGateway = Number(quote?.advance?.gateway_charge) > 0.009;
     const gatewayFromAdvance =
       quoteHasAdvance &&
-      !advanceAlreadyBookedGateway &&
+      !advanceGatewayAlreadyBooked(quote?.advance) &&
       PAYMENT_MODES[advanceModeKey]?.rate > 0
         ? advanceModeKey
         : undefined;
