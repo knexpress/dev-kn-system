@@ -175,6 +175,7 @@ const SYSTEM_ROLES = {
   pickup: '4020',
   delivery: '4030',
   salesDiscount: '40030',
+  salesReturn: '40040',
   gateway: '4040',
   vat: '2200',
   driverCash: '1020',

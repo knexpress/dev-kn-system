@@ -256,7 +256,7 @@ function buildInvoiceSearchQuery(searchTerm) {
 }
 
 // Essential fields for invoice list view (lightweight)
-const INVOICE_LIST_FIELDS = '_id invoice_id invoice_origin awb_number batch_number receiver_name receiver_address receiver_phone service_code weight_kg weight_type volume_cbm amount delivery_charge pickup_charge insurance_charge tax_amount total_amount amount_paid gateway_charges_total credit_notes_total debit_notes_total refunds_total gl_sync.status gl_sync.posted_total gl_sync.settled_amount gl_sync.journal_id gl_sync.journal_no gl_sync.collection_journal_id gl_sync.receipt_journal_id payment_mode payments status issue_date due_date paid_at createdAt updatedAt client_id request_id created_by';
+const INVOICE_LIST_FIELDS = '_id invoice_id invoice_origin awb_number batch_number receiver_name receiver_address receiver_phone service_code weight_kg weight_type volume_cbm amount delivery_charge pickup_charge insurance_charge tax_amount total_amount amount_paid gateway_charges_total credit_notes_total debit_notes_total refunds_total gl_sync.status gl_sync.posted_total gl_sync.settled_amount gl_sync.journal_id gl_sync.journal_no gl_sync.collection_journal_id gl_sync.receipt_journal_id payment_mode payments status issue_date due_date paid_at createdAt updatedAt client_id request_id created_by bill_to';
 
 function canRaiseCancellationInvoice(user) {
   const role = String(user?.role || '').toUpperCase();
@@ -295,7 +295,7 @@ router.get('/cancellation-candidates', auth, async (req, res) => {
       }
     }
     const rows = await InvoiceRequest.find(query)
-      .select('tracking_code awb_number customer_name customer_phone receiver_name receiver_phone service_code status quotation_request.quotation_number quotation_request.quotation_total quotation_request.cancellation_charged quotation_request.advance')
+      .select('tracking_code awb_number customer_name customer_phone receiver_name receiver_phone service_code status quotation_request.quotation_number quotation_request.quotation_total quotation_request.actual_weight quotation_request.volumetric_weight quotation_request.quotation_chargeable_weight quotation_request.quotation_rate_per_kg quotation_request.number_of_boxes quotation_request.cancellation_charged quotation_request.advance')
       .sort({ cancelled_at: -1, updatedAt: -1 })
       .limit(30)
       .lean();
@@ -310,10 +310,14 @@ router.get('/cancellation-candidates', auth, async (req, res) => {
         service_code: row.service_code || '',
         quotation_number: row.quotation_request?.quotation_number || '',
         quotation_total: row.quotation_request?.quotation_total || 0,
-        has_advance: Boolean(row.quotation_request?.advance?.journal_id)
-          && !row.quotation_request?.advance?.void_journal_id
-          && !row.quotation_request?.advance?.applied_journal_id,
-        advance_amount: row.quotation_request?.advance?.amount || 0,
+        actual_weight: row.quotation_request?.actual_weight || 0,
+        volumetric_weight: row.quotation_request?.volumetric_weight || 0,
+        chargeable_weight: row.quotation_request?.quotation_chargeable_weight
+          || Math.max(Number(row.quotation_request?.actual_weight) || 0, Number(row.quotation_request?.volumetric_weight) || 0),
+        rate_per_kg: row.quotation_request?.quotation_rate_per_kg || 0,
+        number_of_boxes: row.quotation_request?.number_of_boxes || 0,
+        has_advance: remainingQuoteAdvance(row) > 0.009,
+        advance_amount: remainingQuoteAdvance(row),
       })),
     });
   } catch (error) {
@@ -341,7 +345,7 @@ router.post('/cancellation', auth, async (req, res) => {
       amount: req.body?.amount,
       vatRate: req.body?.vat_rate,
       reason: (req.body?.reason || '').toString().trim(),
-      payment: req.body?.paid ? req.body?.payment : undefined,
+      payment: req.body?.payment,
       actorId: req.user?.id,
       actorName: req.user?.employee?.full_name || req.user?.full_name || req.user?.email,
       createdBy,
@@ -750,6 +754,7 @@ router.post('/', async (req, res) => {
       declared_amount,
       insurance_fixed_type,
       customer_trn,
+      bill_to,
       batch_number,
       total_amount_cod, // NEW: COD Invoice total (PH_TO_UAE only)
       total_amount_tax_invoice, // NEW: Tax Invoice total (PH_TO_UAE only)
@@ -1673,6 +1678,7 @@ router.post('/', async (req, res) => {
       created_by,
       has_delivery: hasDeliveryComputed, // Store delivery flag (computed)
       ...(customer_trn ? { customer_trn } : {}),
+      bill_to: String(bill_to || '').toUpperCase() === 'RECEIVER' ? 'RECEIVER' : 'SENDER',
       batch_number: batch_number.toString().trim(),
       // Populate fields from InvoiceRequest if available
       ...(invoiceRequest && {

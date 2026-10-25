@@ -3293,6 +3293,7 @@ router.post('/:id/advance-payment', auth, async (req, res) => {
 
     const result = await recordQuoteAdvance(invoiceRequest, {
       mode: req.body?.mode || req.body?.payment?.mode,
+      paymentType: req.body?.payment_type || req.body?.payment?.payment_type,
       amountCollected: req.body?.amount ?? req.body?.payment?.amount,
       reference: req.body?.reference || req.body?.payment?.reference,
       collectedAt: req.body?.collected_at || req.body?.paid_at || req.body?.payment?.collected_at,
@@ -3310,7 +3311,7 @@ router.post('/:id/advance-payment', auth, async (req, res) => {
         journal_no: result.journal?.entry_no,
         draft_journal: result.draft_journal,
       },
-      message: `Advance recorded · ${result.journal?.entry_no || ''} credited to Customer Payment Due${
+      message: `Payment recorded · ${result.journal?.entry_no || ''} credited to Customer Payment Due${
         draftNo ? `. Draft invoice ${draftNo} updated` : ''
       }`.trim(),
     });
@@ -3373,6 +3374,8 @@ router.post('/:id/cancel-shipment', auth, async (req, res) => {
         reason,
         payment: req.body?.payment || {
           mode: req.body?.payment_mode,
+          payment_type: req.body?.payment_type,
+          amount: req.body?.payment_amount,
           reference: req.body?.payment_reference,
           collected_at: req.body?.paid_at,
         },
@@ -3417,6 +3420,7 @@ router.post('/:id/cancel-shipment', auth, async (req, res) => {
         : (reason || 'Cancelled at quotation, no charge')
     );
 
+    const remainingDue = prepaidResult?.remaining || 0;
     res.json({
       success: true,
       data: {
@@ -3434,8 +3438,12 @@ router.post('/:id/cancel-shipment', auth, async (req, res) => {
           : null,
       },
       message: charge
-        ? `Shipment cancelled. Invoice ${invoice.invoice_id} raised for AED ${total.toFixed(2)}.`
-        : 'Shipment cancelled. The customer was not charged.',
+        ? `Shipment cancelled. Invoice ${invoice.invoice_id} raised for AED ${total.toFixed(2)}${
+            prepaidResult?.refund_amount > 0.009
+              ? `. Unused payment AED ${Number(prepaidResult.refund_amount).toFixed(2)} refunded${prepaidResult.refund_journal_no ? ` (${prepaidResult.refund_journal_no})` : ''}`
+              : ''
+          }${remainingDue > 0.009 ? `. Remaining due AED ${Number(remainingDue).toFixed(2)}` : ''}.`
+        : 'Shipment cancelled. The customer was not charged. Any quotation payments were reversed from Customer Payment Due.',
     });
   } catch (error) {
     console.error('Error cancelling shipment at quotation:', error);

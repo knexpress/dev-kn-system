@@ -1,6 +1,35 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 
+const quoteAdvancePaymentSchema = new mongoose.Schema({
+  mode: { type: String, required: false },
+  payment_type: { type: String, enum: ['FULL', 'PARTIAL'], required: false },
+  amount_collected: { type: Number, required: false },
+  amount_applied: { type: Number, required: false },
+  gateway_charge: { type: Number, required: false },
+  gateway_net: { type: Number, required: false },
+  gateway_vat: { type: Number, required: false },
+  reference: { type: String, required: false },
+  collected_at: { type: Date, required: false },
+  expected_settlement_at: { type: Date, required: false },
+  settled_at: { type: Date, required: false },
+  settle_journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
+  settle_journal_no: { type: String, required: false },
+  settle_bank_code: { type: String, required: false },
+  settle_bank_name: { type: String, required: false },
+  settle_amount: { type: Number, required: false },
+  refund_amount: { type: Number, required: false },
+  refund_journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
+  refund_journal_no: { type: String, required: false },
+  status: { type: String, enum: ['POSTED', 'VOID'], default: 'POSTED' },
+  journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
+  journal_no: { type: String, required: false },
+  void_journal_id: { type: mongoose.Schema.Types.ObjectId, required: false },
+  void_journal_no: { type: String, required: false },
+  recorded_at: { type: Date, required: false },
+  recorded_by_name: { type: String, required: false },
+}, { _id: true });
+
 // Department Schema
 const departmentSchema = new mongoose.Schema({
   name: {
@@ -513,6 +542,7 @@ const invoiceRequestSchema = new mongoose.Schema({
       amount: { type: Number, required: false },
       amount_collected: { type: Number, required: false },
       mode: { type: String, required: false },
+      payment_type: { type: String, enum: ['FULL', 'PARTIAL'], required: false },
       reference: { type: String, required: false },
       collected_at: { type: Date, required: false },
       expected_settlement_at: { type: Date, required: false },
@@ -530,11 +560,15 @@ const invoiceRequestSchema = new mongoose.Schema({
       applied_journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
       applied_journal_no: { type: String, required: false },
       applied_amount: { type: Number, required: false },
+      refund_amount: { type: Number, required: false },
+      refund_journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
+      refund_journal_no: { type: String, required: false },
       void_journal_id: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', required: false },
       void_journal_no: { type: String, required: false },
       gateway_charge: { type: Number, required: false },
       gateway_net: { type: Number, required: false },
       gateway_vat: { type: Number, required: false },
+      payments: [quoteAdvancePaymentSchema],
     },
   },
   
@@ -1448,6 +1482,7 @@ const manualQuotationSchema = new mongoose.Schema({
     amount: { type: Number, required: false },
     amount_collected: { type: Number, required: false },
     mode: { type: String, required: false },
+    payment_type: { type: String, enum: ['FULL', 'PARTIAL'], required: false },
     reference: { type: String, required: false },
     collected_at: { type: Date, required: false },
     expected_settlement_at: { type: Date, required: false },
@@ -1465,11 +1500,15 @@ const manualQuotationSchema = new mongoose.Schema({
     applied_journal_id: { type: mongoose.Schema.Types.ObjectId, required: false },
     applied_journal_no: { type: String, required: false },
     applied_amount: { type: Number, required: false },
+    refund_amount: { type: Number, required: false },
+    refund_journal_id: { type: mongoose.Schema.Types.ObjectId, required: false },
+    refund_journal_no: { type: String, required: false },
     void_journal_id: { type: mongoose.Schema.Types.ObjectId, required: false },
     void_journal_no: { type: String, required: false },
     gateway_charge: { type: Number, required: false },
     gateway_net: { type: Number, required: false },
     gateway_vat: { type: Number, required: false },
+    payments: [quoteAdvancePaymentSchema],
   },
 }, {
   timestamps: true,

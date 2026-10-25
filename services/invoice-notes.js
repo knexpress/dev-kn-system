@@ -51,20 +51,64 @@ function normalizeLines(rawLines, { allowVat }) {
   return rawLines.map((raw, i) => {
     const category = String(raw?.category || '').toUpperCase();
     if (!INVOICE_NOTE_CATEGORIES.includes(category)) throw new NoteError(`Line ${i + 1}: choose a charge type`);
-    const amount = round2(raw?.amount);
+    const weightKg = num(raw?.weight_kg);
+    const ratePerKg = num(raw?.rate_per_kg);
+    let amount = round2(raw?.amount);
+    if (!(amount > 0) && weightKg > 0 && ratePerKg > 0) amount = round2(weightKg * ratePerKg);
     if (!(amount > 0)) throw new NoteError(`Line ${i + 1}: enter an amount above zero`);
     const vatRate = Number(raw?.vat_rate) === 5 ? 5 : 0;
     if (vatRate && !allowVat) throw new NoteError('This invoice carries no VAT, so the note cannot include VAT');
     const vatAmount = round2((amount * vatRate) / 100);
+    const priced = weightKg > 0 && ratePerKg > 0 ? `${weightKg} kg × AED ${ratePerKg}/kg` : '';
     return {
       category,
-      description: String(raw?.description || '').trim() || CATEGORY_LABEL[category],
+      description: String(raw?.description || '').trim() || (priced ? `${CATEGORY_LABEL[category]} ${priced}` : CATEGORY_LABEL[category]),
+      weight_kg: weightKg > 0 ? weightKg : undefined,
+      rate_per_kg: ratePerKg > 0 ? ratePerKg : undefined,
       amount,
       vat_rate: vatRate,
       vat_amount: vatAmount,
       total: round2(amount + vatAmount),
     };
   });
+}
+
+async function shipmentChargeOf(invoice) {
+  let request = null;
+  const rid = invoice?.request_id?._id || invoice?.request_id;
+  if (rid) {
+    try {
+      const { InvoiceRequest } = require('../models');
+      request = await InvoiceRequest.findById(rid)
+        .select('quotation_request verification weight weight_kg number_of_boxes')
+        .lean();
+    } catch (_) {
+      request = null;
+    }
+  }
+  const qr = request?.quotation_request || {};
+  const ver = request?.verification || {};
+  const actual = num(qr.actual_weight || ver.actual_weight);
+  const volumetric = num(qr.volumetric_weight || ver.volumetric_weight);
+  const chargeable = num(
+    invoice?.weight_kg ||
+      qr.quotation_chargeable_weight ||
+      ver.chargeable_weight ||
+      request?.weight ||
+      request?.weight_kg ||
+      (actual || volumetric ? Math.max(actual, volumetric) : 0)
+  );
+  const rate = num(invoice?.base_rate || qr.quotation_rate_per_kg);
+  const boxes = num(qr.number_of_boxes || request?.number_of_boxes);
+  const weightType = invoice?.weight_type || ver.weight_type || (actual >= volumetric ? 'ACTUAL' : 'VOLUMETRIC');
+  return {
+    actual_weight: actual || undefined,
+    volumetric_weight: volumetric || undefined,
+    chargeable_weight: chargeable || undefined,
+    rate_per_kg: rate || undefined,
+    number_of_boxes: boxes || undefined,
+    weight_type: chargeable || actual || volumetric ? weightType : undefined,
+  };
 }
 
 function totalsOf(lines) {
@@ -96,6 +140,7 @@ async function invoiceNoteContext(invoice) {
     pending_credit_total: pendingCredit.total,
     creditable: round2(Math.max(0, summary.total - pendingCredit.total)),
     creditable_vat: round2(Math.max(0, vatRemaining)),
+    shipment: await shipmentChargeOf(invoice),
   };
 }
 
@@ -158,6 +203,7 @@ async function createInvoiceNote(invoiceId, payload = {}, userId) {
         customer_name: customerName,
         customer_trn: invoice.customer_trn,
         service_code: invoice.service_code,
+        ...await shipmentChargeOf(invoice),
         reason_code: reasonCode,
         reason,
         lines,
@@ -178,44 +224,78 @@ async function createInvoiceNote(invoiceId, payload = {}, userId) {
 
 async function postNoteJournal(note, invoice, actor) {
   const isCredit = note.note_type === 'CREDIT';
-  const byRole = {};
-  for (const line of note.lines) {
-    const role = CATEGORY_ROLE[line.category];
-    byRole[role] = round2((byRole[role] || 0) + line.amount);
-  }
-  const roles = Object.keys(byRole);
-  const [arGl, vatGl, ...revenueGls] = await Promise.all([
-    resolveAccount('ar'),
-    note.vat_amount > 0 ? resolveAccount('vat') : Promise.resolve(null),
-    ...roles.map((role) => resolveAccount(role)),
-  ]);
   const ref = note.invoice_no;
   const awb = note.awb_number ? ` · AWB ${note.awb_number}` : '';
   const side = (amount, debitSide) => (debitSide ? { debit: amount, credit: 0 } : { debit: 0, credit: amount });
-  const lines = [
-    {
+  const [arGl, vatGl] = await Promise.all([
+    resolveAccount('ar'),
+    note.vat_amount > 0 ? resolveAccount('vat') : Promise.resolve(null),
+  ]);
+  let lines;
+  if (isCredit) {
+    const returnGl = await resolveAccount('salesReturn');
+    const returnAmount = round2(note.subtotal || note.total_amount - (note.vat_amount || 0));
+    lines = [
+      {
+        account_id: returnGl._id,
+        account_code: returnGl.code,
+        account_name: returnGl.name,
+        description: `${note.note_no} sales return ${ref}${awb}`,
+        debit: returnAmount,
+        credit: 0,
+      },
+    ];
+    if (note.vat_amount > 0 && vatGl) {
+      lines.push({
+        account_id: vatGl._id,
+        account_code: vatGl.code,
+        account_name: vatGl.name,
+        description: `${note.note_no} VAT output reduction ${ref}`,
+        debit: note.vat_amount,
+        credit: 0,
+      });
+    }
+    lines.push({
       account_id: arGl._id,
       account_code: arGl.code,
       account_name: arGl.name,
       description: `${note.note_no} AR ${ref} — ${note.customer_name || 'Customer'}`,
-      ...side(note.total_amount, !isCredit),
-    },
-    ...roles.map((role, i) => ({
-      account_id: revenueGls[i]._id,
-      account_code: revenueGls[i].code,
-      account_name: revenueGls[i].name,
-      description: `${note.note_no} ${isCredit ? 'credit' : 'debit'} — ${revenueGls[i].name} ${ref}${awb}`,
-      ...side(byRole[role], isCredit),
-    })),
-  ];
-  if (note.vat_amount > 0) {
-    lines.push({
-      account_id: vatGl._id,
-      account_code: vatGl.code,
-      account_name: vatGl.name,
-      description: `${note.note_no} VAT output ${isCredit ? 'reduction' : 'increase'} ${ref}`,
-      ...side(note.vat_amount, isCredit),
+      debit: 0,
+      credit: note.total_amount,
     });
+  } else {
+    const byRole = {};
+    for (const line of note.lines) {
+      const role = CATEGORY_ROLE[line.category];
+      byRole[role] = round2((byRole[role] || 0) + line.amount);
+    }
+    const roles = Object.keys(byRole);
+    const revenueGls = await Promise.all(roles.map((role) => resolveAccount(role)));
+    lines = [
+      {
+        account_id: arGl._id,
+        account_code: arGl.code,
+        account_name: arGl.name,
+        description: `${note.note_no} AR ${ref} — ${note.customer_name || 'Customer'}`,
+        ...side(note.total_amount, true),
+      },
+      ...roles.map((role, i) => ({
+        account_id: revenueGls[i]._id,
+        account_code: revenueGls[i].code,
+        account_name: revenueGls[i].name,
+        description: `${note.note_no} debit — ${revenueGls[i].name} ${ref}${awb}`,
+        ...side(byRole[role], false),
+      })),
+    ];
+    if (note.vat_amount > 0 && vatGl) {
+      lines.push({
+        account_id: vatGl._id,
+        account_code: vatGl.code,
+        account_name: vatGl.name,
+        description: `${note.note_no} VAT output increase ${ref}`,
+        ...side(note.vat_amount, false),
+      });
+    }
   }
   return createJournalWithNextNo(note.note_date || new Date(), {
     memo: `${isCredit ? 'Credit' : 'Debit'} note ${note.note_no} against ${ref} — ${note.reason}`,
@@ -318,12 +398,15 @@ async function refreshInvoiceSettlement(invoiceId) {
   const active = (invoice.payments || []).filter((p) => p.status !== 'VOID');
   const legacyOnly = Boolean(invoice.gl_sync?.collection_journal_id || invoice.gl_sync?.receipt_journal_id) && !active.length;
   const update = { $set: { amount_paid: summary.paid } };
-  if (!legacyOnly) {
-    if (['UNPAID', 'OVERDUE'].includes(invoice.status) && summary.balance <= 0.009) {
+  if (!legacyOnly && invoice.status !== 'CANCELLED') {
+    if (summary.balance <= 0.009 && summary.paid > 0.009) {
       const unremittedCash = active.some((p) => p.mode === 'CASH' && !p.remitted);
       update.$set.status = unremittedCash ? 'COLLECTED_BY_DRIVER' : 'PAID';
-      update.$set.paid_at = new Date();
-    } else if (invoice.status === 'PAID' && summary.balance > 0.009) {
+      if (!invoice.paid_at) update.$set.paid_at = new Date();
+    } else if (summary.paid > 0.009 && summary.balance > 0.009) {
+      update.$set.status = 'PARTIAL';
+      update.$unset = { paid_at: '' };
+    } else if (summary.balance > 0.009 && ['PAID', 'PARTIAL', 'COLLECTED_BY_DRIVER'].includes(invoice.status)) {
       update.$set.status = 'UNPAID';
       update.$unset = { paid_at: '' };
     }

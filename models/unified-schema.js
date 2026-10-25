@@ -563,6 +563,12 @@ const invoiceSchema = new mongoose.Schema({
     required: false,
     trim: true,
   },
+  bill_to: {
+    type: String,
+    required: false,
+    enum: ['SENDER', 'RECEIVER'],
+    default: 'SENDER',
+  },
   batch_number: {
     type: String,
     required: false,
@@ -640,7 +646,7 @@ const invoiceSchema = new mongoose.Schema({
   status: {
     type: String,
     required: true,
-    enum: ['PAID', 'UNPAID', 'OVERDUE', 'CANCELLED', 'COLLECTED_BY_DRIVER', 'REMITTED'],
+    enum: ['PAID', 'UNPAID', 'PARTIAL', 'OVERDUE', 'CANCELLED', 'COLLECTED_BY_DRIVER', 'REMITTED'],
     default: 'UNPAID',
   },
   line_items: [{

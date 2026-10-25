@@ -5,6 +5,8 @@ const {
   recordInvoicePayment,
   applyQuoteAdvanceToInvoice,
   remainingQuoteAdvance,
+  refundUnusedQuoteAdvance,
+  invoicePaymentSummary,
   PAYMENT_MODES,
 } = require('./invoice-gl');
 
@@ -129,11 +131,16 @@ async function raiseCancellationInvoice({
   const total = roundMoney(net + vat);
   const hasAdvance = liveAdvance(invoiceRequest);
   const existingAdvance = invoiceRequest?.quotation_request?.advance;
-  const paymentMode = String(payment?.mode || existingAdvance?.mode || '').toUpperCase();
+  const paymentMode = String(payment?.mode || '').toUpperCase();
+  const paymentType = String(payment?.payment_type || (hasAdvance ? 'PARTIAL' : 'FULL')).toUpperCase();
+  const collectedNow = roundMoney(payment?.amount ?? payment?.amount_collected);
   const wantsPayment = Boolean(payment?.mode) || hasAdvance;
 
   if (wantsPayment && !hasAdvance && !PAYMENT_MODES[paymentMode]) {
     return { error: 'Choose how the customer paid: Cash, Bank transfer, Card payment or Tabby' };
+  }
+  if (payment?.mode && !['FULL', 'PARTIAL'].includes(paymentType)) {
+    return { error: 'Choose full or partial payment' };
   }
 
   const paymentReference = (payment?.reference || existingAdvance?.reference || '').toString().trim();
@@ -202,17 +209,51 @@ async function raiseCancellationInvoice({
   await pushCancellationToEmpost(invoice);
 
   let prepaidResult = null;
+  let refundResult = null;
   if (gl.status === 'POSTED' && wantsPayment) {
     if (hasAdvance) {
       const paid = await applyQuoteAdvanceToInvoice(invoice, invoiceRequest, { actorId });
-      prepaidResult = paid.error
-        ? { status: 'FAILED', error: paid.error }
-        : { status: 'PAID', journal_no: paid.journal?.entry_no, mode: existingAdvance.mode, from_advance: true };
+      if (paid.error) {
+        prepaidResult = { status: 'FAILED', error: paid.error };
+      } else {
+        refundResult = await refundUnusedQuoteAdvance(invoiceRequest, {
+          actorId,
+          reason: 'cancellation fee less than quotation payment',
+        });
+        const fresh = await Invoice.findById(invoice._id);
+        const { balance } = invoicePaymentSummary(fresh || invoice);
+        let extra = null;
+        if (balance > 0.009 && PAYMENT_MODES[paymentMode]) {
+          extra = await recordInvoicePayment(fresh || invoice, {
+            mode: paymentMode,
+            paymentType,
+            amountCollected: collectedNow || (paymentType === 'FULL' ? balance : 0),
+            reference: paymentReference || undefined,
+            collectedAt: payment?.collected_at || payment?.paid_at,
+            actorId,
+            prepaid: true,
+          });
+        }
+        const remaining = extra?.balance != null ? extra.balance : balance;
+        prepaidResult = extra?.error
+          ? { status: 'FAILED', error: extra.error, from_advance: true, journal_no: paid.journal?.entry_no }
+          : {
+              status: remaining > 0.009 ? 'PARTIAL' : 'PAID',
+              journal_no: extra?.journal?.entry_no || paid.journal?.entry_no,
+              apply_journal_no: paid.journal?.entry_no,
+              extra_journal_no: extra?.journal?.entry_no,
+              refund_journal_no: refundResult?.journal?.entry_no,
+              refund_amount: refundResult?.amount || 0,
+              remaining,
+              mode: paymentMode || existingAdvance?.mode,
+              from_advance: true,
+            };
+      }
     } else {
       const paid = await recordInvoicePayment(invoice, {
         mode: paymentMode,
-        paymentType: 'FULL',
-        amountCollected: total,
+        paymentType,
+        amountCollected: collectedNow || (paymentType === 'FULL' ? total : 0),
         reference: paymentReference || undefined,
         collectedAt: payment?.collected_at || payment?.paid_at,
         actorId,
@@ -220,7 +261,12 @@ async function raiseCancellationInvoice({
       });
       prepaidResult = paid.error
         ? { status: 'FAILED', error: paid.error }
-        : { status: 'PAID', journal_no: paid.journal?.entry_no, mode: paymentMode };
+        : {
+            status: (paid.balance || 0) > 0.009 ? 'PARTIAL' : 'PAID',
+            journal_no: paid.journal?.entry_no,
+            remaining: paid.balance || 0,
+            mode: paymentMode,
+          };
     }
   } else if (gl.status !== 'POSTED') {
     prepaidResult = { status: 'FAILED', error: gl.error || gl.reason || 'Invoice journal is not posted' };
@@ -244,10 +290,12 @@ async function raiseCancellationInvoice({
     await invoiceRequest.save();
   }
 
+  const latest = await Invoice.findById(invoice._id);
   return {
-    invoice,
+    invoice: latest || invoice,
     gl,
     payment: prepaidResult,
+    refund: refundResult,
     total,
     paymentMode,
   };

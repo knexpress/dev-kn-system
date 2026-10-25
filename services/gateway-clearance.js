@@ -44,8 +44,12 @@ function clearingRole(mode) {
 
 function collectedAmount(row) {
   const collected = Number(row?.amount_collected);
-  if (Number.isFinite(collected) && collected > 0) return round2(collected);
-  return round2(row?.amount || row?.amount_applied || 0);
+  const refunded = round2(Number(row?.refund_amount) || 0);
+  const gross = Number.isFinite(collected) && collected > 0
+    ? round2(collected)
+    : round2(row?.amount || row?.amount_applied || 0);
+  if (row?.settled_at || row?.settle_journal_id) return gross;
+  return round2(Math.max(0, gross - refunded));
 }
 
 function parseClearanceId(id) {
@@ -56,9 +60,23 @@ function parseClearanceId(id) {
     const [invoiceId, paymentId] = key.split(':');
     if (invoiceId && paymentId) return { source: 'invoice', invoice_id: invoiceId, payment_id: paymentId };
   }
-  if (source === 'adv' && key) return { source: 'advance', request_id: key };
-  if (source === 'qadv' && key) return { source: 'quotation', quotation_id: key };
+  if (source === 'adv' && key) {
+    const [requestId, paymentId] = key.split(':');
+    if (requestId) return { source: 'advance', request_id: requestId, payment_id: paymentId || '' };
+  }
+  if (source === 'qadv' && key) {
+    const [quotationId, paymentId] = key.split(':');
+    if (quotationId) return { source: 'quotation', quotation_id: quotationId, payment_id: paymentId || '' };
+  }
   return null;
+}
+
+function liveClearancePayments(adv) {
+  const rows = Array.isArray(adv?.payments) ? adv.payments : [];
+  const live = rows.filter((p) => p && p.status !== 'VOID' && !p.void_journal_id);
+  if (live.length) return live;
+  if (adv?.journal_id && !adv?.void_journal_id) return [adv];
+  return [];
 }
 
 function serializeItem({
@@ -144,15 +162,26 @@ async function listGatewayClearance({ status = 'open' } = {}) {
       .select('invoice_id awb_number receiver_name payments')
       .lean(),
     InvoiceRequest.find({
-      'quotation_request.advance.mode': { $in: GATEWAY_MODES },
-      'quotation_request.advance.journal_id': { $exists: true, $ne: null },
+      $or: [
+        {
+          'quotation_request.advance.mode': { $in: GATEWAY_MODES },
+          'quotation_request.advance.journal_id': { $exists: true, $ne: null },
+        },
+        { 'quotation_request.advance.payments.mode': { $in: GATEWAY_MODES } },
+      ],
     })
       .select('customer_name receiver_name tracking_code quotation_request')
       .lean(),
     ManualQuotation.find({
-      'advance.mode': { $in: GATEWAY_MODES },
-      'advance.journal_id': { $exists: true, $ne: null },
-      $or: [{ invoice_request_id: { $exists: false } }, { invoice_request_id: null }],
+      $and: [
+        {
+          $or: [
+            { 'advance.mode': { $in: GATEWAY_MODES }, 'advance.journal_id': { $exists: true, $ne: null } },
+            { 'advance.payments.mode': { $in: GATEWAY_MODES } },
+          ],
+        },
+        { $or: [{ invoice_request_id: { $exists: false } }, { invoice_request_id: null }] },
+      ],
     })
       .select('quotation_number customer_name advance')
       .lean(),
@@ -175,6 +204,7 @@ async function listGatewayClearance({ status = 'open' } = {}) {
       // Advance apply only clears AR; Tabby/Card cash already sits on the quotation advance.
       if (payment.from_quote_advance) continue;
       if (payment.journal_id && appliedAdvanceJournalIds.has(String(payment.journal_id))) continue;
+      if (!(collectedAmount(payment) > 0.009) && !payment.settled_at && !payment.settle_journal_id) continue;
       const mode = String(payment.mode).toUpperCase();
       const clearing = metaFor(mode);
       items.push(
@@ -203,57 +233,65 @@ async function listGatewayClearance({ status = 'open' } = {}) {
 
   for (const request of advances) {
     const adv = request.quotation_request?.advance;
-    if (!adv || !isGatewayMode(adv.mode) || adv.void_journal_id) continue;
-    const mode = String(adv.mode).toUpperCase();
-    const clearing = metaFor(mode);
-    items.push(
-      serializeItem({
-        id: `adv:${request._id}`,
-        source: 'advance',
-        mode,
-        amount: collectedAmount(adv),
-        collectedAt: adv.collected_at,
-        expectedAt: adv.expected_settlement_at,
-        settledAt: adv.settled_at,
-        settleJournalNo: adv.settle_journal_no,
-        settleBankName: adv.settle_bank_name,
-        settleBankCode: adv.settle_bank_code,
-        ref: request.quotation_request?.quotation_number || request.tracking_code || String(request._id),
-        customerName: request.customer_name || request.receiver_name,
-        awb: request.tracking_code,
-        paymentReference: adv.reference,
-        journalNo: adv.journal_no,
-        clearingCode: clearing.code,
-        clearingName: clearing.name,
-      })
-    );
+    if (!adv || adv.void_journal_id) continue;
+    for (const payment of liveClearancePayments(adv).filter((p) => isGatewayMode(p.mode))) {
+      if (!(collectedAmount(payment) > 0.009) && !payment.settled_at && !payment.settle_journal_id) continue;
+      const mode = String(payment.mode).toUpperCase();
+      const clearing = metaFor(mode);
+      const paymentId = payment._id ? String(payment._id) : '';
+      items.push(
+        serializeItem({
+          id: paymentId ? `adv:${request._id}:${paymentId}` : `adv:${request._id}`,
+          source: 'advance',
+          mode,
+          amount: collectedAmount(payment),
+          collectedAt: payment.collected_at,
+          expectedAt: payment.expected_settlement_at,
+          settledAt: payment.settled_at,
+          settleJournalNo: payment.settle_journal_no,
+          settleBankName: payment.settle_bank_name,
+          settleBankCode: payment.settle_bank_code,
+          ref: request.quotation_request?.quotation_number || request.tracking_code || String(request._id),
+          customerName: request.customer_name || request.receiver_name,
+          awb: request.tracking_code,
+          paymentReference: payment.reference,
+          journalNo: payment.journal_no,
+          clearingCode: clearing.code,
+          clearingName: clearing.name,
+        })
+      );
+    }
   }
 
   for (const quotation of quotations) {
     const adv = quotation.advance;
-    if (!adv || !isGatewayMode(adv.mode) || adv.void_journal_id) continue;
-    const mode = String(adv.mode).toUpperCase();
-    const clearing = metaFor(mode);
-    items.push(
-      serializeItem({
-        id: `qadv:${quotation._id}`,
-        source: 'quotation',
-        mode,
-        amount: collectedAmount(adv),
-        collectedAt: adv.collected_at,
-        expectedAt: adv.expected_settlement_at,
-        settledAt: adv.settled_at,
-        settleJournalNo: adv.settle_journal_no,
-        settleBankName: adv.settle_bank_name,
-        settleBankCode: adv.settle_bank_code,
-        ref: quotation.quotation_number || String(quotation._id),
-        customerName: quotation.customer_name,
-        paymentReference: adv.reference,
-        journalNo: adv.journal_no,
-        clearingCode: clearing.code,
-        clearingName: clearing.name,
-      })
-    );
+    if (!adv || adv.void_journal_id) continue;
+    for (const payment of liveClearancePayments(adv).filter((p) => isGatewayMode(p.mode))) {
+      if (!(collectedAmount(payment) > 0.009) && !payment.settled_at && !payment.settle_journal_id) continue;
+      const mode = String(payment.mode).toUpperCase();
+      const clearing = metaFor(mode);
+      const paymentId = payment._id ? String(payment._id) : '';
+      items.push(
+        serializeItem({
+          id: paymentId ? `qadv:${quotation._id}:${paymentId}` : `qadv:${quotation._id}`,
+          source: 'quotation',
+          mode,
+          amount: collectedAmount(payment),
+          collectedAt: payment.collected_at,
+          expectedAt: payment.expected_settlement_at,
+          settledAt: payment.settled_at,
+          settleJournalNo: payment.settle_journal_no,
+          settleBankName: payment.settle_bank_name,
+          settleBankCode: payment.settle_bank_code,
+          ref: quotation.quotation_number || String(quotation._id),
+          customerName: quotation.customer_name,
+          paymentReference: payment.reference,
+          journalNo: payment.journal_no,
+          clearingCode: clearing.code,
+          clearingName: clearing.name,
+        })
+      );
+    }
   }
 
   const filtered = items.filter((item) => matchesStatus(item, status));
@@ -366,17 +404,7 @@ async function persistAdvanceSettlement(adv, patch, { request, quotation }) {
     await request.save();
     const quoteId = request.quotation_request?.quotation_id;
     if (quoteId) {
-      await ManualQuotation.findByIdAndUpdate(quoteId, {
-        $set: {
-          'advance.expected_settlement_at': patch.expected_settlement_at,
-          'advance.settled_at': patch.settled_at,
-          'advance.settle_journal_id': patch.settle_journal_id,
-          'advance.settle_journal_no': patch.settle_journal_no,
-          'advance.settle_bank_code': patch.settle_bank_code,
-          'advance.settle_bank_name': patch.settle_bank_name,
-          'advance.settle_amount': patch.settle_amount,
-        },
-      });
+      await ManualQuotation.findByIdAndUpdate(quoteId, { $set: { advance: request.quotation_request.advance } });
     }
   }
   if (quotation) {
@@ -429,34 +457,44 @@ async function settleGatewayClearance({ id, bank_cash_account_id, settled_at } =
     const request = await InvoiceRequest.findById(parsed.request_id);
     if (!request) return { error: 'Quotation not found' };
     const adv = request.quotation_request?.advance;
-    if (!adv?.journal_id) return { error: 'No advance payment on this quotation' };
-    if (adv.void_journal_id) return { error: 'This advance was voided' };
-    if (!isGatewayMode(adv.mode)) return { error: 'Only Tabby and card advances sit in clearance' };
-    if (adv.settle_journal_id) {
-      return { already: true, journal_no: adv.settle_journal_no, error: `Already closed by ${adv.settle_journal_no}` };
+    const payment = parsed.payment_id
+      ? (adv?.payments || []).find((p) => String(p._id) === String(parsed.payment_id))
+      : adv;
+    if (!payment?.journal_id && !adv?.journal_id) return { error: 'No advance payment on this quotation' };
+    if (adv?.void_journal_id || payment?.void_journal_id || payment?.status === 'VOID') {
+      return { error: 'This advance was voided' };
     }
-    row = { kind: 'advance', request, adv };
-    mode = String(adv.mode).toUpperCase();
-    amount = collectedAmount(adv);
-    collectedAt = adv.collected_at;
-    expectedAt = adv.expected_settlement_at || expectedSettlementAt(mode, collectedAt);
+    if (!isGatewayMode(payment.mode || adv?.mode)) return { error: 'Only Tabby and card advances sit in clearance' };
+    if (payment.settle_journal_id) {
+      return { already: true, journal_no: payment.settle_journal_no, error: `Already closed by ${payment.settle_journal_no}` };
+    }
+    row = { kind: 'advance', request, adv, payment };
+    mode = String(payment.mode || adv.mode).toUpperCase();
+    amount = collectedAmount(payment);
+    collectedAt = payment.collected_at;
+    expectedAt = payment.expected_settlement_at || expectedSettlementAt(mode, collectedAt);
     ref = request.quotation_request?.quotation_number || request.tracking_code || String(request._id);
     customerName = request.customer_name || request.receiver_name || '';
   } else {
     const quotation = await ManualQuotation.findById(parsed.quotation_id);
     if (!quotation) return { error: 'Quotation not found' };
     const adv = quotation.advance;
-    if (!adv?.journal_id) return { error: 'No advance payment on this quotation' };
-    if (adv.void_journal_id) return { error: 'This advance was voided' };
-    if (!isGatewayMode(adv.mode)) return { error: 'Only Tabby and card advances sit in clearance' };
-    if (adv.settle_journal_id) {
-      return { already: true, journal_no: adv.settle_journal_no, error: `Already closed by ${adv.settle_journal_no}` };
+    const payment = parsed.payment_id
+      ? (adv?.payments || []).find((p) => String(p._id) === String(parsed.payment_id))
+      : adv;
+    if (!payment?.journal_id && !adv?.journal_id) return { error: 'No advance payment on this quotation' };
+    if (adv?.void_journal_id || payment?.void_journal_id || payment?.status === 'VOID') {
+      return { error: 'This advance was voided' };
     }
-    row = { kind: 'quotation', quotation, adv };
-    mode = String(adv.mode).toUpperCase();
-    amount = collectedAmount(adv);
-    collectedAt = adv.collected_at;
-    expectedAt = adv.expected_settlement_at || expectedSettlementAt(mode, collectedAt);
+    if (!isGatewayMode(payment.mode || adv?.mode)) return { error: 'Only Tabby and card advances sit in clearance' };
+    if (payment.settle_journal_id) {
+      return { already: true, journal_no: payment.settle_journal_no, error: `Already closed by ${payment.settle_journal_no}` };
+    }
+    row = { kind: 'quotation', quotation, adv, payment };
+    mode = String(payment.mode || adv.mode).toUpperCase();
+    amount = collectedAmount(payment);
+    collectedAt = payment.collected_at;
+    expectedAt = payment.expected_settlement_at || expectedSettlementAt(mode, collectedAt);
     ref = quotation.quotation_number || String(quotation._id);
     customerName = quotation.customer_name || '';
   }
@@ -485,7 +523,19 @@ async function settleGatewayClearance({ id, bank_cash_account_id, settled_at } =
     row.invoice.markModified('payments');
     await row.invoice.save();
   } else if (row.kind === 'advance') {
-    await persistAdvanceSettlement(row.adv, patch, { request: row.request });
+    if (row.payment && row.payment !== row.adv) {
+      Object.assign(row.payment, patch);
+      const gatewayLive = (row.adv.payments || []).filter((p) => isGatewayMode(p.mode) && p.status !== 'VOID');
+      if (gatewayLive.length && gatewayLive.every((p) => p.settle_journal_id)) Object.assign(row.adv, patch);
+    } else {
+      Object.assign(row.adv, patch);
+    }
+    await persistAdvanceSettlement(row.adv, {}, { request: row.request });
+  } else if (row.payment && row.payment !== row.adv) {
+    Object.assign(row.payment, patch);
+    const gatewayLive = (row.adv.payments || []).filter((p) => isGatewayMode(p.mode) && p.status !== 'VOID');
+    if (gatewayLive.length && gatewayLive.every((p) => p.settle_journal_id)) Object.assign(row.adv, patch);
+    await persistAdvanceSettlement(row.adv, {}, { quotation: row.quotation });
   } else {
     await persistAdvanceSettlement(row.adv, patch, { quotation: row.quotation });
   }

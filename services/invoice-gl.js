@@ -11,6 +11,7 @@ const PAYMENT_LABEL = 'Finance invoice payment';
 const PAYMENT_VOID_LABEL = 'Finance invoice payment void';
 const ADVANCE_LABEL = 'Quotation advance';
 const ADVANCE_APPLY_LABEL = 'Quotation advance applied';
+const ADVANCE_REFUND_LABEL = 'Quotation advance refund';
 
 const glCodes = () => ({
   ar: String(process.env.FINANCE_INVOICE_AR_CODE || glCode('1300')).trim(),
@@ -19,6 +20,7 @@ const glCodes = () => ({
   pickup: String(process.env.FINANCE_SALES_PICKUP_CODE || glCode('4020')).trim(),
   delivery: String(process.env.FINANCE_SALES_DELIVERY_CODE || glCode('4030')).trim(),
   salesDiscount: String(process.env.FINANCE_SALES_DISCOUNT_CODE || glCode('salesDiscount') || glCode('40030')).trim(),
+  salesReturn: String(process.env.FINANCE_SALES_RETURN_CODE || glCode('salesReturn') || glCode('40040')).trim(),
   gateway: String(process.env.FINANCE_GATEWAY_REVENUE_CODE || glCode('4040')).trim(),
   vat: String(process.env.FINANCE_INVOICE_VAT_CODE || glCode('2200')).trim(),
   driverCash: String(process.env.FINANCE_DRIVER_CASH_CODE || glCode('1020')).trim(),
@@ -36,6 +38,7 @@ const DEFAULT_ACCOUNTS = {
   pickup: { name: 'Sales - Pick up Charge', type: 'Revenue', subtype: 'Revenue' },
   delivery: { name: 'Sales - Delivery Fee', type: 'Revenue', subtype: 'Revenue' },
   salesDiscount: { name: 'Sales Discount', type: 'Revenue', subtype: 'Revenue' },
+  salesReturn: { name: 'Sales Return and Allowance', type: 'Revenue', subtype: 'Revenue' },
   gateway: { name: 'Payment getway revenue', type: 'Revenue', subtype: 'Revenue' },
   vat: { name: 'VAT Output Payable', type: 'Liability', subtype: 'Tax' },
   driverCash: { name: 'Cash with Drivers (in transit)', type: 'Asset', subtype: 'Cash' },
@@ -64,9 +67,105 @@ function isGatewayMode(mode) {
 function advanceGatewayAlreadyBooked(adv) {
   if (!adv) return false;
   if (Number(adv.gateway_charge) > 0.009) return true;
+  if (Array.isArray(adv.payments) && adv.payments.some((p) => p && p.status !== 'VOID' && Number(p.gateway_charge) > 0.009)) {
+    return true;
+  }
   const collected = round2(Number(adv.amount_collected) || 0);
   const amount = round2(Number(adv.amount) || 0);
   return collected > amount + 0.009;
+}
+
+function liveAdvancePayments(adv) {
+  if (!adv) return [];
+  const rows = Array.isArray(adv.payments) ? adv.payments : [];
+  const live = rows.filter((p) => p && p.status !== 'VOID' && !p.void_journal_id);
+  if (live.length) return live;
+  if (adv.journal_id && !adv.void_journal_id) {
+    const collected = round2(Number(adv.amount_collected) || Number(adv.amount) || 0);
+    const amount = round2(Number(adv.amount) || 0);
+    const collectedField = round2(Number(adv.amount_collected) || 0);
+    const gateway = Number(adv.gateway_charge) > 0.009
+      ? round2(Number(adv.gateway_charge))
+      : (collectedField > amount + 0.009 ? round2(collectedField - amount) : 0);
+    const goods = gateway > 0.009
+      ? round2(Math.max(0, collected - gateway))
+      : (collectedField > amount + 0.009 ? amount : collected);
+    return [{
+      mode: adv.mode,
+      payment_type: adv.payment_type || 'FULL',
+      amount_collected: collected,
+      amount_applied: round2(Math.max(0, goods)),
+      gateway_charge: gateway,
+      gateway_net: round2(Number(adv.gateway_net) || 0),
+      gateway_vat: round2(Number(adv.gateway_vat) || 0),
+      reference: adv.reference,
+      collected_at: adv.collected_at,
+      expected_settlement_at: adv.expected_settlement_at,
+      journal_id: adv.journal_id,
+      journal_no: adv.journal_no,
+      status: 'POSTED',
+      recorded_by_name: adv.recorded_by_name,
+    }];
+  }
+  return [];
+}
+
+function quoteCollectedTotal(adv) {
+  return round2(liveAdvancePayments(adv).reduce((sum, p) => sum + (Number(p.amount_collected) || 0), 0));
+}
+
+function quoteGoodsReceived(adv, quoteTotal) {
+  const received = round2(liveAdvancePayments(adv).reduce((sum, p) => sum + (Number(p.amount_applied) || 0), 0));
+  return quoteTotal > 0 ? round2(Math.min(received, quoteTotal)) : received;
+}
+
+function quoteGatewayTotals(adv) {
+  const live = liveAdvancePayments(adv);
+  const gross = round2(live.reduce((sum, p) => sum + (Number(p.gateway_charge) || 0), 0));
+  const storedNet = round2(live.reduce((sum, p) => sum + (Number(p.gateway_net) || 0), 0));
+  const storedVat = round2(live.reduce((sum, p) => sum + (Number(p.gateway_vat) || 0), 0));
+  const net = storedNet > 0 || !(gross > 0.009) ? storedNet : round2(gross / (1 + GATEWAY_VAT_RATE));
+  const vat = storedVat > 0 || !(gross > 0.009) ? storedVat : round2(gross - net);
+  return { gross, net, vat };
+}
+
+function remainingQuoteGoods(quoteTotal, adv) {
+  return round2(Math.max(0, round2(Number(quoteTotal) || 0) - quoteGoodsReceived(adv, quoteTotal)));
+}
+
+function rollupQuoteAdvance(existing, payments) {
+  const live = (payments || []).filter((p) => p && p.status !== 'VOID' && !p.void_journal_id);
+  const first = live[0] || {};
+  const last = live[live.length - 1] || {};
+  const gateway = quoteGatewayTotals({ payments: live });
+  const collected = round2(live.reduce((sum, p) => sum + (Number(p.amount_collected) || 0), 0));
+  return {
+    amount: collected,
+    amount_collected: collected,
+    mode: last.mode || first.mode || existing?.mode,
+    payment_type: last.payment_type || existing?.payment_type,
+    reference: last.reference || first.reference || existing?.reference,
+    collected_at: last.collected_at || first.collected_at || existing?.collected_at,
+    expected_settlement_at: last.expected_settlement_at || existing?.expected_settlement_at,
+    settled_at: existing?.settled_at,
+    settle_journal_id: existing?.settle_journal_id,
+    settle_journal_no: existing?.settle_journal_no,
+    settle_bank_code: existing?.settle_bank_code,
+    settle_bank_name: existing?.settle_bank_name,
+    settle_amount: existing?.settle_amount,
+    recorded_at: last.recorded_at || existing?.recorded_at,
+    recorded_by_name: last.recorded_by_name || existing?.recorded_by_name,
+    journal_id: first.journal_id || existing?.journal_id,
+    journal_no: live.map((p) => p.journal_no).filter(Boolean).join(', ') || existing?.journal_no,
+    applied_invoice_id: existing?.applied_invoice_id,
+    applied_journal_id: existing?.applied_journal_id,
+    applied_journal_no: existing?.applied_journal_no,
+    applied_amount: existing?.applied_amount,
+    gateway_charge: gateway.gross,
+    gateway_net: gateway.net,
+    gateway_vat: gateway.vat,
+    payments,
+  };
 }
 
 function expectedSettlementAt(mode, collectedAt) {
@@ -567,19 +666,15 @@ async function upsertQuoteDraftJournal(request, { actorId } = {}) {
       includedGatewayConfig?.rate || 0,
       total
     );
-    const onTopGross = liveAdvance && advanceGatewayAlreadyBooked(adv)
-      ? (Number(adv.gateway_charge) > 0.009
-          ? round2(Number(adv.gateway_charge))
-          : round2((Number(adv.amount_collected) || 0) - (Number(adv.amount) || 0)))
-      : 0;
+    const gatewayTotals = liveAdvance ? quoteGatewayTotals(adv) : { gross: 0, net: 0, vat: 0 };
+    const onTopGross = liveAdvance && advanceGatewayAlreadyBooked(adv) ? gatewayTotals.gross : 0;
     const onTopConfig = onTopGross > 0.009 ? PAYMENT_MODES[advanceModeKey] : null;
-    const onTopNet = onTopConfig ? round2(onTopGross / (1 + GATEWAY_VAT_RATE)) : 0;
-    const onTopVat = onTopConfig ? round2(onTopGross - onTopNet) : 0;
+    const onTopNet = onTopConfig ? (gatewayTotals.net || round2(onTopGross / (1 + GATEWAY_VAT_RATE))) : 0;
+    const onTopVat = onTopConfig ? (gatewayTotals.vat || round2(onTopGross - onTopNet)) : 0;
     const gatewayConfig = includedGatewayConfig || onTopConfig;
     const arDebit = round2(total + (onTopGross > 0.009 ? onTopGross : 0));
-    const collected = liveAdvance
-      ? round2(Number(adv.amount_collected) || Number(adv.amount) || 0)
-      : 0;
+    const collected = liveAdvance ? quoteCollectedTotal(adv) : 0;
+    const remainingGoods = liveAdvance ? remainingQuoteGoods(total, adv) : total;
 
     const awb = request.tracking_code || request.awb_number || '';
     const awbText = awb ? ` · AWB ${awb}` : '';
@@ -606,7 +701,7 @@ async function upsertQuoteDraftJournal(request, { actorId } = {}) {
       ...split.map((part) => resolveAccount(part.role)),
     ]);
     const arDescription = liveAdvance
-      ? `AR ${qno} — ${customer} (advance ${gatewayConfig?.label || adv.mode} AED ${collected.toFixed(2)})`
+      ? `AR ${qno} — ${customer} (${remainingGoods > 0.009 ? 'partial' : 'paid'} ${gatewayConfig?.label || adv.mode || 'advance'} AED ${collected.toFixed(2)})`
       : `AR ${qno} — ${customer} (payment not yet received)`;
     const lines = [
       {
@@ -683,7 +778,9 @@ async function upsertQuoteDraftJournal(request, { actorId } = {}) {
 
     const items = (q.items || []).map((item) => `${item.name} ×${item.quantity}`).join(', ');
     const advanceNote = liveAdvance
-      ? ` Advance ${adv.journal_no || ''} via ${PAYMENT_MODES[advanceModeKey]?.label || adv.mode} AED ${collected.toFixed(2)}.`
+      ? ` ${remainingGoods > 0.009 ? 'Partial payment' : 'Payment'} ${adv.journal_no || ''} via ${PAYMENT_MODES[advanceModeKey]?.label || adv.mode || 'advance'} AED ${collected.toFixed(2)}${
+          remainingGoods > 0.009 ? ` · remaining AED ${remainingGoods.toFixed(2)}` : ''
+        }.`
       : '';
     const draft = {
       memo: `Quotation ${qno}${awbText} — ${customer}${items ? ` · Items: ${items}` : ''}. Draft until the invoice is generated.${advanceNote}`,
@@ -1201,6 +1298,8 @@ async function recordInvoicePayment(
     set.status = unremittedCash ? 'COLLECTED_BY_DRIVER' : 'PAID';
     set.paid_at = when;
     if (payment.reference) set.payment_reference = payment.reference;
+  } else if (newPaid > 0.009) {
+    set.status = 'PARTIAL';
   }
 
   const Invoice = mongoose.models.Invoice;
@@ -1252,14 +1351,35 @@ function quoteAdvanceOf(request) {
 
 function remainingQuoteAdvance(request) {
   const adv = quoteAdvanceOf(request);
-  if (!adv?.journal_id || adv.void_journal_id) return 0;
-  return round2(Math.max(0, round2(Number(adv.amount) || 0) - round2(Number(adv.applied_amount) || 0)));
+  if (!liveAdvancePayments(adv).length) return 0;
+  return round2(Math.max(
+    0,
+    quoteCollectedTotal(adv) - round2(Number(adv.applied_amount) || 0) - round2(Number(adv.refund_amount) || 0)
+  ));
+}
+
+function advanceDebitRole(mode) {
+  const modeKey = String(mode || '').toUpperCase();
+  const config = PAYMENT_MODES[modeKey];
+  if (!config) return 'remitted';
+  return modeKey === 'CASH' ? 'remitted' : config.debitRole;
+}
+
+async function persistQuoteAdvanceCopy(invoiceRequest) {
+  const quoteId = invoiceRequest?.quotation_request?.quotation_id;
+  if (!quoteId) return;
+  try {
+    const { ManualQuotation } = require('../models');
+    await ManualQuotation.findByIdAndUpdate(quoteId, { $set: { advance: invoiceRequest.quotation_request.advance } });
+  } catch (_) {
+    /* quotation copy is optional */
+  }
 }
 
 /** Cash in: Dr bank/cash/card · Cr Customer Payment Due (2310). Parked until the invoice posts. */
 async function recordQuoteAdvance(
   invoiceRequest,
-  { mode, amountCollected, reference, collectedAt, actorId } = {}
+  { mode, paymentType, amountCollected, reference, collectedAt, actorId } = {}
 ) {
   const quote = invoiceRequest?.quotation_request;
   if (!quote?.quotation_id) {
@@ -1269,33 +1389,51 @@ async function recordQuoteAdvance(
   if (invoiceRequest.status === 'COMPLETED') {
     return { error: 'An invoice was already generated for this quotation' };
   }
-  if (quote.advance?.journal_id && !quote.advance?.void_journal_id) {
-    return { error: `Advance ${quote.advance.journal_no || ''} is already recorded on this quotation`.trim() };
+  if (quote.advance?.applied_journal_id) {
+    return { error: 'This quotation payment has already been applied to an invoice' };
   }
 
   const modeKey = String(mode || '').toUpperCase();
   const baseConfig = PAYMENT_MODES[modeKey];
   if (!baseConfig) return { error: 'Choose how the customer paid: Cash, Bank transfer, Card payment or Tabby' };
   const config = modeKey === 'CASH' ? { ...baseConfig, debitRole: 'remitted' } : baseConfig;
+  const type = String(paymentType || 'FULL').toUpperCase();
+  if (!['FULL', 'PARTIAL'].includes(type)) return { error: 'Choose full or partial payment' };
+
   const quoteTotal = round2(Number(quote.quotation_total) || 0);
-  const collected = round2(Number(amountCollected) || quoteTotal);
-  if (!(collected > 0)) return { error: 'Enter the advance amount' };
-  const maxWithGateway = round2(quoteTotal * (1 + (config.rate || 0)));
-  if (quoteTotal > 0 && collected > maxWithGateway + 0.009) {
-    return {
-      error: config.rate
-        ? `Advance cannot be more than AED ${maxWithGateway.toFixed(2)} (quotation + ${Math.round(config.rate * 100)}% ${config.label} charges)`
-        : `Advance cannot be more than the quotation total AED ${quoteTotal.toFixed(2)}`,
-    };
+  const existing = quote.advance?.void_journal_id ? {} : (quote.advance || {});
+  const seeded = Array.isArray(existing.payments) && existing.payments.length
+    ? existing.payments.map((p) => (p.toObject ? p.toObject() : { ...p }))
+    : liveAdvancePayments(existing).map((p) => ({ ...p }));
+  const remainingGoods = remainingQuoteGoods(quoteTotal, { payments: seeded });
+  if (quoteTotal > 0 && remainingGoods <= 0.009) {
+    return { error: 'This quotation is already fully paid' };
   }
-  // Fee-on-top (Card/Tabby): amount above the quotation total is the VAT-inclusive gateway charge.
-  // If they enter exactly the quotation total with Tabby/Card, gateway is carved later on the invoice /
-  // draft JE (fee treated as included in the quoted price).
-  let applied = collected;
+
+  const collected = round2(Number(amountCollected) || (type === 'FULL' ? remainingGoods * (1 + (config.rate || 0)) : 0));
+  if (!(collected > 0)) return { error: 'Enter the amount collected' };
+
+  let applied;
   let gatewayCharge = 0;
-  if (config.rate > 0 && quoteTotal > 0 && collected > quoteTotal + 0.009) {
-    applied = quoteTotal;
-    gatewayCharge = round2(collected - applied);
+  if (type === 'FULL') {
+    if (collected < remainingGoods - 0.009) {
+      return { error: `AED ${collected.toFixed(2)} is less than the AED ${remainingGoods.toFixed(2)} balance — record it as a partial payment` };
+    }
+    if (config.rate === 0 && collected > remainingGoods + 0.009) {
+      return { error: `${config.label} carries no charges — the amount should be AED ${remainingGoods.toFixed(2)}` };
+    }
+    const maxWithGateway = round2(remainingGoods * (1 + (config.rate || 0)));
+    if (config.rate > 0 && collected > maxWithGateway + 0.009) {
+      return { error: `Full payment cannot be more than AED ${maxWithGateway.toFixed(2)} (balance + ${Math.round(config.rate * 100)}% ${config.label} charges)` };
+    }
+    applied = remainingGoods;
+    gatewayCharge = round2(Math.max(0, collected - applied));
+  } else {
+    applied = config.rate > 0 ? round2(collected / (1 + config.rate)) : collected;
+    if (applied >= remainingGoods - 0.009) {
+      return { error: `That covers the full AED ${remainingGoods.toFixed(2)} balance — record it as a full payment` };
+    }
+    gatewayCharge = round2(Math.max(0, collected - applied));
   }
   const gatewayNet = gatewayCharge > 0 ? round2(gatewayCharge / (1 + GATEWAY_VAT_RATE)) : 0;
   const gatewayVat = gatewayCharge > 0 ? round2(gatewayCharge - gatewayNet) : 0;
@@ -1320,11 +1458,11 @@ async function recordQuoteAdvance(
   // Park the full amount collected in Customer Payment Due. Tabby/Card extra is booked on the
   // invoice / draft JE so generating the invoice does not strip those charges.
   const lines = [
-    line(config.debitRole, collected, 0, `${config.label} advance ${quoteNo}${refText}`),
+    line(config.debitRole, collected, 0, `${config.label} ${type === 'PARTIAL' ? 'partial ' : ''}payment ${quoteNo}${refText}`),
     line('customerAdvance', 0, collected, `Customer Payment Due ${quoteNo}`),
   ];
   const journal = await createJournalWithNextNo(when, {
-    memo: `Advance on ${quoteNo} via ${config.label}`,
+    memo: `${type === 'FULL' ? 'Payment' : 'Partial payment'} on ${quoteNo} via ${config.label}`,
     source: 'PAYMENT',
     status: 'POSTED',
     lines,
@@ -1339,25 +1477,24 @@ async function recordQuoteAdvance(
   });
   await adjustWalletBalances(journal.lines);
 
-  const advance = {
-    amount: collected,
-    amount_collected: collected,
+  const payment = {
     mode: modeKey,
+    payment_type: type,
+    amount_collected: collected,
+    amount_applied: applied,
+    gateway_charge: gatewayCharge,
+    gateway_net: gatewayNet,
+    gateway_vat: gatewayVat,
     reference: reference ? String(reference).trim() : undefined,
     collected_at: when,
     expected_settlement_at: expectedSettlementAt(modeKey, when),
-    recorded_at: when,
-    recorded_by_name: actor.created_by_name,
+    status: 'POSTED',
     journal_id: journal._id,
     journal_no: journal.entry_no,
-    ...(config.rate > 0
-      ? {
-          gateway_charge: gatewayCharge,
-          gateway_net: gatewayNet,
-          gateway_vat: gatewayVat,
-        }
-      : {}),
+    recorded_at: when,
+    recorded_by_name: actor.created_by_name,
   };
+  const advance = rollupQuoteAdvance(existing, [...seeded, payment]);
   invoiceRequest.quotation_request.advance = advance;
   invoiceRequest.markModified('quotation_request');
   await invoiceRequest.save();
@@ -1376,14 +1513,11 @@ async function recordQuoteAdvance(
     draftJournal = await upsertQuoteDraftJournal(invoiceRequest, { actorId });
   }
   if (global.awbCache) global.awbCache.clear();
-  return { journal, advance, draft_journal: draftJournal };
+  return { journal, advance, payment, draft_journal: draftJournal };
 }
 
 async function recordManualQuotationAdvance(quotation, opts = {}) {
   if (!quotation) return { error: 'Quotation not found' };
-  if (quotation.advance?.journal_id && !quotation.advance?.void_journal_id) {
-    return { error: `Advance ${quotation.advance.journal_no || ''} is already recorded on this quotation`.trim() };
-  }
   if (quotation.invoice_request_id) {
     const InvoiceRequest = mongoose.models.InvoiceRequest || require('../models').InvoiceRequest;
     const invoiceRequest = await InvoiceRequest.findById(quotation.invoice_request_id);
@@ -1397,10 +1531,7 @@ async function recordManualQuotationAdvance(quotation, opts = {}) {
     if (!invoiceRequest.quotation_request.quotation_total) {
       invoiceRequest.quotation_request.quotation_total = quotation.total_amount;
     }
-    return recordQuoteAdvance(invoiceRequest, {
-      ...opts,
-      amountCollected: opts.amountCollected || quotation.total_amount,
-    });
+    return recordQuoteAdvance(invoiceRequest, opts);
   }
 
   const fakeRequest = {
@@ -1419,10 +1550,7 @@ async function recordManualQuotationAdvance(quotation, opts = {}) {
       await quotation.save();
     },
   };
-  return recordQuoteAdvance(fakeRequest, {
-    ...opts,
-    amountCollected: opts.amountCollected || quotation.total_amount,
-  });
+  return recordQuoteAdvance(fakeRequest, opts);
 }
 
 /**
@@ -1431,7 +1559,7 @@ async function recordManualQuotationAdvance(quotation, opts = {}) {
  */
 async function applyQuoteAdvanceToInvoice(invoice, invoiceRequest, { actorId } = {}) {
   const adv = quoteAdvanceOf(invoiceRequest);
-  if (!adv?.journal_id || adv.void_journal_id) return { skipped: true };
+  if (!liveAdvancePayments(adv).length) return { skipped: true };
   if (invoice.gl_sync?.status !== 'POSTED') {
     return { error: 'Post the invoice journal first' };
   }
@@ -1536,6 +1664,8 @@ async function applyQuoteAdvanceToInvoice(invoice, invoiceRequest, { actorId } =
     set.status = 'PAID';
     set.paid_at = when;
     if (payment.reference) set.payment_reference = payment.reference;
+  } else if (newPaid > 0.009) {
+    set.status = 'PARTIAL';
   }
   const Invoice = mongoose.models.Invoice;
   const updated = await Invoice.findByIdAndUpdate(
@@ -1559,27 +1689,135 @@ async function applyQuoteAdvanceToInvoice(invoice, invoiceRequest, { actorId } =
 
 async function reverseQuoteAdvance(invoiceRequest, { actorId, reason } = {}) {
   const adv = quoteAdvanceOf(invoiceRequest);
-  if (!adv?.journal_id || adv.void_journal_id) return { skipped: true };
-  if (adv.settle_journal_id) {
-    return { error: `This ${adv.mode || 'gateway'} advance has already been closed to the bank (${adv.settle_journal_no || 'settled'})` };
+  const live = liveAdvancePayments(adv);
+  if (!live.length) return { skipped: true };
+  if (adv.settle_journal_id || live.some((p) => p.settle_journal_id)) {
+    return { error: `This ${adv.mode || 'gateway'} payment has already been closed to the bank (${adv.settle_journal_no || 'settled'})` };
   }
   if (adv.applied_journal_id) return { error: 'Advance already applied to an invoice' };
-  const original = await JournalEntry.findById(adv.journal_id).lean();
-  if (!original || original.status !== 'POSTED') return { skipped: true };
   const actor = await resolveActor(actorId);
   const quoteNo = invoiceRequest.quotation_request?.quotation_number || 'quotation';
-  const reversal = await reverseJournal(original, {
-    ref: quoteNo,
-    actor,
-    reason: reason || 'quotation cancelled',
-    label: ADVANCE_LABEL,
-  });
-  await adjustWalletBalances(reversal.lines);
-  adv.void_journal_id = reversal._id;
-  adv.void_journal_no = reversal.entry_no;
+  let lastReversal = null;
+  for (const payment of live) {
+    const original = payment.journal_id ? await JournalEntry.findById(payment.journal_id).lean() : null;
+    if (!original || original.status !== 'POSTED') continue;
+    lastReversal = await reverseJournal(original, {
+      ref: quoteNo,
+      actor,
+      reason: reason || 'quotation cancelled',
+      label: ADVANCE_LABEL,
+    });
+    await adjustWalletBalances(lastReversal.lines);
+    payment.void_journal_id = lastReversal._id;
+    payment.void_journal_no = lastReversal.entry_no;
+    payment.status = 'VOID';
+  }
+  if (!lastReversal) return { skipped: true };
+  adv.void_journal_id = lastReversal._id;
+  adv.void_journal_no = lastReversal.entry_no;
+  if (Array.isArray(adv.payments)) {
+    for (const payment of adv.payments) {
+      const match = live.find((p) => String(p.journal_id || '') === String(payment.journal_id || ''));
+      if (match) {
+        payment.void_journal_id = match.void_journal_id;
+        payment.void_journal_no = match.void_journal_no;
+        payment.status = 'VOID';
+      }
+    }
+  }
   invoiceRequest.markModified('quotation_request');
   await invoiceRequest.save();
-  return { journal: reversal };
+  await persistQuoteAdvanceCopy(invoiceRequest);
+  return { journal: lastReversal };
+}
+
+/**
+ * After a cancellation / return fee uses only part of the parked quotation payment, send the leftover
+ * back out of Customer Payment Due to the original cash / bank / Tabby / Card account.
+ */
+async function refundUnusedQuoteAdvance(invoiceRequest, { actorId, reason } = {}) {
+  const leftover = remainingQuoteAdvance(invoiceRequest);
+  if (!(leftover > 0.009)) return { skipped: true };
+  const adv = quoteAdvanceOf(invoiceRequest);
+  const live = liveAdvancePayments(adv);
+  if (!live.length) return { skipped: true };
+
+  const actor = await resolveActor(actorId);
+  const quoteNo = invoiceRequest.quotation_request?.quotation_number || 'quotation';
+  const advanceGl = await resolveAccount('customerAdvance');
+  let appliedLeft = round2(Number(adv.applied_amount) || 0);
+  const journals = [];
+  let refunded = 0;
+
+  for (const payment of live) {
+    const collected = round2(Number(payment.amount_collected) || 0);
+    const used = round2(Math.min(collected, appliedLeft));
+    appliedLeft = round2(Math.max(0, appliedLeft - used));
+    const priorRefund = round2(Number(payment.refund_amount) || 0);
+    const unused = round2(Math.max(0, collected - used - priorRefund));
+    if (!(unused > 0.009)) continue;
+
+    const modeKey = String(payment.mode || adv.mode || 'CASH').toUpperCase();
+    const debitRole = payment.settle_journal_id || adv.settle_journal_id ? 'paid' : advanceDebitRole(modeKey);
+    const cashGl = await resolveAccount(debitRole);
+    const config = PAYMENT_MODES[modeKey] || { label: modeKey || 'Cash' };
+    const journal = await createJournalWithNextNo(new Date(), {
+      memo: `Refund unused ${quoteNo} payment via ${config.label}`,
+      source: 'PAYMENT',
+      status: 'POSTED',
+      lines: [
+        {
+          account_id: advanceGl._id,
+          account_code: advanceGl.code,
+          account_name: advanceGl.name,
+          description: `Return unused Customer Payment Due ${quoteNo}`,
+          debit: unused,
+          credit: 0,
+        },
+        {
+          account_id: cashGl._id,
+          account_code: cashGl.code,
+          account_name: cashGl.name,
+          description: `${config.label} refund ${quoteNo}${reason ? ` — ${reason}` : ''}`,
+          debit: 0,
+          credit: unused,
+        },
+      ],
+      total_debit: unused,
+      total_credit: unused,
+      posted_at: new Date(),
+      source_reference: quoteNo,
+      source_label: ADVANCE_REFUND_LABEL,
+      ...actor,
+    });
+    await adjustWalletBalances(journal.lines);
+    payment.refund_amount = round2(priorRefund + unused);
+    payment.refund_journal_id = journal._id;
+    payment.refund_journal_no = journal.entry_no;
+    refunded = round2(refunded + unused);
+    journals.push(journal);
+  }
+
+  if (!journals.length) return { skipped: true };
+
+  if (Array.isArray(adv.payments) && adv.payments.length) {
+    for (const payment of adv.payments) {
+      const match = live.find((p) => String(p.journal_id || p._id || '') === String(payment.journal_id || payment._id || ''));
+      if (!match?.refund_journal_id) continue;
+      payment.refund_amount = match.refund_amount;
+      payment.refund_journal_id = match.refund_journal_id;
+      payment.refund_journal_no = match.refund_journal_no;
+    }
+  }
+
+  const last = journals[journals.length - 1];
+  adv.refund_amount = round2((Number(adv.refund_amount) || 0) + refunded);
+  adv.refund_journal_id = last._id;
+  adv.refund_journal_no = last.entry_no;
+  invoiceRequest.markModified('quotation_request');
+  await invoiceRequest.save();
+  await persistQuoteAdvanceCopy(invoiceRequest);
+  return { journal: last, journals, amount: refunded };
 }
 
 /** Undo a mistaken payment entry: reversing journal, balance reopened. Remitted cash can't be voided. */
@@ -1646,7 +1884,10 @@ module.exports = {
   recordManualQuotationAdvance,
   applyQuoteAdvanceToInvoice,
   remainingQuoteAdvance,
+  remainingQuoteGoods,
+  liveAdvancePayments,
   reverseQuoteAdvance,
+  refundUnusedQuoteAdvance,
   voidInvoicePayment,
   invoicePaymentSummary,
   invoiceNetTotal,

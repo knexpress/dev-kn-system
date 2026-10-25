@@ -364,6 +364,7 @@ router.post('/:id/advance-payment', auth, async (req, res) => {
 
     const result = await recordManualQuotationAdvance(quotation, {
       mode: req.body?.mode || req.body?.payment?.mode,
+      paymentType: req.body?.payment_type || req.body?.payment?.payment_type,
       amountCollected: req.body?.amount ?? req.body?.payment?.amount,
       reference: req.body?.reference || req.body?.payment?.reference,
       collectedAt: req.body?.collected_at || req.body?.paid_at || req.body?.payment?.collected_at,
@@ -381,7 +382,7 @@ router.post('/:id/advance-payment', auth, async (req, res) => {
         journal_no: result.journal?.entry_no,
         draft_journal: result.draft_journal,
       },
-      message: `Advance recorded · ${result.journal?.entry_no || ''} credited to Customer Payment Due${
+      message: `Payment recorded · ${result.journal?.entry_no || ''} credited to Customer Payment Due${
         draftNo ? `. Draft invoice ${draftNo} updated` : ''
       }`.trim(),
     });
