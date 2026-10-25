@@ -2,7 +2,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const { InvoiceRequest, Employee, Collections, AuditReport, Booking, Department, ManualQuotation } = require('../models');
 const { DeliveryAssignment, Invoice, Client } = require('../models/unified-schema');
-const { createNotificationsForAllUsers, createNotificationsForDepartment } = require('./notifications');
+const { createNotificationsForDepartment, notifyInvoiceRequestEvent } = require('./notifications');
 const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/id-generators');
 const { sanitizeRegex } = require('../middleware/security');
@@ -33,7 +33,7 @@ async function optionalUser(req) {
     if (!token) return null;
     const decoded = jwt.verify(token, jwtSecret());
     const { User } = require('../models');
-    return await User.findById(decoded.userId).select('full_name email').lean();
+    return await User.findById(decoded.userId).select('full_name email employee_id').lean();
   } catch (_) {
     return null;
   }
@@ -1271,14 +1271,8 @@ router.post('/', async (req, res) => {
       reason: `Invoice request status update (${status || 'no status'})`,
     });
 
-    // Create notifications for relevant departments (Sales, Operations, Finance)
-    const relevantDepartments = ['Sales', 'Operations', 'Finance'];
-    for (const deptName of relevantDepartments) {
-      // Get department ID (you might need to adjust this based on your department structure)
-      const dept = await mongoose.model('Department').findOne({ name: deptName });
-      if (dept) {
-        await createNotificationsForDepartment('invoice_request', invoiceRequest._id, dept._id, created_by_employee_id);
-      }
+    if ((status || invoiceRequest.status) === 'SUBMITTED') {
+      await notifyInvoiceRequestEvent(invoiceRequest, 'submitted', created_by_employee_id);
     }
 
     res.status(201).json({
@@ -1315,6 +1309,20 @@ router.put('/:id', async (req, res) => {
     });
 
     await invoiceRequest.save();
+
+    if (updateData.status && updateData.status !== oldStatus) {
+      const actor = await optionalUser(req);
+      const event =
+        updateData.status === 'SUBMITTED' ? 'submitted' :
+        updateData.status === 'IN_PROGRESS' ? 'sent_to_operations' :
+        updateData.status === 'VERIFIED' ? 'verified' :
+        updateData.status === 'COMPLETED' ? 'completed' :
+        updateData.status === 'CANCELLED' ? 'cancelled' :
+        null;
+      if (event) {
+        await notifyInvoiceRequestEvent(invoiceRequest, event, actor?._id || actor?.employee_id);
+      }
+    }
 
     if (updateData.delivery_status === 'DELIVERED' && oldDeliveryStatus !== 'DELIVERED') {
       await cleanupBookingIdentityDocumentsForDeliveredInvoiceRequest(invoiceRequest);
@@ -1521,6 +1529,7 @@ router.put('/:id/quotation-request', auth, async (req, res) => {
     }
 
     requestCache.clear();
+    await notifyInvoiceRequestEvent(invoiceRequest, 'quotation_requested', req.user?.id);
     res.json({ success: true, data: normalizeInvoiceRequest(invoiceRequest) });
   } catch (error) {
     console.error('Error submitting quotation request:', error);
@@ -1642,6 +1651,21 @@ router.put('/:id/status', async (req, res) => {
     }
 
     await invoiceRequest.save();
+
+    if (status && status !== oldStatus) {
+      const actor = await optionalUser(req);
+      const actorId = actor?._id || actor?.employee_id;
+      const event =
+        status === 'SUBMITTED' ? 'submitted' :
+        status === 'IN_PROGRESS' ? 'sent_to_operations' :
+        status === 'VERIFIED' ? 'verified' :
+        status === 'COMPLETED' ? 'completed' :
+        status === 'CANCELLED' ? 'cancelled' :
+        null;
+      if (event) {
+        await notifyInvoiceRequestEvent(invoiceRequest, event, actorId);
+      }
+    }
 
     if (delivery_status === 'DELIVERED' && oldDeliveryStatus !== 'DELIVERED') {
       await cleanupBookingIdentityDocumentsForDeliveredInvoiceRequest(invoiceRequest);
@@ -2312,6 +2336,15 @@ router.put('/:id/complete-verification', async (req, res) => {
     // Move to next status - ready for finance (EmPost failure does not block)
     invoiceRequest.status = 'VERIFIED';
     await invoiceRequest.save();
+
+    if (previousStatus !== 'VERIFIED') {
+      const actor = await optionalUser(req);
+      await notifyInvoiceRequestEvent(
+        invoiceRequest,
+        'verified',
+        actor?._id || actor?.employee_id || verified_by_employee_id
+      );
+    }
 
     res.json({
       success: true,
@@ -3412,6 +3445,7 @@ router.post('/:id/cancel-shipment', auth, async (req, res) => {
     }
 
     await voidQuoteDraftJournal(invoiceRequest, { actorId: req.user?.id, reason: 'shipment cancelled at quotation' });
+    await notifyInvoiceRequestEvent(invoiceRequest, 'cancelled', req.user?.id);
     await markBookingCancelled(
       invoiceRequest,
       actorName,
@@ -3619,6 +3653,7 @@ router.post('/:id/cancel', async (req, res) => {
     session.endSession();
 
     await voidQuoteDraftJournal(invoiceRequest, { reason: 'request cancelled' });
+    await notifyInvoiceRequestEvent(invoiceRequest, 'cancelled', employeeId);
     
     console.log(`✅ Invoice request ${id} cancelled successfully. Audit entry: ${auditEntry[0]._id}`);
     

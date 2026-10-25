@@ -2,7 +2,7 @@ const mongoose = require('mongoose');
 const { Booking, InvoiceRequest } = require('../models');
 const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/id-generators');
 const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
-const { createNotificationsForDepartment } = require('../routes/notifications');
+const { notifyInvoiceRequestEvent } = require('../routes/notifications');
 
 /**
  * Review and approve a booking (creates invoice request). Same logic as POST /bookings/:id/review.
@@ -487,14 +487,7 @@ async function performBookingReview(bookingId, reviewed_by_employee_id, deps = {
     bookingDoc.converted_to_invoice_request_id = invoiceRequest._id;
     await bookingDoc.save();
 
-    // Create notifications for relevant departments (same as sales person does)
-    const relevantDepartments = ['Sales', 'Operations', 'Finance'];
-    for (const deptName of relevantDepartments) {
-      const dept = await mongoose.model('Department').findOne({ name: deptName });
-      if (dept) {
-        await createNotificationsForDepartment('invoice_request', invoiceRequest._id, dept._id, reviewed_by_employee_id);
-      }
-    }
+    await notifyInvoiceRequestEvent(invoiceRequest, 'submitted', reviewed_by_employee_id);
 
     // Generate PDF and upload to Google Drive (in background - don't block response)
     if (typeof generateAndUploadBookingPDF === 'function') {
