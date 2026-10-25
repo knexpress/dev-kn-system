@@ -329,7 +329,10 @@ const reportSchema = new mongoose.Schema({
   timestamps: true,
 });
 
-
+reportSchema.index({ generatedAt: -1 });
+reportSchema.index({ 'report_data.awb_number': 1 });
+reportSchema.index({ 'report_data.customer_name': 1 });
+reportSchema.index({ 'report_data.receiver_name': 1 });
 
 // Invoice Request Schema
 const invoiceRequestSchema = new mongoose.Schema({
@@ -867,6 +870,10 @@ invoiceRequestSchema.index({ createdAt: -1 });
 invoiceRequestSchema.index({ status: 1, createdAt: -1 }); // For Operations (IN_PROGRESS) and general status queries
 invoiceRequestSchema.index({ customer_name: 1, status: 1 });
 invoiceRequestSchema.index({ shipment_type: 1 });
+invoiceRequestSchema.index({ origin_place: 1 });
+invoiceRequestSchema.index({ destination_place: 1 });
+invoiceRequestSchema.index({ service_code: 1 });
+invoiceRequestSchema.index({ empost_uhawb: 1 });
 // Compound index for Finance department queries (VERIFIED status, exclude CANCELLED)
 // This index optimizes queries filtering by status='VERIFIED' and delivery_status != 'CANCELLED'
 // Sort order matches the index for optimal performance
@@ -1641,8 +1648,47 @@ interDepartmentChatMessageSchema.index({ sender_department_id: 1 });
 interDepartmentChatMessageSchema.index({ is_read: 1 });
 interDepartmentChatMessageSchema.index({ message: 'text' });
 
+const notificationSchema = new mongoose.Schema({
+  user_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true,
+  },
+  department_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Department',
+    required: false,
+  },
+  type: {
+    type: String,
+    required: true,
+    enum: [
+      'invoice_request',
+      'quotation_request',
+      'invoice',
+      'collection',
+      'request',
+      'ticket',
+      'chat',
+    ],
+  },
+  title: { type: String, required: true },
+  message: { type: String, required: true },
+  href: { type: String, required: false },
+  item_id: { type: mongoose.Schema.Types.Mixed, required: false },
+  is_read: { type: Boolean, default: false },
+  read_at: { type: Date, required: false },
+}, {
+  timestamps: true,
+});
+
+notificationSchema.index({ user_id: 1, createdAt: -1 });
+notificationSchema.index({ user_id: 1, is_read: 1, createdAt: -1 });
+notificationSchema.index({ user_id: 1, type: 1, is_read: 1 });
+
 const ChatRoom = mongoose.models.ChatRoom || mongoose.model('ChatRoom', chatRoomSchema);
 const ChatMessage = mongoose.models.ChatMessage || mongoose.model('ChatMessage', interDepartmentChatMessageSchema);
+const Notification = mongoose.models.Notification || mongoose.model('Notification', notificationSchema);
 
 module.exports = {
   Department,
@@ -1659,6 +1705,7 @@ module.exports = {
   SystemSettings,
   ChatRoom,
   ChatMessage,
+  Notification,
   AuditReport,
   ManualQuotation,
 };

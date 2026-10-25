@@ -38,6 +38,49 @@ const router = express.Router();
 
 const REQUEST_POPULATE_FIELDS = 'request_id awb_number customer route status shipment verification number_of_boxes origin_place destination_place receiver_name receiver_address receiver_phone quotation_request';
 
+function isObjectIdString(value) {
+  const id = String(value || '').trim();
+  return mongoose.Types.ObjectId.isValid(id) && String(new mongoose.Types.ObjectId(id)) === id;
+}
+
+function populateInvoice(query) {
+  return query
+    .populate('request_id', REQUEST_POPULATE_FIELDS)
+    .populate('client_id', 'company_name contact_name email phone')
+    .populate('created_by', 'full_name email department_id');
+}
+
+/** Indexed lookup by Mongo id, invoice_id, AWB, or invoice-request number. */
+async function findInvoiceByKey(raw) {
+  const key = decodeURIComponent(String(raw || '')).trim();
+  if (!key) return null;
+
+  if (isObjectIdString(key)) {
+    const byId = await populateInvoice(Invoice.findById(key));
+    if (byId) return byId;
+  }
+
+  const byNumber = await populateInvoice(Invoice.findOne({ invoice_id: key }));
+  if (byNumber) return byNumber;
+
+  const byAwb = await populateInvoice(Invoice.findOne({ awb_number: key }));
+  if (byAwb) return byAwb;
+
+  const invoiceRequest = await InvoiceRequest.findOne({
+    $or: [{ invoice_number: key }, { tracking_code: key }],
+  }).select('_id invoice_number tracking_code').lean();
+
+  if (!invoiceRequest) return null;
+
+  return populateInvoice(Invoice.findOne({
+    $or: [
+      { invoice_id: invoiceRequest.invoice_number },
+      { request_id: invoiceRequest._id },
+      { awb_number: invoiceRequest.tracking_code },
+    ],
+  }));
+}
+
 const normalizeServiceCode = (code = '') =>
   code.toString().toUpperCase().replace(/[\s-]+/g, '_');
 
@@ -472,13 +515,10 @@ router.get('/', async (req, res) => {
   }
 });
 
-// Get invoice by ID
-router.get('/:id', validateObjectIdParam('id'), async (req, res) => {
+// Get invoice by Mongo id, invoice number, or AWB
+router.get('/:id', async (req, res) => {
   try {
-    const invoice = await Invoice.findById(req.params.id)
-      .populate('request_id', REQUEST_POPULATE_FIELDS)
-      .populate('client_id', 'company_name contact_name email phone')
-      .populate('created_by', 'full_name email department_id');
+    const invoice = await findInvoiceByKey(req.params.id);
     
     if (!invoice) {
       return res.status(404).json({ 

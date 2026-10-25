@@ -1,6 +1,7 @@
 const express = require('express');
-const { Request } = require('../models');
+const { Request, Employee } = require('../models');
 const auth = require('../middleware/auth');
+const { createNotificationsForDepartment } = require('./notifications');
 
 const router = express.Router();
 router.use(auth);
@@ -38,6 +39,11 @@ router.post('/', async (req, res) => {
     });
 
     await request.save();
+
+    const assignee = await Employee.findById(assigned_to_employee_id).select('department_id');
+    if (assignee?.department_id) {
+      await createNotificationsForDepartment('request', request._id, assignee.department_id, req.user?.id);
+    }
 
     res.status(201).json({
       success: true,

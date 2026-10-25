@@ -264,6 +264,7 @@ app.use('/api/csv-upload', csvUploadRoutes);
 app.use('/api/bookings', bookingsRoutes);
 app.use('/api/system-settings', systemSettingsRoutes);
 app.use('/api/finance-setup', require('./routes/finance-setup'));
+app.use('/api/dashboard', require('./routes/dashboard'));
 app.use('/api/empost', require('./routes/empost-pending'));
 app.use('/api/accounting', require('./routes/accounting'));
 app.use('/api/accounting', require('./routes/bank-reconciliation'));
@@ -274,6 +275,7 @@ app.use('/uploads/finance-setup', express.static(path.join(__dirname, 'uploads/f
 app.use('/api/activity', activityRoutes);
 app.use('/api/errors', errorMonitoringRoutes);
 app.use('/api/motivation', require('./routes/motivation'));
+app.use('/api/ai', require('./routes/ai'));
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
