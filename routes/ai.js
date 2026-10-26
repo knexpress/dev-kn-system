@@ -11,7 +11,7 @@ router.post('/chat', auth, async (req, res) => {
         req.body?.firstName ||
         req.user?.employee?.full_name?.split?.(' ')?.[0] ||
         req.user?.email?.split?.('@')?.[0],
-      department: req.body?.department || req.user?.department?.name,
+      department: req.user?.department?.name || req.body?.department,
       role: req.user?.role,
     });
     res.json({ success: true, data: result });

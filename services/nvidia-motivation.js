@@ -75,7 +75,7 @@ async function fetchQuoteFromNvidia({ firstName, department } = {}) {
             type: 'text',
             text:
               `Write one original motivational quote (maximum 22 words) for ${name} ` +
-              `on a logistics and finance operations team (${dept}). ` +
+              `on the ${dept} desk at a UAE–Philippines courier. Stay relevant to ${dept} work only. ` +
               'Return ONLY the quote sentence. No quotation marks, no author, no preamble.',
           },
         ],
